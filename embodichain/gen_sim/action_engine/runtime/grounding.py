@@ -33,6 +33,7 @@ from embodichain.gen_sim.action_engine.config import (
     default_runtime_policy,
 )
 from embodichain.gen_sim.action_engine.domain import normalize_placement_relation
+from embodichain.gen_sim.action_engine.gripper_profiles import get_gripper_profile
 from embodichain.gen_sim.action_engine.orientation import (
     AlignAxisConstraint,
     MatchRotationConstraint,
@@ -49,6 +50,9 @@ from embodichain.lab.sim.atomic_actions import (
     HeldObjectPoseGoal,
     JointPositionGoal,
     ObjectSemantics,
+    OpenDoor,
+    OpenDoorAffordance,
+    OpenDoorGoal,
     PlaceGoal,
     PourGoal,
     PressAffordance,
@@ -60,6 +64,16 @@ from embodichain.lab.sim.atomic_actions import (
 )
 from embodichain.utils.logger import log_info
 
+from .articulation import (
+    _active_joint_candidates,
+    _closed_open_endpoints,
+    _effective_joint_limits,
+    _effective_joint_position,
+    _is_usd_articulation,
+    _named_link_geometry,
+    _scene_entity,
+    _select_joint_candidate,
+)
 from .frames import arm_base_poses, relation_offset, robot_frame_axes
 from .geometry_axes import analyze_local_geometry_axes
 from .models import ExecutionProgram, GroundedAction, SemanticStep
@@ -88,18 +102,14 @@ def _batched_pose(value: Any, env: Any) -> torch.Tensor:
 
 
 def _object(env: Any, uid: str) -> Any:
-    entity = env.sim.get_rigid_object(uid)
-    if entity is None:
-        entity = getattr(env.sim, "get_articulation", lambda _uid: None)(uid)
+    entity = _scene_entity(env.sim, uid)
     if entity is None:
         raise ValueError(f"Unknown scene entity {uid!r}.")
     return entity
 
 
 def _live_pose(env: Any, uid: str) -> torch.Tensor:
-    entity = env.sim.get_rigid_object(uid)
-    if entity is None:
-        entity = getattr(env.sim, "get_articulation", lambda _uid: None)(uid)
+    entity = _scene_entity(env.sim, uid)
     if entity is None:
         raise ValueError(f"Unknown scene entity {uid!r}.")
     return _batched_pose(entity.get_local_pose(to_matrix=True), env)
@@ -670,6 +680,9 @@ class ActionGrounder:
         self.semantics_factory = semantics_factory
         self.capabilities = capability_registry or build_atomic_capability_registry()
         self.robot_profile = str(getattr(env, "agent_robot_profile", "dual_ur10"))
+        self.gripper_profile = get_gripper_profile(
+            str(getattr(env, "agent_gripper_model", "pgi"))
+        )
         self.runtime_policy = runtime_policy or default_runtime_policy(
             self.robot_profile
         )
@@ -859,6 +872,7 @@ class ActionGrounder:
                 target, press_policy = self._press_goal(
                     step.object_uid,
                     object_pose,
+                    arm=arm,
                     semantics=semantics,
                     terminal_state=str(
                         step.postcondition.get("terminal_state", "activated")
@@ -879,9 +893,18 @@ class ActionGrounder:
             target = PourGoal()
         elif kind == "articulation_goal":
             if capability.target_materializer == "slide":
-                target, policy = self._slide_target(
+                target, policy = self._slide_target(step, arm, policy)
+            elif capability.target_materializer == "open_door":
+                articulation = getattr(
+                    self.env.sim, "get_articulation", lambda _uid: None
+                )(step.object_uid)
+                if articulation is None:
+                    raise ValueError(
+                        f"OpenDoor requires live articulation {step.object_uid!r}."
+                    )
+                target, policy = self._open_door_target(
                     step,
-                    arm,
+                    articulation,
                     policy,
                 )
             elif capability.target_materializer == "twist":
@@ -916,6 +939,7 @@ class ActionGrounder:
                 target, press_policy = self._press_goal(
                     step.object_uid,
                     object_pose,
+                    arm=arm,
                     terminal_state=str(
                         step.postcondition.get("terminal_state", "activated")
                     ),
@@ -969,6 +993,36 @@ class ActionGrounder:
                 arm,
                 reference_eef_pose,
             )
+            if operation == "safe_retreat":
+                retreat_reference = self._retreat_reference_pose(arm, None)
+            if operation == "interaction_staging":
+                interaction = str(binding.get("interaction", ""))
+                interaction_semantics = self.semantics_factory(step.object_uid)
+                policy["collision_safety"] = "required"
+                policy["interaction"] = interaction
+                target = EndEffectorPoseGoal(
+                    xpos=self._interaction_staging_pose(
+                        step,
+                        arm,
+                        policy,
+                        object_pose=object_pose,
+                        semantics=interaction_semantics,
+                        interaction=interaction,
+                    )
+                )
+                return GroundedAction(
+                    action_class=action_class,
+                    arm=arm,
+                    control=control,
+                    target=target,
+                    cfg=policy,
+                    object_pose=object_pose,
+                    reference_pose=reference_pose,
+                    target_object_pose=target_object_pose,
+                    motion_policy=policy,
+                    object_uid=step.object_uid,
+                    allow_yaw_search=orientation.allows_yaw_search,
+                )
             if operation in {"retreat", "lift_clear", "retreat_after_lift"}:
                 policy["retreat_reachability_search"] = True
                 policy["retreat_reference_pose"] = retreat_reference.clone()
@@ -998,7 +1052,12 @@ class ActionGrounder:
                 policy["minimum_retreat_distance"] = 0.05
                 policy["retreat_search_mode"] = "horizontal_only"
                 policy["retreat_search_samples"] = 4
-            if source in {"release", "handover"}:
+            if operation == "safe_retreat":
+                policy["retreat_reachability_search"] = True
+                policy["retreat_reference_pose"] = retreat_reference.clone()
+                policy["retreat_search_mode"] = "vertical_then_baseward"
+                policy["interaction"] = str(binding.get("interaction", ""))
+            if source in {"release", "handover", "interaction"}:
                 policy["clearance_object_uid"] = step.object_uid
                 policy["collision_safety"] = "required"
                 contact_uids = [step.object_uid]
@@ -1018,12 +1077,21 @@ class ActionGrounder:
                 xpos=(
                     retreat_reference.clone()
                     if operation == "reorient_tool_down"
-                    else self._retreat_pose(
-                        arm,
-                        policy,
-                        retreat_reference,
-                        clear_exchange=source == "handover",
-                        retreat_after_lift=operation == "retreat_after_lift",
+                    else (
+                        self._safe_interaction_retreat_pose(
+                            arm,
+                            policy,
+                            retreat_reference,
+                            step.object_uid,
+                        )
+                        if operation == "safe_retreat"
+                        else self._retreat_pose(
+                            arm,
+                            policy,
+                            retreat_reference,
+                            clear_exchange=source == "handover",
+                            retreat_after_lift=operation == "retreat_after_lift",
+                        )
                     )
                 )
             )
@@ -2115,35 +2183,16 @@ class ActionGrounder:
             raise ValueError(
                 f"Articulation action requires live articulation {step.object_uid!r}."
             )
-        backend_entities = getattr(
+        joint_id, joint_name, joint_info = _select_joint_candidate(
+            _active_joint_candidates(articulation, joint_types={"prismatic"}),
+            preferred_name_tokens=("drawer", "slide"),
+            context="Slide grounding",
+        )
+        backend = getattr(
             articulation,
             "_entities",
             getattr(articulation, "entities", ()),
-        )
-        if not backend_entities:
-            raise ValueError("Articulation backend does not expose joint metadata.")
-        backend = backend_entities[0]
-        candidates = []
-        for joint_id in getattr(
-            articulation,
-            "active_joint_ids",
-            range(len(articulation.joint_names)),
-        ):
-            joint_name = str(articulation.joint_names[int(joint_id)])
-            info = backend.get_joint_info(joint_name)
-            joint_type = (
-                str(getattr(getattr(info, "joint_type", None), "name", info.joint_type))
-                .rsplit(".", maxsplit=1)[-1]
-                .lower()
-            )
-            if joint_type == "prismatic":
-                candidates.append((int(joint_id), joint_name, info))
-        if len(candidates) != 1:
-            raise ValueError(
-                "Slide grounding requires exactly one active prismatic joint; "
-                f"found {[name for _, name, _ in candidates]}."
-            )
-        joint_id, joint_name, joint_info = candidates[0]
+        )[0]
         child_link = str(getattr(joint_info, "child_link_name", ""))
         parent_link = str(getattr(joint_info, "parent_link_name", ""))
         if (
@@ -2174,12 +2223,15 @@ class ActionGrounder:
                 and candidate_child in articulation.link_names
             ):
                 contact_links.append(candidate_child)
-        if len(contact_links) != 1:
+        if not contact_links:
+            contact_link = child_link
+        elif len(contact_links) == 1:
+            contact_link = contact_links[0]
+        else:
             raise ValueError(
-                "Slide grounding requires exactly one fixed contact endpoint "
+                "Slide grounding requires at most one fixed contact endpoint "
                 f"on prismatic child link {child_link!r}; found {contact_links}."
             )
-        contact_link = contact_links[0]
         vertices, triangles = articulation.get_link_vert_face(contact_link)
         vertices = torch.as_tensor(
             vertices, dtype=torch.float32, device=self.env.device
@@ -2187,6 +2239,15 @@ class ActionGrounder:
         triangles = torch.as_tensor(
             triangles, dtype=torch.int64, device=self.env.device
         )
+        selected_geometry = _named_link_geometry(
+            articulation,
+            contact_link,
+            name_tokens=("handle", "pull", "grip"),
+        )
+        if selected_geometry is not None:
+            vertices, triangles = (
+                value.to(device=self.env.device) for value in selected_geometry
+            )
         if vertices.ndim != 2 or vertices.shape[-1] != 3 or not vertices.numel():
             raise ValueError("Slide contact link has no valid grasp geometry.")
         if triangles.ndim != 2 or triangles.shape[-1] != 3 or not triangles.numel():
@@ -2213,7 +2274,16 @@ class ActionGrounder:
         opening_world = torch.matmul(
             torch.matmul(parent_pose[:, :3, :3], origin[:3, :3]), axis
         )
-        push_world = -torch.nn.functional.normalize(opening_world, dim=1)
+        limits = _effective_joint_limits(articulation, joint_id, joint_info)
+        qpos = _effective_joint_position(articulation, joint_id, joint_info)
+        closed_qpos, open_qpos = _closed_open_endpoints(limits)
+        opening_sign = torch.sign(open_qpos - closed_qpos)
+        body1_sign = 1.0 if _is_usd_articulation(articulation) else -1.0
+        push_world = (
+            torch.nn.functional.normalize(opening_world, dim=1)
+            * opening_sign[:, None]
+            * body1_sign
+        )
         push_local = torch.bmm(
             contact_pose[:, :3, :3].transpose(1, 2),
             push_world.unsqueeze(2),
@@ -2228,17 +2298,21 @@ class ActionGrounder:
             raise ValueError(
                 "Batched Slide environments require one shared child-link axis."
             )
+        self._require_gripper_compatible_geometry(
+            vertices,
+            push_local[0],
+            context="Slide",
+        )
 
-        limits = articulation.get_qpos_limits(joint_ids=[joint_id])[:, 0]
-        qpos = articulation.get_qpos()[:, joint_id]
         if limits.shape != (int(self.env.num_envs), 2):
             raise ValueError("Prismatic joint limits have an invalid batch shape.")
         if not torch.isfinite(limits).all() or torch.any(limits[:, 0] >= limits[:, 1]):
             raise ValueError("Slide requires finite ordered prismatic joint limits.")
-        if step.operator not in {"pull_articulated_part", "push_articulated_part"}:
-            raise ValueError("Slide grounding requires a pull or push operator.")
-        direction = "pull" if step.operator == "pull_articulated_part" else "push"
-        target_qpos = limits[:, 1] if direction == "pull" else limits[:, 0]
+        target_state = str(step.goal.get("target_state", ""))
+        if target_state not in {"open", "closed"}:
+            raise ValueError("Slide grounding requires target_state open or closed.")
+        direction = "pull" if target_state == "open" else "push"
+        target_qpos = open_qpos if direction == "pull" else closed_qpos
         distances = torch.abs(target_qpos - qpos)
         if torch.any(distances <= 1.0e-5):
             raise ValueError("Articulation joint is already at the requested target.")
@@ -2296,6 +2370,89 @@ class ActionGrounder:
             scoped_policy,
         )
 
+    def _open_door_target(
+        self,
+        step: SemanticStep,
+        articulation: Any,
+        policy: Mapping[str, Any],
+    ) -> tuple[OpenDoorGoal, dict[str, Any]]:
+        joint_id, joint_name, joint_info = _select_joint_candidate(
+            _active_joint_candidates(articulation, joint_types={"revolute"}),
+            preferred_name_tokens=("door", "hinge"),
+            context="OpenDoor grounding",
+        )
+        child_link = str(getattr(joint_info, "child_link_name", ""))
+        if child_link not in articulation.link_names:
+            raise ValueError("Door hinge must identify a live child link.")
+        affordance = OpenDoorAffordance.from_articulation(
+            articulation,
+            child_link,
+            hinge_joint_name=joint_name,
+            opening_direction=1,
+        )
+        selected_geometry = _named_link_geometry(
+            articulation,
+            child_link,
+            name_tokens=("handle", "pull", "grip"),
+        )
+        if selected_geometry is not None:
+            affordance = replace(
+                affordance,
+                mesh_vertices=selected_geometry[0].to(device=self.env.device),
+                mesh_triangles=selected_geometry[1].to(device=self.env.device),
+            )
+        self._require_gripper_compatible_geometry(
+            affordance.mesh_vertices,
+            OpenDoor._approach_direction_local(affordance),
+            context="OpenDoor",
+        )
+        limits = _effective_joint_limits(articulation, joint_id, joint_info)
+        affordance = replace(
+            affordance,
+            joint_limits=(float(limits[0, 0]), float(limits[0, 1])),
+        )
+        closed_qpos, open_qpos = _closed_open_endpoints(limits)
+        opening_direction = torch.sign(open_qpos - closed_qpos)
+        if not torch.all(opening_direction == opening_direction[:1]):
+            raise ValueError("Batched doors require one shared opening direction.")
+        affordance.opening_direction = int(opening_direction[0].item())
+        target_state = str(step.goal.get("target_state", ""))
+        if target_state != "open":
+            raise ValueError("OpenDoor grounding requires target_state open.")
+        open_fraction = 1.0
+        target_qpos = open_qpos
+        qpos = _effective_joint_position(articulation, joint_id, joint_info)
+        if torch.any(torch.abs(target_qpos - qpos) <= 1.0e-5):
+            raise ValueError("Door hinge is already at the requested target state.")
+        handle_pose = _batched_pose(
+            articulation.get_link_pose(child_link, to_matrix=True),
+            self.env,
+        )
+        semantics = ObjectSemantics(
+            affordance=affordance,
+            geometry={},
+            entity_id=f"{step.object_uid}:{child_link}",
+            label=f"{step.object_uid}:{child_link}",
+        )
+        scoped_policy = dict(policy)
+        scoped_policy.setdefault("joint_position_tolerance", 1.0e-3)
+        scoped_policy.update(
+            {
+                "articulation_joint_name": joint_name,
+                "articulation_joint_id": joint_id,
+                "articulation_initial_qpos": qpos,
+                "articulation_target_qpos": target_qpos,
+            }
+        )
+        return (
+            OpenDoorGoal(
+                semantics,
+                handle_pose,
+                open_fraction=open_fraction,
+            ),
+            scoped_policy,
+        )
+
     def _twist_target(
         self,
         step: SemanticStep,
@@ -2307,9 +2464,7 @@ class ActionGrounder:
             step.object_uid
         )
         if articulation is None:
-            raise ValueError(
-                f"TurnKnob requires live articulation {step.object_uid!r}."
-            )
+            raise ValueError(f"Twist requires live articulation {step.object_uid!r}.")
         backend_entities = getattr(
             articulation,
             "_entities",
@@ -2335,7 +2490,7 @@ class ActionGrounder:
                 candidates.append((int(joint_id), joint_name, info))
         if len(candidates) != 1:
             raise ValueError(
-                "TurnKnob grounding requires exactly one active revolute joint; "
+                "Twist grounding requires exactly one active revolute joint; "
                 f"found {[name for _, name, _ in candidates]}."
             )
         joint_id, joint_name, joint_info = candidates[0]
@@ -2353,7 +2508,7 @@ class ActionGrounder:
             vertices, dtype=torch.float32, device=self.env.device
         )
         if vertices.ndim != 2 or vertices.shape[-1] != 3 or not vertices.numel():
-            raise ValueError("TurnKnob child link has no valid grasp geometry.")
+            raise ValueError("Twist child link has no valid grasp geometry.")
 
         child_pose = _batched_pose(
             articulation.get_link_pose(child_link, to_matrix=True), self.env
@@ -2395,7 +2550,7 @@ class ActionGrounder:
             rtol=1.0e-4,
         ):
             raise ValueError(
-                "Batched TurnKnob environments require shared local joint geometry."
+                "Batched Twist environments require shared local joint geometry."
             )
 
         agent_config = getattr(self.env, "agent_config", {})
@@ -2420,24 +2575,34 @@ class ActionGrounder:
             or not setting_values
         ):
             raise ValueError(
-                "TurnKnob requires explicit setting_values; ordinal settings "
+                "Twist requires explicit setting_values; ordinal settings "
                 "cannot be guessed from joint limits."
             )
         values = torch.as_tensor(
             setting_values, dtype=torch.float32, device=self.env.device
         )
         if values.ndim != 1 or not torch.isfinite(values).all():
-            raise ValueError("TurnKnob setting_values must be a finite list.")
+            raise ValueError("Twist setting_values must be a finite list.")
         setting = int(step.goal.get("target_setting", -1))
         if setting < 0 or setting >= values.numel():
-            raise ValueError("TurnKnob target_setting is outside setting_values.")
-        limits = articulation.get_qpos_limits(joint_ids=[joint_id])[:, 0]
+            raise ValueError("Twist target_setting is outside setting_values.")
+        limits = _effective_joint_limits(articulation, joint_id, joint_info)
         target_qpos = values[setting]
-        if torch.any(target_qpos < limits[:, 0]) or torch.any(
-            target_qpos > limits[:, 1]
+        limit_tolerance = 1.0e-5
+        if torch.any(target_qpos < limits[:, 0] - limit_tolerance) or torch.any(
+            target_qpos > limits[:, 1] + limit_tolerance
         ):
-            raise ValueError("TurnKnob target setting violates revolute joint limits.")
-        qpos = articulation.get_qpos()[:, joint_id]
+            raise ValueError(
+                "Twist target setting violates revolute joint limits: "
+                f"target={float(target_qpos):.6f}, "
+                f"limits={limits[0].detach().cpu().tolist()}."
+            )
+        target_qpos = torch.clamp(
+            target_qpos,
+            min=limits[:, 0].max(),
+            max=limits[:, 1].min(),
+        )
+        qpos = _effective_joint_position(articulation, joint_id, joint_info)
         twist_angles = target_qpos - qpos
         if not torch.allclose(
             twist_angles,
@@ -2446,7 +2611,7 @@ class ActionGrounder:
             rtol=1.0e-4,
         ):
             raise ValueError(
-                "Batched TurnKnob environments require one shared twist angle."
+                "Batched Twist environments require one shared twist angle."
             )
 
         axis_local = local_axis[0]
@@ -2464,6 +2629,14 @@ class ActionGrounder:
         grasp_position = geometry_center + (
             0.8 * (axial_value - center_projection) * axis_local
         )
+        grasp_world = (
+            torch.matmul(child_pose[0, :3, :3], grasp_position) + child_pose[0, :3, 3]
+        )
+        axis_world = torch.matmul(child_pose[0, :3, :3], axis_local)
+        eef_position = self._current_eef_pose(arm)[0, :3, 3]
+        if torch.dot(axis_world, eef_position - grasp_world) > 0.0:
+            axis_local = -axis_local
+            twist_angles = -twist_angles
         affordance = TwistAffordance(
             object_label=f"{step.object_uid}:{child_link}",
             grasp_position=tuple(float(value) for value in grasp_position),
@@ -2488,9 +2661,12 @@ class ActionGrounder:
                 "articulation_target_qpos": target_qpos,
             }
         )
+        grasp_pose = affordance.get_grasp_pose(child_pose)
         log_info(
             f"Twist grounding {step.id}/{arm}: joint={joint_name!r}, "
-            f"current={float(qpos[0]):.4f}, target={float(target_qpos):.4f}."
+            f"current={float(qpos[0]):.4f}, target={float(target_qpos):.4f}, "
+            f"grasp_position={grasp_pose[0, :3, 3].detach().cpu().tolist()}, "
+            f"twist_axis={grasp_pose[0, :3, 2].detach().cpu().tolist()}."
         )
         return TwistGoal(semantics=semantics, target_pose=child_pose), scoped_policy
 
@@ -2759,6 +2935,7 @@ class ActionGrounder:
         uid: str,
         object_pose: torch.Tensor,
         *,
+        arm: str,
         semantics: ObjectSemantics | None = None,
         terminal_state: str = "activated",
     ) -> tuple[PressGoal, dict[str, Any]]:
@@ -2775,6 +2952,7 @@ class ActionGrounder:
                 uid,
                 articulation,
                 semantics,
+                arm=arm,
                 terminal_state=terminal_state,
             )
         entity = _object(self.env, uid)
@@ -2811,35 +2989,29 @@ class ActionGrounder:
         articulation: Any,
         semantics: ObjectSemantics,
         *,
+        arm: str,
         terminal_state: str,
     ) -> tuple[PressGoal, dict[str, Any]]:
-        """Ground a calibrated prismatic button from live joint metadata."""
-        backend_entities = getattr(
+        """Ground a prismatic button or small revolute rocker switch."""
+        prismatic = _active_joint_candidates(
             articulation,
-            "_entities",
-            getattr(articulation, "entities", ()),
+            joint_types={"prismatic"},
         )
-        if not backend_entities:
-            raise ValueError("Button articulation exposes no joint metadata.")
-        backend = backend_entities[0]
-        candidates = []
-        for joint_id in getattr(
-            articulation,
-            "active_joint_ids",
-            range(len(articulation.joint_names)),
-        ):
-            joint_name = str(articulation.joint_names[int(joint_id)])
-            info = backend.get_joint_info(joint_name)
-            joint_type = (
-                str(getattr(getattr(info, "joint_type", None), "name", info.joint_type))
-                .rsplit(".", maxsplit=1)[-1]
-                .lower()
+        if prismatic:
+            joint_id, joint_name, joint_info = _select_joint_candidate(
+                prismatic,
+                preferred_name_tokens=("button", "press"),
+                context="Button press grounding",
             )
-            if joint_type == "prismatic":
-                candidates.append((int(joint_id), joint_name, info))
-        if len(candidates) != 1:
-            raise ValueError("Press requires exactly one active prismatic joint.")
-        joint_id, joint_name, joint_info = candidates[0]
+        else:
+            joint_id, joint_name, joint_info = _select_joint_candidate(
+                _active_joint_candidates(articulation, joint_types={"revolute"}),
+                preferred_name_tokens=("rocker", "switch", "toggle"),
+                context="Rocker press grounding",
+            )
+        joint_type = str(
+            getattr(getattr(joint_info, "joint_type", None), "name", "")
+        ).lower()
         child_link = str(getattr(joint_info, "child_link_name", ""))
         parent_link = str(getattr(joint_info, "parent_link_name", ""))
         if (
@@ -2859,32 +3031,33 @@ class ActionGrounder:
             if isinstance(per_articulation, Mapping)
             else ()
         )
-        if (
-            not isinstance(values, Sequence)
-            or isinstance(values, (str, bytes, bytearray))
-            or len(values) < 2
-        ):
-            raise ValueError(
-                "Press requires explicit inactive/activated joint settings."
-            )
-        values_tensor = torch.as_tensor(
-            values, dtype=torch.float32, device=self.env.device
+        qpos = _effective_joint_position(articulation, joint_id, joint_info)
+        limits = _effective_joint_limits(articulation, joint_id, joint_info)
+        has_settings = (
+            isinstance(values, Sequence)
+            and not isinstance(values, (str, bytes, bytearray))
+            and len(values) >= 2
         )
-        if not torch.isfinite(values_tensor).all():
-            raise ValueError("Press joint settings must be finite.")
+        if has_settings:
+            values_tensor = torch.as_tensor(
+                values, dtype=torch.float32, device=self.env.device
+            )
+            if not torch.isfinite(values_tensor).all():
+                raise ValueError("Press joint settings must be finite.")
+            inactive_qpos = values_tensor[0].expand_as(qpos)
+            activated_qpos = values_tensor[-1].expand_as(qpos)
+        else:
+            inactive_qpos, activated_qpos = _closed_open_endpoints(limits)
         if terminal_state == "activated":
-            target_qpos = values_tensor[-1]
+            target_qpos = activated_qpos
         elif terminal_state == "inactive":
-            target_qpos = values_tensor[0]
+            target_qpos = inactive_qpos
         else:
             raise ValueError(f"Unsupported button terminal state {terminal_state!r}.")
-
-        qpos = articulation.get_qpos()[:, joint_id]
-        limits = articulation.get_qpos_limits(joint_ids=[joint_id])[:, 0]
         if torch.any(target_qpos < limits[:, 0]) or torch.any(
             target_qpos > limits[:, 1]
         ):
-            raise ValueError("Button target setting violates prismatic limits.")
+            raise ValueError("Press target setting violates articulation joint limits.")
         distances = torch.abs(target_qpos - qpos)
         if torch.any(distances <= 1.0e-5):
             raise ValueError("Button is already at the requested terminal state.")
@@ -2914,12 +3087,60 @@ class ActionGrounder:
             dtype=torch.float32,
             device=self.env.device,
         ).reshape(4, 4)
-        joint_pose = torch.matmul(parent_pose, origin)
-        world_axis = torch.matmul(joint_pose[:, :3, :3], axis)
-        direction_sign = torch.sign(target_qpos - qpos)
-        movement_world = torch.nn.functional.normalize(
-            world_axis * direction_sign[:, None], dim=1
+        vertices, _ = articulation.get_link_vert_face(child_link)
+        vertices = torch.as_tensor(
+            vertices, dtype=torch.float32, device=self.env.device
         )
+        if vertices.ndim != 2 or vertices.shape[-1] != 3 or not vertices.numel():
+            raise ValueError("Press child link has no contact geometry.")
+
+        joint_pose = torch.matmul(parent_pose, origin)
+        world_axis = torch.nn.functional.normalize(
+            torch.matmul(joint_pose[:, :3, :3], axis), dim=1
+        )
+        direction_sign = torch.sign(target_qpos - qpos)
+        if joint_type == "prismatic":
+            movement_world = world_axis * direction_sign[:, None]
+            press_distances = distances
+            press_position = None
+        else:
+            if not torch.all(direction_sign == direction_sign[:1]):
+                raise ValueError(
+                    "Batched rocker Press requires one movement direction."
+                )
+            world_vertices = (
+                vertices @ child_pose[0, :3, :3].transpose(0, 1) + child_pose[0, :3, 3]
+            )
+            radial = world_vertices - joint_pose[0, :3, 3]
+            radial = (
+                radial
+                - torch.sum(radial * world_axis[0], dim=1, keepdim=True) * world_axis[0]
+            )
+            radii = torch.linalg.vector_norm(radial, dim=1)
+            valid = radii > 1.0e-6
+            if not bool(valid.any()):
+                raise ValueError("Rocker contact geometry lies on its rotation axis.")
+            tangents = torch.linalg.cross(
+                world_axis[0].expand_as(radial), radial, dim=1
+            )
+            tangents = torch.nn.functional.normalize(tangents, dim=1)
+            # PhysX joint coordinates rotate body1 opposite the joint-frame
+            # axis used by the USD body0/body1 convention.
+            tangents = tangents * -direction_sign[0]
+            eef_position = self._current_eef_pose(arm)[0, :3, 3]
+            outward = torch.nn.functional.normalize(
+                eef_position - world_vertices,
+                dim=1,
+            )
+            scores = -torch.sum(tangents * outward, dim=1)
+            scores = scores + 0.1 * radii / radii[valid].max()
+            scores = torch.where(valid, scores, -torch.inf)
+            contact_index = int(torch.argmax(scores))
+            movement_world = tangents[contact_index][None].repeat(
+                int(self.env.num_envs), 1
+            )
+            press_position = vertices[contact_index]
+            press_distances = distances * radii[contact_index]
         movement_local = torch.bmm(
             child_pose[:, :3, :3].transpose(1, 2),
             movement_world.unsqueeze(2),
@@ -2932,22 +3153,17 @@ class ActionGrounder:
         ):
             raise ValueError("Batched Press requires one shared movement axis.")
 
-        vertices, _ = articulation.get_link_vert_face(child_link)
-        vertices = torch.as_tensor(
-            vertices, dtype=torch.float32, device=self.env.device
-        )
-        if vertices.ndim != 2 or vertices.shape[-1] != 3 or not vertices.numel():
-            raise ValueError("Button child link has no contact geometry.")
         press_axis = movement_local[0]
-        geometry_center = (
-            vertices.min(dim=0).values + vertices.max(dim=0).values
-        ) * 0.5
-        projections = torch.matmul(vertices, press_axis)
-        contact_projection = projections.min()
-        center_projection = torch.dot(geometry_center, press_axis)
-        press_position = (
-            geometry_center + (contact_projection - center_projection) * press_axis
-        )
+        if press_position is None:
+            geometry_center = (
+                vertices.min(dim=0).values + vertices.max(dim=0).values
+            ) * 0.5
+            projections = torch.matmul(vertices, press_axis)
+            contact_projection = projections.min()
+            center_projection = torch.dot(geometry_center, press_axis)
+            press_position = (
+                geometry_center + (contact_projection - center_projection) * press_axis
+            )
         press_semantics = replace(
             semantics,
             affordance=PressAffordance(
@@ -2958,13 +3174,165 @@ class ActionGrounder:
         return (
             PressGoal(semantics=press_semantics, target_pose=child_pose),
             {
-                "press_distance": float(distances[0]),
+                "press_distance": float(press_distances[0]),
                 "articulation_joint_name": joint_name,
                 "articulation_joint_id": joint_id,
                 "articulation_initial_qpos": qpos,
                 "articulation_target_qpos": target_qpos,
             },
         )
+
+    def _require_gripper_compatible_geometry(
+        self,
+        vertices: torch.Tensor,
+        approach_local: torch.Tensor,
+        *,
+        context: str,
+    ) -> None:
+        """Reject meshes with no AABB span compatible with the selected gripper."""
+        vertices = torch.as_tensor(vertices, dtype=torch.float32)
+        approach = torch.as_tensor(
+            approach_local,
+            dtype=vertices.dtype,
+            device=vertices.device,
+        )
+        approach = approach / torch.linalg.vector_norm(approach)
+        extents = vertices.amax(dim=0) - vertices.amin(dim=0)
+        axes = torch.eye(3, dtype=vertices.dtype, device=vertices.device)
+        perpendicular = torch.abs(torch.matmul(axes, approach)) <= 0.5
+        model = self.gripper_profile.grasp_model
+        compatible = perpendicular & (extents >= float(model.min_opening_width))
+        compatible &= extents <= float(model.max_opening_width)
+        if bool(compatible.any()):
+            return
+        raise ValueError(
+            "gripper_geometry_incompatible: "
+            f"{context} handle spans {extents.detach().cpu().tolist()} have no "
+            f"approach-perpendicular width in [{model.min_opening_width}, "
+            f"{model.max_opening_width}] for {model.model_id}."
+        )
+
+    def _interaction_staging_pose(
+        self,
+        step: SemanticStep,
+        arm: str,
+        policy: Mapping[str, Any],
+        *,
+        object_pose: torch.Tensor,
+        semantics: ObjectSemantics,
+        interaction: str,
+    ) -> torch.Tensor:
+        """Resolve a coarse collision-safe pose outside one interaction zone."""
+        distance = float(
+            self.runtime_policy.grounding["semantic_defaults"][
+                "interaction_staging_distance"
+            ]
+        )
+        current = self._current_eef_pose(arm).clone()
+        if interaction == "slide":
+            goal, _ = self._slide_target(step, arm, policy)
+            link_pose = _batched_pose(goal.target_pose, self.env)
+            affordance = goal.semantics.affordance
+            if not isinstance(affordance, SlideAffordance):
+                raise ValueError("Slide staging requires a SlideAffordance.")
+            local_axis = affordance.translation_axis.to(
+                device=link_pose.device,
+                dtype=link_pose.dtype,
+            )
+            local_axis = local_axis / torch.linalg.vector_norm(local_axis)
+            approach = torch.matmul(link_pose[:, :3, :3], local_axis)
+            center_local = affordance.mesh_vertices.to(
+                device=link_pose.device,
+                dtype=link_pose.dtype,
+            ).mean(dim=0)
+            center = torch.matmul(link_pose[:, :3, :3], center_local)
+            center = center + link_pose[:, :3, 3]
+            current[:, :3, 3] = center - approach * distance
+            return current
+        if interaction == "open_door":
+            articulation = getattr(self.env.sim, "get_articulation", lambda _uid: None)(
+                step.object_uid
+            )
+            if articulation is None:
+                raise ValueError("OpenDoor staging requires a live articulation.")
+            goal, _ = self._open_door_target(step, articulation, policy)
+            link_pose = _batched_pose(goal.target_pose, self.env)
+            affordance = goal.semantics.affordance
+            if not isinstance(affordance, OpenDoorAffordance):
+                raise ValueError("OpenDoor staging requires an OpenDoorAffordance.")
+            approach_local = OpenDoor._approach_direction_local(affordance)
+            approach = torch.matmul(link_pose[:, :3, :3], approach_local)
+            center_local = affordance.mesh_vertices.to(
+                device=link_pose.device,
+                dtype=link_pose.dtype,
+            ).mean(dim=0)
+            center = torch.matmul(link_pose[:, :3, :3], center_local)
+            center = center + link_pose[:, :3, 3]
+            current[:, :3, 3] = center - approach * distance
+            return current
+        if interaction == "twist":
+            goal, _ = self._twist_target(step, arm, policy)
+            link_pose = _batched_pose(goal.target_pose, self.env)
+            affordance = goal.semantics.affordance
+            if not isinstance(affordance, TwistAffordance):
+                raise ValueError("Twist staging requires a TwistAffordance.")
+            grasp = affordance.get_grasp_pose(link_pose).to(current)
+            grasp[:, :3, 3] -= grasp[:, :3, 2] * distance
+            return grasp
+        if interaction == "press":
+            goal, _ = self._press_goal(
+                step.object_uid,
+                object_pose,
+                arm=arm,
+                semantics=semantics,
+                terminal_state=str(step.goal.get("terminal_state", "activated")),
+            )
+            affordance = goal.semantics.affordance
+            if not isinstance(affordance, PressAffordance):
+                raise ValueError("Press staging requires a PressAffordance.")
+            contact = affordance.get_press_pose(
+                _batched_pose(goal.target_pose, self.env)
+            ).to(current)
+            contact[:, :3, 3] -= contact[:, :3, 2] * distance
+            return contact
+        raise ValueError(f"Unsupported interaction staging mode {interaction!r}.")
+
+    def _safe_interaction_retreat_pose(
+        self,
+        arm: str,
+        policy: Mapping[str, Any],
+        reference: torch.Tensor,
+        object_uid: str,
+    ) -> torch.Tensor:
+        """Move baseward and upward from the live post-interaction TCP."""
+        defaults = self.runtime_policy.grounding["semantic_defaults"]
+        distance = float(defaults["safe_retreat_distance"])
+        height = float(defaults["safe_retreat_height"])
+        target = reference.clone()
+        object_pose = _batched_pose(
+            _object(self.env, object_uid).get_local_pose(to_matrix=True),
+            self.env,
+        )
+        direction = target[:, :2, 3] - object_pose[:, :2, 3]
+        norm = torch.linalg.vector_norm(direction, dim=1, keepdim=True)
+        unresolved = norm <= 1.0e-6
+        if unresolved.any():
+            left_base, right_base = arm_base_poses(self.env)
+            base = left_base if arm == "left_arm" else right_base
+            baseward = base[:, :2, 3] - target[:, :2, 3]
+            baseward = baseward / torch.clamp(
+                torch.linalg.vector_norm(baseward, dim=1, keepdim=True),
+                min=1.0e-6,
+            )
+            direction = torch.where(unresolved, baseward, direction)
+            norm = torch.linalg.vector_norm(direction, dim=1, keepdim=True)
+        target[:, :2, 3] += direction / torch.clamp(norm, min=1.0e-6) * distance
+        ceiling = float(self._policy_value(policy, "maximum_eef_height"))
+        target[:, 2, 3] += torch.clamp(
+            torch.full_like(target[:, 2, 3], height),
+            max=torch.clamp(ceiling - target[:, 2, 3], min=0.0),
+        )
+        return target
 
     def _retreat_pose(
         self,

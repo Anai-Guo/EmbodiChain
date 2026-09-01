@@ -646,10 +646,10 @@ def _validate_task_fields(step: Mapping[str, Any], context: str) -> None:
             )
     if task_type == "E5" and step["required_arm"] not in {"none", "auto"}:
         raise ValueError(f"{context} E5 always uses both arms, not required_arm.")
-    if task_type == "E6" and step["target_state"] != "open":
-        raise ValueError(f"{context} E6 target_state must be open.")
-    if task_type == "E7" and step["target_state"] != "closed":
-        raise ValueError(f"{context} E7 target_state must be closed.")
+    if task_type == "E6" and step["target_state"] not in {"open", "closed"}:
+        raise ValueError(f"{context} E6 target_state must be open or closed.")
+    if task_type == "E7" and step["target_state"] != "open":
+        raise ValueError(f"{context} E7 target_state must be open.")
     if task_type == "E9" and step["target_state"] != "activated":
         raise ValueError(f"{context} E9 target_state must be activated.")
     if step["layout"] == "line" and task_type != "E1":
@@ -687,9 +687,10 @@ def _instruction_prompt(instruction: str) -> str:
         "is exactly one E3 step: object selects the source container, target "
         "selects the receiving container, and relation=above. Pickup and staging "
         "are internal to that E3 step. "
-        "Opening or pulling out a drawer is E6 with object selecting that drawer "
-        "and target_state=open. Closing or pushing in a drawer is E7 with object "
-        "selecting that drawer and target_state=closed. "
+        "Opening or pulling out a drawer or sliding tray is E6 with target_state=open. "
+        "Closing or pushing in that prismatic part is also E6 with target_state=closed. "
+        "Opening a hinged cabinet, appliance, or other revolute door is E7 with "
+        "target_state=open. "
         f"Instruction:\n{instruction}\n\n"
         f"E1-E9 catalog:\n{json.dumps(_intent_capability_catalog(), ensure_ascii=False, sort_keys=True)}\n\n"
         "Shape-only complete JSON example (do not copy its step count or values; "
@@ -793,8 +794,8 @@ def _instruction_repair_guidance(error: Exception) -> str:
         return (
             "\nMissing-object repair rule: preserve the selected task_type and "
             "set object to a scene_ref that preserves the explicit manipulated "
-            "object phrase from the instruction. For E6/E7 the drawer, door, or "
-            "other articulated part is the object selector; target remains none.\n"
+            "object phrase from the instruction. For E6 the drawer or sliding tray, "
+            "and for E7 the hinged door, is the object selector; target remains none.\n"
         )
     if not isinstance(error, _MissingRequiredTargetError):
         return ""

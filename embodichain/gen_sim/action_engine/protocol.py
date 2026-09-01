@@ -43,12 +43,12 @@ __all__ = [
 ]
 
 ACTION_ENGINE_ENV_ID: Final = "ActionEngine-v1"
-ACTION_ENGINE_CONFIG_SCHEMA: Final = "action_engine_config_v2"
+ACTION_ENGINE_CONFIG_SCHEMA: Final = "action_engine_config_v3"
 TASK_AGENT_SCHEMA: Final = "action_engine_task_agent_v1"
-EXECUTION_PROGRAM_SCHEMA: Final = "action_engine_execution_graph_v1"
-SEED_GRAPH_SCHEMA: Final = "action_engine_seed_graph_v3"
-TASK_SPEC_SCHEMA: Final = "action_engine_task_spec_v2"
-SCENE_REQUIREMENTS_SCHEMA: Final = "action_engine_scene_requirements_v2"
+EXECUTION_PROGRAM_SCHEMA: Final = "action_engine_execution_graph_v2"
+SEED_GRAPH_SCHEMA: Final = "action_engine_seed_graph_v4"
+TASK_SPEC_SCHEMA: Final = "action_engine_task_spec_v3"
+SCENE_REQUIREMENTS_SCHEMA: Final = "action_engine_scene_requirements_v3"
 
 FAST_GYM_CONFIG_FILENAME: Final = "fast_gym_config.json"
 AGENT_CONFIG_FILENAME: Final = "agent_config.json"

@@ -69,8 +69,8 @@ _OBJECT_FIXTURES = {
     "E3": ("container", ["graspable", "pourable"], {"held_by": "left_arm"}),
     "E4": ("cup", ["graspable", "handover"], {}),
     "E5": ("tray", ["dual_graspable", "rigid"], {}),
-    "E6": ("drawer", ["articulated", "pullable"], {"joint_state": "closed"}),
-    "E7": ("drawer", ["articulated", "pushable"], {"joint_state": "open"}),
+    "E6": ("drawer", ["articulated", "slideable"], {"joint_state": "closed"}),
+    "E7": ("door", ["articulated", "openable"], {"joint_state": "closed"}),
     "E8": ("knob", ["turnable"], {}),
     "E9": ("button", ["pressable"], {"activation": "inactive"}),
 }
@@ -321,7 +321,7 @@ def make_task_spec(
     elif task_type == "E6":
         params["target_state"] = "open"
     elif task_type == "E7":
-        params["target_state"] = "closed"
+        params["target_state"] = "open"
     elif task_type == "E8":
         params["target_setting"] = 2
     elif task_type == "E9":

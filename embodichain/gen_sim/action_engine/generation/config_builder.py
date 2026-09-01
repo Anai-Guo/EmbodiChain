@@ -324,7 +324,7 @@ def build_fast_gym_config(
     rigid_uids = [str(config["uid"]) for config in scene.rigid_objects]
     background_uids = [str(config["uid"]) for config in scene.background]
     engine_extension = {
-        "schema_version": "action_engine_runtime_v2",
+        "schema_version": "action_engine_runtime_v3",
         "defaults_schema_version": ACTION_ENGINE_DEFAULTS_SCHEMA,
         "task_name": task_name,
         "robot_profile": profile,

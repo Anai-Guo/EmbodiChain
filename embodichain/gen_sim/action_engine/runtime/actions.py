@@ -53,6 +53,7 @@ from embodichain.lab.sim.atomic_actions import (
     ExecutionSession,
     MotionPolicy,
     ObjectSemantics,
+    ObservedArticulationJointState,
     PlanningContext,
     PlanningFailure,
     PlannerDiagnostics,
@@ -82,6 +83,7 @@ from embodichain.utils.logger import log_info, log_warning
 from embodichain.utils.math import matrix_from_quat, quat_from_matrix, quat_slerp
 
 from .body_grasp import AxisAlignBodyGraspAdapter
+from .articulation import _effective_joint_position, _scene_entity
 from .coordinated_safety import _trajectory_safety_report
 from .grasp_diagnostics import _TracingAntipodalGraspPoseGenerator
 from .models import ActionOutcome, GroundedAction
@@ -340,15 +342,17 @@ class AtomicActionAdapter:
         cached = self._semantics.get(uid)
         if cached is not None:
             return cached
-        entity = self.env.sim.get_rigid_object(uid)
+        entity = _scene_entity(self.env.sim, uid)
         if entity is None:
-            entity = getattr(
+            raise ValueError(f"Unknown grasp target {uid!r}.")
+        if uid in {
+            str(value)
+            for value in getattr(
                 self.env.sim,
-                "get_articulation",
-                lambda _uid: None,
-            )(uid)
-            if entity is None:
-                raise ValueError(f"Unknown grasp target {uid!r}.")
+                "get_articulation_uid_list",
+                lambda: (),
+            )()
+        }:
             active_joint_ids = list(getattr(entity, "active_joint_ids", ()))
             if len(active_joint_ids) != 1:
                 raise ValueError(
@@ -419,6 +423,10 @@ class AtomicActionAdapter:
                 capability,
             )
             for reorientation in self._adapt_tool_down_candidates(candidate)
+            for reorientation in self._adapt_interaction_grasp_candidates(
+                reorientation,
+                capability,
+            )
         )
         selected: (
             tuple[
@@ -461,10 +469,16 @@ class AtomicActionAdapter:
                 candidate,
                 capability,
             )
+            interaction_context = self._interaction_grasp_selection_context(
+                candidate_engine,
+                candidate,
+                capability,
+            )
             with (
                 seed_context,
                 pair_context,
                 upright_context,
+                interaction_context,
                 _capture_retreat_warnings(capture_warnings) as warnings,
             ):
                 candidate_plan = candidate_engine.plan(candidate_invocation, context)
@@ -1517,6 +1531,60 @@ class AtomicActionAdapter:
         )
 
     @contextmanager
+    def _interaction_grasp_selection_context(
+        self,
+        engine: AtomicActionEngine,
+        candidate: GroundedAction,
+        capability: AtomicCapability,
+    ) -> Iterator[None]:
+        """Install one ranked grasp choice for Slide/OpenDoor candidate search."""
+        rank = candidate.motion_policy.get("interaction_grasp_candidate_rank")
+        if capability.target_materializer not in {"slide", "open_door"} or rank is None:
+            yield
+            return
+        _, hand_part, _ = self._parts(candidate.arm)
+        if hand_part is None:
+            yield
+            return
+        generator = engine.grasp_pose_generators.get(hand_part)
+        if not isinstance(generator, _TracingAntipodalGraspPoseGenerator):
+            yield
+            return
+        left_xpos, right_xpos = self.env.get_current_xpos_agent()
+        reference_xpos = left_xpos if candidate.arm == "left_arm" else right_xpos
+        with generator.interaction_selection_context(
+            reference_xpos=torch.as_tensor(
+                reference_xpos,
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            candidate_rank=int(rank),
+        ):
+            yield
+
+    @staticmethod
+    def _adapt_interaction_grasp_candidates(
+        grounded: GroundedAction,
+        capability: AtomicCapability,
+    ) -> tuple[GroundedAction, ...]:
+        """Expose bounded grasp ranks to the existing plan-candidate loop."""
+        if capability.target_materializer not in {"slide", "open_door"}:
+            return (grounded,)
+        count = int(grounded.motion_policy.get("interaction_grasp_candidate_count", 2))
+        if not 1 <= count <= 8:
+            raise ValueError("interaction_grasp_candidate_count must be in [1, 8].")
+        return tuple(
+            replace(
+                grounded,
+                motion_policy={
+                    **grounded.motion_policy,
+                    "interaction_grasp_candidate_rank": rank,
+                },
+            )
+            for rank in range(count)
+        )
+
+    @contextmanager
     def _upright_grasp_selection_context(
         self,
         engine: AtomicActionEngine,
@@ -2245,6 +2313,42 @@ class AtomicActionAdapter:
                 timestamp=self._scene_time,
                 env_ids=env_ids,
             )
+        articulation_joints = dict(base.articulation_joints)
+        sim = getattr(self.env, "sim", None)
+        list_articulations = getattr(sim, "get_articulation_uid_list", None)
+        get_articulation = getattr(sim, "get_articulation", None)
+        if callable(list_articulations) and callable(get_articulation):
+            for uid in list_articulations():
+                articulation = get_articulation(str(uid))
+                if articulation is None:
+                    continue
+                backend_entities = getattr(
+                    articulation,
+                    "_entities",
+                    getattr(articulation, "entities", ()),
+                )
+                if not backend_entities:
+                    continue
+                backend = backend_entities[0]
+                for joint_id, joint_name in enumerate(articulation.joint_names):
+                    joint_info = backend.get_joint_info(str(joint_name))
+                    position = _effective_joint_position(
+                        articulation,
+                        joint_id,
+                        joint_info,
+                    )
+                    articulation_joints[(str(uid), str(joint_name))] = (
+                        ObservedArticulationJointState(position[:, None])
+                    )
+        if articulation_joints != dict(base.articulation_joints):
+            base = SceneSnapshot(
+                timestamp=base.timestamp,
+                version=base.version,
+                entities=base.entities,
+                collision_world_revision=base.collision_world_revision,
+                collision_entity_ids=base.collision_entity_ids,
+                articulation_joints=articulation_joints,
+            )
         if not bool(self.planner_policy.get("dynamic_collision", False)):
             return base
         exclusion_masks = self._collision_exclusion_masks(grounded, state)
@@ -2279,6 +2383,7 @@ class AtomicActionAdapter:
             entities=entities,
             collision_world_revision=base.collision_world_revision,
             collision_entity_ids=dynamic_uids,
+            articulation_joints=base.articulation_joints,
             collision_pose_overrides=collision_pose_overrides,
         )
 

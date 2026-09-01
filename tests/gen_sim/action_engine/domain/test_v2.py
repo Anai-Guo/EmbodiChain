@@ -180,6 +180,47 @@ def test_seed_graph_hash_is_order_stable_and_detached() -> None:
     assert graph == original
 
 
+def test_pre_e6_e9_protocol_versions_are_rejected() -> None:
+    graph = _seed_graph()
+    graph["schema_version"] = "action_engine_seed_graph_v3"
+    with pytest.raises(ValueError, match="action_engine_seed_graph_v4"):
+        validate_seed_graph(graph)
+
+    spec = {
+        "schema_version": "action_engine_task_spec_v2",
+        "task_id": "legacy",
+        "level": "L1",
+        "instruction": "Open the drawer.",
+        "reasoning_type": "none",
+        "task_instances": [
+            {
+                "id": "legacy_e6",
+                "task_type": "E6",
+                "params": {"object_role": "drawer", "target_state": "open"},
+                "depends_on": [],
+                "role": "primary",
+            }
+        ],
+        "success": {},
+        "oracle": {},
+        "metadata": {},
+    }
+    with pytest.raises(ValueError, match="action_engine_task_spec_v3"):
+        validate_task_spec(spec)
+
+    requirements = {
+        "schema_version": "action_engine_scene_requirements_v2",
+        "task_id": "legacy",
+        "objects": [],
+        "cameras": [],
+        "spatial_constraints": [],
+        "distractor_count": 0,
+        "metadata": {},
+    }
+    with pytest.raises(ValueError, match="action_engine_scene_requirements_v3"):
+        validate_scene_requirements(requirements)
+
+
 def test_task_spec_enforces_reasoning_level_and_repetition_shape() -> None:
     spec = {
         "schema_version": TASK_SPEC_SCHEMA,
@@ -266,7 +307,7 @@ def test_scene_requirements_validate_task_first_handoff() -> None:
 def test_planning_only_capability_is_rejected_before_execution() -> None:
     registry = build_atomic_capability_registry()
     graph = _seed_graph()
-    graph["nodes"][0]["atomic_action"] = "TurnKnob"
+    graph["nodes"][0]["atomic_action"] = "Twist"
     graph["nodes"][0]["target_binding"] = {
         "kind": "articulation_goal",
         "object": "cup",
@@ -275,6 +316,6 @@ def test_planning_only_capability_is_rejected_before_execution() -> None:
         validate_seed_graph(
             graph,
             known_actions=registry.names(),
-            executable_actions=(set(registry.executable_names()) - {"TurnKnob"}),
+            executable_actions=(set(registry.executable_names()) - {"Twist"}),
             require_executable=True,
         )

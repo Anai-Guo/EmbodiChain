@@ -58,6 +58,9 @@ _OPERATOR_TASK_TYPES = {
     "place_in_line": "E1",
     "place_relative": "E1",
     "press": "E9",
+    "slide": "E6",
+    "open_door": "E7",
+    "twist": "E8",
 }
 
 

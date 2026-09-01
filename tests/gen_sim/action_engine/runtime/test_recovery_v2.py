@@ -52,7 +52,7 @@ def _graph(task_type: str) -> dict:
 
 def _handover_then_place_graph() -> dict:
     task = {
-        "schema_version": "action_engine_task_spec_v2",
+        "schema_version": "action_engine_task_spec_v3",
         "task_id": "handover_then_place_recovery",
         "level": "L3",
         "instruction": "Hand the yellow can from the left arm to the right arm.",

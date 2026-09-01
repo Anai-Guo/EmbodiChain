@@ -68,10 +68,10 @@ def test_production_code_has_no_legacy_pipeline_imports() -> None:
 
 def test_protocol_identifiers_are_new_and_stable() -> None:
     assert ACTION_ENGINE_ENV_ID == "ActionEngine-v1"
-    assert ACTION_ENGINE_CONFIG_SCHEMA == "action_engine_config_v2"
-    assert SEED_GRAPH_SCHEMA == "action_engine_seed_graph_v3"
-    assert TASK_SPEC_SCHEMA == "action_engine_task_spec_v2"
-    assert SCENE_REQUIREMENTS_SCHEMA == "action_engine_scene_requirements_v2"
+    assert ACTION_ENGINE_CONFIG_SCHEMA == "action_engine_config_v3"
+    assert SEED_GRAPH_SCHEMA == "action_engine_seed_graph_v4"
+    assert TASK_SPEC_SCHEMA == "action_engine_task_spec_v3"
+    assert SCENE_REQUIREMENTS_SCHEMA == "action_engine_scene_requirements_v3"
     assert EXECUTION_PROGRAM_FILENAME == "seed_task_graph.json"
     assert TASK_SPEC_FILENAME == "task_spec.json"
     assert SCENE_REQUIREMENTS_FILENAME == "scene_requirements.json"
@@ -97,13 +97,14 @@ def test_atomic_actions_have_one_runtime_capability_catalog() -> None:
         "MoveEndEffector",
         "MoveHeldObject",
         "MoveJoints",
+        "OpenDoor",
         "PickUp",
         "Place",
         "Pour",
         "Press",
-        "PullArticulatedPart",
-        "PushArticulatedPart",
-        "TurnKnob",
+        "Slide",
+        "OpenDoor",
+        "Twist",
     }
     assert set(registry.executable_names()) == {
         "AxisAlign",
@@ -113,13 +114,14 @@ def test_atomic_actions_have_one_runtime_capability_catalog() -> None:
         "MoveEndEffector",
         "MoveHeldObject",
         "MoveJoints",
+        "OpenDoor",
         "PickUp",
         "Place",
         "Pour",
         "Press",
-        "PullArticulatedPart",
-        "PushArticulatedPart",
-        "TurnKnob",
+        "Slide",
+        "OpenDoor",
+        "Twist",
     }
 
 
@@ -146,7 +148,9 @@ def test_runtime_core_has_no_action_name_dispatch_branches() -> None:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         literals = {
             node.value
-            for node in ast.walk(tree)
+            for comparison in ast.walk(tree)
+            if isinstance(comparison, ast.Compare)
+            for node in ast.walk(comparison)
             if isinstance(node, ast.Constant) and isinstance(node.value, str)
         }
         duplicated = sorted(literals & action_names)

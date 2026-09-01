@@ -284,7 +284,7 @@ def test_agent_policy_snapshot_is_hash_verified_and_legacy_config_falls_back() -
     assert legacy.as_mapping() == snapshot
 
 
-def test_v6_policy_snapshot_adds_axis_align_defaults_without_rewriting_e1() -> None:
+def test_v6_policy_snapshot_is_rejected() -> None:
     snapshot = default_runtime_policy("dual_franka").as_mapping()
     snapshot["schema_version"] = "action_engine_runtime_policy_v6"
     snapshot["motion_defaults"].pop("AxisAlign")
@@ -296,20 +296,17 @@ def test_v6_policy_snapshot_adds_axis_align_defaults_without_rewriting_e1() -> N
         ensure_ascii=True,
     ).encode("utf-8")
 
-    resolved = resolve_agent_runtime_policy(
-        {
-            "robot_profile": "dual_franka",
-            "runtime_policy": snapshot,
-            "runtime_policy_hash": hashlib.sha256(payload).hexdigest(),
-        }
-    )
-
-    assert resolved.schema_version == "action_engine_runtime_policy_v8"
-    assert resolved.motion_defaults["AxisAlign"]["sample_interval"] == 180
-    assert resolved.motion_defaults["PickUp"]["lift_height"] == pytest.approx(0.11)
+    with pytest.raises(ValueError, match="schema is incompatible"):
+        resolve_agent_runtime_policy(
+            {
+                "robot_profile": "dual_franka",
+                "runtime_policy": snapshot,
+                "runtime_policy_hash": hashlib.sha256(payload).hexdigest(),
+            }
+        )
 
 
-def test_v7_policy_snapshot_drops_legacy_gripper_geometry() -> None:
+def test_v7_policy_snapshot_is_rejected() -> None:
     snapshot = default_runtime_policy("dual_ur10").as_mapping()
     snapshot["schema_version"] = "action_engine_runtime_policy_v7"
     snapshot["grasp"].update(
@@ -326,21 +323,17 @@ def test_v7_policy_snapshot_drops_legacy_gripper_geometry() -> None:
         ensure_ascii=True,
     ).encode("utf-8")
 
-    resolved = resolve_agent_runtime_policy(
-        {
-            "robot_profile": "dual_ur10",
-            "runtime_policy": snapshot,
-            "runtime_policy_hash": hashlib.sha256(payload).hexdigest(),
-        }
-    )
-
-    assert resolved.schema_version == "action_engine_runtime_policy_v8"
-    assert "min_open_length" not in resolved.grasp
-    assert "max_open_length" not in resolved.grasp
-    assert "finger_length" not in resolved.grasp
+    with pytest.raises(ValueError, match="schema is incompatible"):
+        resolve_agent_runtime_policy(
+            {
+                "robot_profile": "dual_ur10",
+                "runtime_policy": snapshot,
+                "runtime_policy_hash": hashlib.sha256(payload).hexdigest(),
+            }
+        )
 
 
-def test_narrow_v1_policy_snapshot_is_migrated_to_complete_runtime_policy() -> None:
+def test_narrow_v1_policy_snapshot_is_rejected() -> None:
     snapshot = {
         "schema_version": "action_engine_runtime_policy_v1",
         "arm_selection": {
@@ -358,19 +351,17 @@ def test_narrow_v1_policy_snapshot_is_migrated_to_complete_runtime_policy() -> N
         ensure_ascii=True,
     ).encode("utf-8")
 
-    resolved = resolve_agent_runtime_policy(
-        {
-            "robot_profile": "dual_ur10",
-            "runtime_policy": snapshot,
-            "runtime_policy_hash": hashlib.sha256(payload).hexdigest(),
-        }
-    )
-
-    assert resolved.arm_selection.pickup_crossing_weight == 2.0
-    assert resolved.motion_defaults["PickUp"]["lift_height"] == 0.16
+    with pytest.raises(ValueError, match="schema is incompatible"):
+        resolve_agent_runtime_policy(
+            {
+                "robot_profile": "dual_ur10",
+                "runtime_policy": snapshot,
+                "runtime_policy_hash": hashlib.sha256(payload).hexdigest(),
+            }
+        )
 
 
-def test_v3_policy_snapshot_is_migrated_with_default_planner_policy() -> None:
+def test_v3_policy_snapshot_is_rejected() -> None:
     expected = default_runtime_policy("dual_ur10")
     snapshot = expected.as_mapping()
     snapshot.pop("planner")
@@ -382,16 +373,14 @@ def test_v3_policy_snapshot_is_migrated_with_default_planner_policy() -> None:
         ensure_ascii=True,
     ).encode("utf-8")
 
-    resolved = resolve_agent_runtime_policy(
-        {
-            "robot_profile": "dual_ur10",
-            "runtime_policy": snapshot,
-            "runtime_policy_hash": hashlib.sha256(payload).hexdigest(),
-        }
-    )
-
-    assert resolved.schema_version == "action_engine_runtime_policy_v8"
-    assert resolved.planner == expected.planner
+    with pytest.raises(ValueError, match="schema is incompatible"):
+        resolve_agent_runtime_policy(
+            {
+                "robot_profile": "dual_ur10",
+                "runtime_policy": snapshot,
+                "runtime_policy_hash": hashlib.sha256(payload).hexdigest(),
+            }
+        )
 
 
 def test_curobo_policy_rejects_coordinated_motion_generation() -> None:

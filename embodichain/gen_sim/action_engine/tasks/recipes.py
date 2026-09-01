@@ -1153,9 +1153,9 @@ def _recipe(
             success,
         )
     planning = {
-        "E6": ("PullArticulatedPart", "pull_articulated_part"),
-        "E7": ("PushArticulatedPart", "push_articulated_part"),
-        "E8": ("TurnKnob", "turn_knob"),
+        "E6": ("Slide", "slide"),
+        "E7": ("OpenDoor", "open_door"),
+        "E8": ("Twist", "twist"),
     }
     if task_type in planning:
         action_name, operator = planning[task_type]
@@ -1163,24 +1163,25 @@ def _recipe(
         if task_type == "E8":
             success["target_setting"] = int(params["target_setting"])
         else:
-            success["target_state"] = params["target_state"]
+            target_state = str(params["target_state"])
+            if task_type == "E6" and target_state not in {"open", "closed"}:
+                raise ValueError("E6 target_state must be open or closed.")
+            if task_type == "E7" and target_state != "open":
+                raise ValueError("E7 target_state must be open.")
+            success["target_state"] = target_state
         return (
-            [
-                _node(
-                    group_id,
-                    1,
-                    action_name,
-                    task_type,
-                    object_uid,
-                    actor,
-                    "arm",
-                    {"kind": "articulation_goal", "object": object_uid},
-                    dependencies,
-                    role,
-                    success,
-                    motion_policy(),
-                )
-            ],
+            _single_arm_interaction(
+                group_id,
+                task_type,
+                object_uid,
+                actor,
+                dependencies,
+                action_name=action_name,
+                interaction=operator,
+                target_binding={"kind": "articulation_goal", "object": object_uid},
+                postcondition=success,
+                role=role,
+            ),
             operator,
             {
                 key: deepcopy(value)
@@ -1196,22 +1197,18 @@ def _recipe(
             "terminal_state": str(params.get("terminal_state", "activated")),
         }
         return (
-            [
-                _node(
-                    group_id,
-                    1,
-                    "Press",
-                    task_type,
-                    object_uid,
-                    actor,
-                    "arm",
-                    {"kind": "object", "object": object_uid},
-                    dependencies,
-                    role,
-                    success,
-                    motion_policy(),
-                )
-            ],
+            _single_arm_interaction(
+                group_id,
+                task_type,
+                object_uid,
+                actor,
+                dependencies,
+                action_name="Press",
+                interaction="press",
+                target_binding={"kind": "object", "object": object_uid},
+                postcondition=success,
+                role=role,
+            ),
             "press",
             {"terminal_state": success["terminal_state"]},
             success,
@@ -1317,6 +1314,93 @@ def _single_arm_manipulation(
         nodes.append(node)
         previous = [node["id"]]
     return nodes
+
+
+def _single_arm_interaction(
+    group_id: str,
+    task_type: str,
+    object_uid: str,
+    actor: Mapping[str, Any],
+    dependencies: list[str],
+    *,
+    action_name: str,
+    interaction: str,
+    target_binding: Mapping[str, Any],
+    postcondition: Mapping[str, Any],
+    role: str,
+) -> list[dict[str, Any]]:
+    """Build staging, interaction, safety-retreat, and home nodes."""
+    staging = _node(
+        group_id,
+        1,
+        "MoveEndEffector",
+        task_type,
+        object_uid,
+        actor,
+        "arm",
+        {
+            "kind": "policy_pose",
+            "source": "interaction",
+            "operation": "interaction_staging",
+            "interaction": interaction,
+        },
+        dependencies,
+        role,
+        {},
+        motion_policy(),
+    )
+    interaction_node = _node(
+        group_id,
+        2,
+        action_name,
+        task_type,
+        object_uid,
+        actor,
+        "arm",
+        target_binding,
+        [staging["id"]],
+        role,
+        postcondition,
+        motion_policy(),
+    )
+    retreat = _node(
+        group_id,
+        3,
+        "MoveEndEffector",
+        task_type,
+        object_uid,
+        actor,
+        "arm",
+        {
+            "kind": "policy_pose",
+            "source": "interaction",
+            "operation": "safe_retreat",
+            "interaction": interaction,
+        },
+        [interaction_node["id"]],
+        "cleanup",
+        {},
+        motion_policy(),
+    )
+    home = _node(
+        group_id,
+        4,
+        "MoveJoints",
+        task_type,
+        object_uid,
+        actor,
+        "arm",
+        {
+            "kind": "joint_state",
+            "source": "initial",
+            "required_home": False,
+        },
+        [retreat["id"]],
+        "cleanup",
+        {},
+        motion_policy(),
+    )
+    return [staging, interaction_node, retreat, home]
 
 
 def _node(

@@ -112,7 +112,7 @@ def _candidate(task_type: str, affordances: list[str]) -> dict:
 def _catalog(*, pour_available: bool = False) -> dict[str, dict]:
     return {
         name: {"runtime_available": True, "unavailable_reason": None}
-        for name in ("PickUp", "MoveHeldObject", "Place", "TurnKnob")
+        for name in ("PickUp", "MoveHeldObject", "Place", "Twist")
     } | {
         "Pour": {
             "runtime_available": pour_available,
@@ -223,6 +223,57 @@ def test_scene_engine_v1_adapter_preserves_static_execution_evidence(
     )
 
 
+def test_generated_knob_metadata_crosses_scene_and_feasibility_boundary(
+    tmp_path: Path,
+) -> None:
+    prepared = _prepared_scene(tmp_path)
+    knob = {
+        "uid": "dial",
+        "source_uid": "dial_0",
+        "role": "articulation",
+        "name": "rotary dial",
+        "description": "A generated three-position rotary dial.",
+        "category": "dial",
+        "color": None,
+        "shape": {},
+        "init_pos": [0.0, 0.0, 0.8],
+        "init_rot": [0.0, 0.0, 0.0],
+        "body_scale": [1.0, 1.0, 1.0],
+        "attributes": {"joint_settings": {"dial_rotation": [-1.0, 0.0, 1.0]}},
+        "initial_state": {},
+        "affordances": ["articulated", "turnable"],
+    }
+    prepared.planner_objects = (*prepared.planner_objects, knob)
+    prepared.articulations = (
+        {
+            "uid": "dial",
+            "fpath": "/assets/dial.usdc",
+            "body_scale": [1.0, 1.0, 1.0],
+        },
+    )
+    manifest = SceneEngineV1Adapter().adapt_prepared_scene(
+        prepared,
+        source_format="embodichain.scene-export/v1",
+        robot_profile="dual_franka",
+    )
+    candidate = _candidate("E8", ["turnable"])
+    candidate["scene_request"]["references"][0]["source_structure"] = "articulation"
+
+    report = FeasibilityBroker().assess(
+        candidate,
+        {"step_01.object": ["dial"]},
+        manifest,
+        capability_catalog=_catalog(),
+        task_actions={"E8": ["Twist"]},
+    )
+
+    setting_check = next(
+        check for check in report["checks"] if check["kind"] == "setting_mapping"
+    )
+    assert setting_check["status"] == "proven"
+    assert setting_check["evidence"] == {"setting_map_count": 1}
+
+
 def test_e2_feasibility_requires_runtime_probe_for_geometry(tmp_path: Path) -> None:
     manifest = SceneEngineV1Adapter().adapt_prepared_scene(
         _prepared_scene(tmp_path),
@@ -294,7 +345,7 @@ def test_e8_requires_explicit_setting_to_angle_mapping(tmp_path: Path) -> None:
         {"step_01.object": ["red_can"]},
         manifest,
         capability_catalog=_catalog(),
-        task_actions={"E8": ("TurnKnob",)},
+        task_actions={"E8": ("Twist",)},
     )
 
     assert any(

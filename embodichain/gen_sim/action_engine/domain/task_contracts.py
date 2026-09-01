@@ -74,10 +74,10 @@ _CORE_ACTIONS: Mapping[str, tuple[str, ...]] = MappingProxyType(
         "E3": ("PickUp", "MoveHeldObject", "Pour", "Place"),
         "E4": ("PickUp", "MoveHeldObject", "HandOver", "Place"),
         "E5": ("CoordinatedPickment",),
-        "E6": ("PullArticulatedPart",),
-        "E7": ("PushArticulatedPart",),
-        "E8": ("TurnKnob",),
-        "E9": ("Press",),
+        "E6": ("MoveEndEffector", "Slide", "MoveJoints"),
+        "E7": ("MoveEndEffector", "OpenDoor", "MoveJoints"),
+        "E8": ("MoveEndEffector", "Twist", "MoveJoints"),
+        "E9": ("MoveEndEffector", "Press", "MoveJoints"),
     }
 )
 
@@ -88,9 +88,9 @@ _SIGNATURE_ACTIONS: Mapping[str, frozenset[str]] = MappingProxyType(
         "E3": frozenset({"Pour"}),
         "E4": frozenset({"HandOver"}),
         "E5": frozenset(),
-        "E6": frozenset({"PullArticulatedPart"}),
-        "E7": frozenset({"PushArticulatedPart"}),
-        "E8": frozenset({"TurnKnob"}),
+        "E6": frozenset({"Slide"}),
+        "E7": frozenset({"OpenDoor"}),
+        "E8": frozenset({"Twist"}),
         "E9": frozenset({"Press"}),
     }
 )

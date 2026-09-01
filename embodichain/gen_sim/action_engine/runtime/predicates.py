@@ -28,6 +28,14 @@ from .geometry_axes import analyze_local_geometry_axes
 from embodichain.gen_sim.action_engine.config import default_runtime_policy
 
 from .frames import relation_axes
+from .articulation import (
+    _active_joint_candidates,
+    _closed_open_endpoints,
+    _effective_joint_limits,
+    _effective_joint_position,
+    _scene_entity,
+    _select_joint_candidate,
+)
 from .robot_parts import arm_control_part
 
 __all__ = ["PREDICATE_TYPES", "evaluate_predicate"]
@@ -78,9 +86,7 @@ def _constant(env: Any, value: bool) -> torch.Tensor:
 
 
 def _entity(env: Any, uid: str) -> Any:
-    entity = env.sim.get_rigid_object(uid)
-    if entity is None:
-        entity = getattr(env.sim, "get_articulation", lambda _uid: None)(uid)
+    entity = _scene_entity(env.sim, uid)
     if entity is None:
         raise ValueError(f"Unknown scene entity {uid!r}.")
     return entity
@@ -802,46 +808,29 @@ def evaluate_predicate(
         articulation = getattr(env.sim, "get_articulation", lambda _uid: None)(uid)
         if articulation is None:
             raise ValueError(f"Unknown articulation {uid!r}.")
-        backend_entities = getattr(
-            articulation,
-            "_entities",
-            getattr(articulation, "entities", ()),
+        expected_joint_types = (
+            {"revolute"} if "target_setting" in spec else {"prismatic", "revolute"}
         )
-        if not backend_entities:
-            raise ValueError("Articulation backend does not expose joint metadata.")
-        backend = backend_entities[0]
-        expected_joint_type = "revolute" if "target_setting" in spec else "prismatic"
-        candidates = []
-        for joint_id in getattr(
+        candidates = _active_joint_candidates(
             articulation,
-            "active_joint_ids",
-            range(len(articulation.joint_names)),
-        ):
-            joint_name = str(articulation.joint_names[int(joint_id)])
-            info = backend.get_joint_info(joint_name)
-            joint_type = (
-                str(getattr(getattr(info, "joint_type", None), "name", info.joint_type))
-                .rsplit(".", maxsplit=1)[-1]
-                .lower()
-            )
-            if joint_type == expected_joint_type:
-                candidates.append((int(joint_id), joint_name))
+            joint_types=expected_joint_types,
+        )
         requested = spec.get("joint_name")
         if requested is not None:
             candidates = [item for item in candidates if item[1] == str(requested)]
-        if len(candidates) != 1:
-            raise ValueError(
-                "articulation_joint_near requires exactly one matching "
-                f"{expected_joint_type} joint."
-            )
-        joint_id, _ = candidates[0]
-        limits = articulation.get_qpos_limits(joint_ids=[joint_id])[:, 0]
-        qpos = articulation.get_qpos()[:, joint_id]
+        joint_id, _, joint_info = _select_joint_candidate(
+            candidates,
+            preferred_name_tokens=("door", "hinge", "drawer", "slide"),
+            context="articulation_joint_near",
+        )
+        limits = _effective_joint_limits(articulation, joint_id, joint_info)
+        qpos = _effective_joint_position(articulation, joint_id, joint_info)
+        closed_qpos, open_qpos = _closed_open_endpoints(limits)
         target_state = spec.get("target_state")
         if target_state == "open":
-            target = limits[:, 1]
+            target = open_qpos
         elif target_state == "closed":
-            target = limits[:, 0]
+            target = closed_qpos
         elif "target_qpos" in spec:
             target = torch.as_tensor(
                 spec["target_qpos"], dtype=torch.float32, device=env.device

@@ -49,6 +49,13 @@ FAILURE_TYPES = frozenset(
         "object_fallen",
         "object_dropped",
         "postcondition_failed",
+        "gripper_geometry_incompatible",
+        "no_grasp_candidate",
+        "grasp_ik_infeasible",
+        "contact_not_established",
+        "articulation_tracking_failed",
+        "safe_retreat_failed",
+        "home_cleanup_failed",
     }
 )
 

@@ -62,7 +62,7 @@ def compile_task_agent(
             object-reference validation.
 
     Returns:
-        A validated ``action_engine_execution_graph_v1`` mapping.
+        A validated ``action_engine_execution_graph_v2`` mapping.
     """
     task_agent = validate_task_agent(program, known_objects=known_objects)
     capabilities = registry or build_default_registry()

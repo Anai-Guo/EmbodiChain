@@ -51,6 +51,7 @@ from embodichain.utils import logger as project_logger
 from embodichain.utils.logger import log_info, log_warning
 
 from .actions import AtomicActionAdapter
+from .articulation import _effective_joint_position, _scene_entity
 from .frames import DIRECTIONAL_RELATIONS, robot_frame_axes
 from .grounding import ActionGrounder, LiveArrangementPlan, LivePlacementPlan
 from .models import (
@@ -345,6 +346,7 @@ class ProgramExecutor:
         self._orientation_references: dict[str, torch.Tensor] = {}
         self._orientation_errors: dict[str, torch.Tensor] = {}
         self._policies: dict[str, dict[str, Any]] = {}
+        self._entry_satisfied: dict[str, torch.Tensor] = {}
         self._payload_initial: dict[str, dict[str, torch.Tensor]] = {}
         self._support_relations: dict[str, list[_SupportRelation | None]] = {}
         self._placement_candidate_history: dict[tuple[str, str], set[int]] = {}
@@ -406,9 +408,14 @@ class ProgramExecutor:
                 }
                 scheduling_blocked = {
                     edge_id: (
-                        failed
-                        if self.failure_policy == "stop"
-                        else safety_dependency_failed[edge_id]
+                        safety_dependency_failed[edge_id]
+                        if self._edge_failure_policy(self.edges[edge_id])
+                        == "safety_required"
+                        else (
+                            failed
+                            if self.failure_policy == "stop"
+                            else safety_dependency_failed[edge_id]
+                        )
                     )
                     for edge_id, failed in dependency_failed.items()
                 }
@@ -478,15 +485,28 @@ class ProgramExecutor:
                     edge = batch[0]
                     step = self.step_by_edge[edge.id]
                     branch_failed = blocked[edge.id]
-                    self._ensure_assignment(step, branch_failed)
-                    active = ~branch_failed
+                    already_satisfied = self._already_satisfied_articulation_rows(
+                        edge,
+                        step,
+                        active=~branch_failed,
+                    )
+                    execution_blocked = branch_failed | already_satisfied
+                    self._ensure_assignment(step, execution_blocked)
+                    active = ~execution_blocked
                     posture_before = self._object_not_fallen(step)
                     failure_policy = self._edge_failure_policy(edge)
                     try:
                         primary_result = self._execute_edge_with_retries(
                             edge,
                             step,
-                            failed=branch_failed,
+                            failed=execution_blocked,
+                        )
+                    except (TypeError, ValueError) as exc:
+                        primary_result = self._edge_exception_result(
+                            edge,
+                            step,
+                            execution_blocked,
+                            exc,
                         )
                     except Exception as exc:
                         if failure_policy != "best_effort":
@@ -494,8 +514,13 @@ class ProgramExecutor:
                         primary_result = self._edge_exception_result(
                             edge,
                             step,
-                            branch_failed,
+                            execution_blocked,
                             exc,
+                        )
+                    if bool(already_satisfied.any()):
+                        primary_result = replace(
+                            primary_result,
+                            failed=primary_result.failed & ~already_satisfied,
                         )
                     newly_failed = primary_result.failed & ~branch_failed
                     fallen_transition = self._fallen_transition(
@@ -712,6 +737,54 @@ class ProgramExecutor:
             ),
         )
 
+    def _already_satisfied_articulation_rows(
+        self,
+        edge: ExecutionEdge,
+        step: SemanticStep,
+        *,
+        active: torch.Tensor,
+    ) -> torch.Tensor:
+        """Skip physical articulation motion for rows already at their goal."""
+        cached = self._entry_satisfied.get(step.id)
+        if cached is not None:
+            return active & cached
+        if len(edge.actions) != 1:
+            return torch.zeros_like(active)
+        capability = self.adapter.capabilities.get(
+            str(edge.actions[0].get("atomic_action_class"))
+        )
+        interaction_capability = capability.failure_classifier == "articulation"
+        is_entry = edge.id == step.edge_ids[0]
+        if is_entry and not interaction_capability:
+            interaction_capability = any(
+                self.adapter.capabilities.get(
+                    str(candidate.actions[0].get("atomic_action_class"))
+                ).failure_classifier
+                == "articulation"
+                for candidate in self.program.edges
+                if candidate.id in step.edge_ids and candidate.actions
+            )
+        if not interaction_capability and capability.target_materializer not in {
+            "slide",
+            "open_door",
+            "twist",
+            "press",
+        }:
+            return torch.zeros_like(active)
+        predicate = step.postcondition
+        if not isinstance(predicate, Mapping) or predicate.get("type") not in {
+            "articulation_joint_near",
+            "pressed",
+        }:
+            return torch.zeros_like(active)
+        try:
+            satisfied = active & evaluate_predicate(self.env, predicate)
+            if is_entry:
+                self._entry_satisfied[step.id] = satisfied.clone()
+            return satisfied
+        except (TypeError, ValueError):
+            return torch.zeros_like(active)
+
     def _failure_events(
         self,
         edge: ExecutionEdge,
@@ -755,12 +828,28 @@ class ProgramExecutor:
         )
         fatal = failure_policy != "best_effort"
         if postcondition:
-            classified = (("postcondition_failed", failed),)
+            if capability.failure_classifier == "articulation":
+                failure_type = "articulation_tracking_failed"
+            elif (
+                capability.target_materializer == "eef_pose"
+                and action.get("target_binding", {}).get("operation") == "safe_retreat"
+            ):
+                failure_type = "safe_retreat_failed"
+            elif (
+                capability.target_materializer == "joint_state"
+                and action.get("role") == "cleanup"
+            ):
+                failure_type = "home_cleanup_failed"
+            else:
+                failure_type = "postcondition_failed"
+            classified = ((failure_type, failed),)
         else:
             fallen = failed & executed_mask & transitioned
             planning = failed & ~executed_mask
             execution = failed & executed_mask & ~fallen
-            if capability.failure_classifier == "grasp":
+            if capability.failure_classifier == "articulation":
+                execution_type = "contact_not_established"
+            elif capability.failure_classifier == "grasp":
                 execution_type = "grasp_missed"
             elif capability.state_effect in {"preserve_hold", "transfer_hold"}:
                 execution_type = "object_dropped"
@@ -826,6 +915,11 @@ class ProgramExecutor:
                         ),
                         planner_traces[0] if planner_traces else {},
                     )
+                    details = self._planner_failure_details(trace, env_id)
+                    specific_failure = self._articulation_planning_failure_type(
+                        capability,
+                        str(details.get("planner_failure_reason", "")),
+                    )
                     result.append(
                         {
                             "node_id": action.get("seed_node_id"),
@@ -834,11 +928,11 @@ class ProgramExecutor:
                             "task_instance_id": step.id,
                             "atomic_action": action_name,
                             "arm": self._assignments.get(step.id, [None])[env_id],
-                            "failure_type": "search_exhausted",
+                            "failure_type": specific_failure,
                             "failure_policy": failure_policy,
                             "fatal": fatal,
                             "planning_stage": "runtime_planning",
-                            **self._planner_failure_details(trace, env_id),
+                            **details,
                             "reason": (
                                 "Bounded runtime search exhausted without a valid "
                                 "plan; this is not a geometric proof of "
@@ -866,6 +960,26 @@ class ProgramExecutor:
                 }
             )
         return result
+
+    @staticmethod
+    def _articulation_planning_failure_type(
+        capability: Any,
+        reason: str,
+    ) -> str:
+        """Refine bounded planning failures for interaction capabilities."""
+        normalized = reason.casefold()
+        if "gripper_geometry_incompatible" in normalized:
+            return "gripper_geometry_incompatible"
+        if capability.failure_classifier != "articulation":
+            return "search_exhausted"
+        if any(
+            token in normalized
+            for token in ("grasp pose", "antipodal", "no valid grasp")
+        ):
+            return "no_grasp_candidate"
+        if "ik" in normalized:
+            return "grasp_ik_infeasible"
+        return "search_exhausted"
 
     def _edge_exception_result(
         self,
@@ -1648,6 +1762,7 @@ class ProgramExecutor:
         self._orientation_references.clear()
         self._orientation_errors.clear()
         self._policies.clear()
+        self._entry_satisfied.clear()
         self._payload_initial.clear()
         self._support_relations.clear()
         self._placement_candidate_history.clear()
@@ -4338,7 +4453,10 @@ class ProgramExecutor:
         step: SemanticStep,
         grounded: GroundedAction,
     ) -> None:
-        self._policies[step.id] = grounded.motion_policy
+        self._policies[step.id] = {
+            **self._policies.get(step.id, {}),
+            **grounded.motion_policy,
+        }
         target = grounded.target_object_pose
         if target is not None:
             self._targets[step.id] = target[:, :3, 3].clone()
@@ -4388,11 +4506,21 @@ class ProgramExecutor:
             )(step.object_uid)
             if articulation is not None and joint_name in articulation.joint_names:
                 joint_id = articulation.joint_names.index(joint_name)
+                backend_entities = getattr(
+                    articulation,
+                    "_entities",
+                    getattr(articulation, "entities", ()),
+                )
+                joint_info = backend_entities[0].get_joint_info(joint_name)
                 articulation_state = {
                     "joint_name": joint_name,
                     "initial_qpos": policy.get("articulation_initial_qpos"),
                     "target_qpos": policy.get("articulation_target_qpos"),
-                    "observed_qpos": articulation.get_qpos()[:, joint_id],
+                    "observed_qpos": _effective_joint_position(
+                        articulation,
+                        joint_id,
+                        joint_info,
+                    ),
                 }
         result = []
         for env_id, assignment in enumerate(assignments):
@@ -4460,11 +4588,7 @@ class ProgramExecutor:
             raise ValueError("settle_steps must be non-negative.")
         if self.settle_steps and bool((~failed).any()):
             self.env.sim.update(step=self.settle_steps)
-        entity = self.env.sim.get_rigid_object(step.object_uid)
-        if entity is None:
-            entity = getattr(self.env.sim, "get_articulation", lambda _uid: None)(
-                step.object_uid
-            )
+        entity = _scene_entity(self.env.sim, step.object_uid)
         if entity is None:
             raise ValueError(f"Unknown semantic scene entity {step.object_uid!r}.")
         observed_pose = torch.as_tensor(
@@ -4733,9 +4857,7 @@ class ProgramExecutor:
         return result
 
     def _entity_pose(self, uid: str) -> torch.Tensor:
-        entity = self.env.sim.get_rigid_object(uid)
-        if entity is None:
-            entity = getattr(self.env.sim, "get_articulation", lambda _uid: None)(uid)
+        entity = _scene_entity(self.env.sim, uid)
         if entity is None:
             raise ValueError(f"Unknown scene entity {uid!r}.")
         pose = torch.as_tensor(

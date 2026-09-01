@@ -520,18 +520,36 @@ def _planner_object(
 ) -> dict[str, Any]:
     description = str(config.get("description", "")).strip()
     shape = deepcopy(dict(config.get("shape", {})))
+    inferred_attributes, inferred_affordances = (
+        _generated_articulation_semantics(config)
+        if role == "articulation"
+        else ({}, [])
+    )
     raw_attributes = config.get("attributes", {})
     if not isinstance(raw_attributes, Mapping):
         raw_attributes = {}
+    raw_attributes = {**inferred_attributes, **dict(raw_attributes)}
     raw_initial_state = config.get("initial_state", config.get("state", {}))
     if not isinstance(raw_initial_state, Mapping):
         raw_initial_state = {}
     raw_affordances = config.get("affordances", config.get("capabilities", []))
     affordances = (
-        [str(value) for value in raw_affordances]
+        [
+            (
+                str(value.get("type", value.get("name", "")))
+                if isinstance(value, Mapping)
+                else str(value)
+            )
+            for value in raw_affordances
+        ]
         if isinstance(raw_affordances, Sequence)
         and not isinstance(raw_affordances, (str, bytes))
         else []
+    )
+    affordances = sorted(
+        value
+        for value in {*inferred_affordances, *affordances}
+        if isinstance(value, str) and value
     )
     return {
         "uid": str(config["uid"]),
@@ -550,6 +568,80 @@ def _planner_object(
         "initial_state": deepcopy(dict(raw_initial_state)),
         "affordances": affordances,
     }
+
+
+def _generated_articulation_semantics(
+    config: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    """Infer conservative interaction metadata from one generated USD asset."""
+    path = Path(str(config.get("fpath", "")))
+    if path.suffix.lower() not in {".usd", ".usda", ".usdc"} or not path.is_file():
+        return {}, ["articulated"]
+    try:
+        from pxr import Usd, UsdPhysics
+
+        stage = Usd.Stage.Open(path.as_posix())
+    except (ImportError, RuntimeError):
+        return {}, ["articulated"]
+    if stage is None:
+        return {}, ["articulated"]
+
+    affordances = {"articulated"}
+    joint_settings: dict[str, list[float]] = {}
+    for prim in stage.Traverse():
+        if prim.IsA(UsdPhysics.RevoluteJoint):
+            joint_type = "revolute"
+            joint = UsdPhysics.RevoluteJoint(prim)
+        elif prim.IsA(UsdPhysics.PrismaticJoint):
+            joint_type = "prismatic"
+            joint = UsdPhysics.PrismaticJoint(prim)
+        else:
+            continue
+        authored_name = prim.GetAttribute("articraft:name").Get()
+        joint_name = str(authored_name or prim.GetName()).strip()
+        normalized_name = joint_name.casefold()
+        if not joint_name:
+            continue
+        if joint_type == "prismatic" and any(
+            token in normalized_name for token in ("drawer", "slide", "tray")
+        ):
+            affordances.add("slideable")
+        if joint_type == "prismatic" and any(
+            token in normalized_name for token in ("button", "press")
+        ):
+            affordances.add("pressable")
+        if joint_type == "revolute" and any(
+            token in normalized_name for token in ("door", "hinge")
+        ):
+            affordances.add("openable")
+        if joint_type == "revolute" and any(
+            token in normalized_name for token in ("rocker", "switch", "toggle")
+        ):
+            affordances.add("pressable")
+        if joint_type != "revolute" or not any(
+            token in normalized_name for token in ("knob", "dial", "rotary")
+        ):
+            continue
+        lower = joint.GetLowerLimitAttr().Get()
+        upper = joint.GetUpperLimitAttr().Get()
+        if lower is None or upper is None:
+            continue
+        lower_radians = math.radians(float(lower))
+        upper_radians = math.radians(float(upper))
+        if not (
+            math.isfinite(lower_radians)
+            and math.isfinite(upper_radians)
+            and lower_radians < upper_radians
+        ):
+            continue
+        joint_settings[joint_name] = [
+            lower_radians,
+            0.5 * (lower_radians + upper_radians),
+            upper_radians,
+        ]
+        affordances.add("turnable")
+    attributes = {"joint_settings": joint_settings} if joint_settings else {}
+    return attributes, sorted(affordances)
 
 
 def _runtime_object(config: Mapping[str, Any], *, role: str) -> dict[str, Any]:

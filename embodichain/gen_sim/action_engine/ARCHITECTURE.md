@@ -12,7 +12,7 @@ owners:
 2. `SceneAdapter` binds one verified candidate to a read-only existing scene,
    producing `SceneManifest`, `RoleBindings`, and a complete `BindingReport`.
 3. `ActionAgent` lowers the selected `GroundedTaskPlan` to the existing
-   `action_engine_seed_graph_v3`, performs executable capability preflight,
+   `action_engine_seed_graph_v4`, performs executable capability preflight,
    runs it through `ProgramExecutor`, and emits a tensor-free
    `ExecutionReport`. Report v2 records the episode seed, package and Python
    versions, Git commit/dirty state when available, and structured runtime
@@ -190,14 +190,24 @@ classifier, retry mode, and runtime availability.
 The executable catalog currently contains:
 
 - `PickUp`, `MoveHeldObject`, `MoveEndEffector`, `MoveJoints`, and `Place`
-- `Press`
+- `Pour` and `Press`
 - `CoordinatedPickment` and `CoordinatedPlacement`
 - `HandOver`
+- `Slide`, for opening or closing a live prismatic joint
+- `OpenDoor`, for opening a revolute door hinge by its handle
+- `Twist`, with explicit ordinal joint settings
 
-`Pour`, `PullArticulatedPart`, `PushArticulatedPart`, and `TurnKnob` are
-planning-only until matching lower-level implementations exist. They can be
-generated and statically checked, but preflight fails before any motion with
-the descriptor's unavailable reason.
+Articulation grounding reads live joint types, link geometry, limits, and
+positions. Zero-nearest joint endpoints represent closed or inactive states
+for generated binary mechanisms. The Scene Engine source adapter declares a
+three-position ordinal calibration only for unambiguous generated
+`knob`/`dial`/`rotary` joints, using the USD-authored revolute limits; authored
+`joint_settings` always win, and multiple calibrated joints remain an explicit
+ambiguity. GenSim converts authored prismatic limits to the uniformly scaled
+endpoints enforced by physics, reads USD revolute limits in radians, and wraps
+equivalent live angles before invoking `Slide`, `OpenDoor`, `Twist`, or `Press`.
+Rows already at their requested articulation state are verified without
+replaying motion.
 
 Adding an executable skill consists of registering its descriptor and reusable
 materializer/verifier hooks plus focused tests. Planner and executor dispatch

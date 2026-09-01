@@ -59,6 +59,12 @@ class _DualGraspSelectionContext:
     minimum_lateral_gap: float
 
 
+@dataclass(frozen=True, slots=True)
+class _InteractionGraspSelectionContext:
+    reference_xpos: torch.Tensor
+    candidate_rank: int
+
+
 class _TracingAntipodalGraspPoseGenerator(AntipodalGraspPoseGenerator):
     """Retain compact S1-S5 evidence from the concrete GenSim grasp backend."""
 
@@ -68,6 +74,9 @@ class _TracingAntipodalGraspPoseGenerator(AntipodalGraspPoseGenerator):
         self._last_upright_trace: dict[str, Any] | None = None
         self._selection_context: _DualGraspSelectionContext | None = None
         self._upright_selection_context: _UprightGraspSelectionContext | None = None
+        self._interaction_selection_context: (
+            _InteractionGraspSelectionContext | None
+        ) = None
 
     @property
     def last_dual_trace(self) -> dict[str, Any] | None:
@@ -100,6 +109,70 @@ class _TracingAntipodalGraspPoseGenerator(AntipodalGraspPoseGenerator):
             yield
         finally:
             self._upright_selection_context = None
+
+    @contextmanager
+    def interaction_selection_context(
+        self,
+        *,
+        reference_xpos: torch.Tensor,
+        candidate_rank: int,
+    ) -> Iterator[None]:
+        """Select one kinematically distinct single-arm grasp candidate."""
+        if self._interaction_selection_context is not None:
+            raise RuntimeError("Interaction grasp selection context cannot be nested.")
+        if type(candidate_rank) is not int or candidate_rank < 0:
+            raise ValueError("Interaction grasp candidate_rank must be non-negative.")
+        reference = torch.as_tensor(reference_xpos, dtype=torch.float32)
+        if reference.ndim == 2:
+            reference = reference.unsqueeze(0)
+        if reference.ndim != 3 or reference.shape[1:] != (4, 4):
+            raise ValueError("Interaction reference_xpos must have shape (B, 4, 4).")
+        self._interaction_selection_context = _InteractionGraspSelectionContext(
+            reference_xpos=reference.clone(),
+            candidate_rank=candidate_rank,
+        )
+        try:
+            yield
+        finally:
+            self._interaction_selection_context = None
+
+    def get_best_grasp_poses(
+        self,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Select a ranked interaction candidate when a context is installed."""
+        context = self._interaction_selection_context
+        if context is None:
+            return super().get_best_grasp_poses(**kwargs)
+        rows = self.get_valid_grasp_poses(**kwargs)
+        successes: list[bool] = []
+        selected: list[torch.Tensor] = []
+        for row_index, (poses, costs) in enumerate(rows):
+            poses = torch.as_tensor(poses, dtype=torch.float32)
+            costs = torch.as_tensor(costs, dtype=torch.float32, device=poses.device)
+            if poses.ndim == 2:
+                poses = poses.unsqueeze(0)
+            reference = context.reference_xpos[
+                min(row_index, context.reference_xpos.shape[0] - 1)
+            ].to(device=poses.device, dtype=poses.dtype)
+            canonical = _canonicalize_parallel_jaw_poses(poses, reference)
+            scores = costs + canonical.selected_rotation_radians.to(costs) / torch.pi
+            ranked = torch.argsort(scores)
+            if context.candidate_rank >= ranked.numel() or not bool(
+                torch.isfinite(scores[ranked[context.candidate_rank]])
+            ):
+                successes.append(False)
+                selected.append(torch.eye(4, dtype=poses.dtype, device=poses.device))
+                continue
+            index = int(ranked[context.candidate_rank])
+            successes.append(True)
+            selected.append(canonical.poses[index])
+        device = selected[0].device
+        return (
+            torch.tensor(successes, dtype=torch.bool, device=device),
+            torch.stack(selected),
+            torch.zeros(len(selected), dtype=torch.float32, device=device),
+        )
 
     @contextmanager
     def dual_arm_selection_context(

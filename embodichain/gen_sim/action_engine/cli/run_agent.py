@@ -66,7 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--agent_config",
         required=True,
-        help="Path to action_engine_config_v2 JSON.",
+        help="Path to action_engine_config_v3 JSON.",
     )
     parser.add_argument(
         "--regenerate",

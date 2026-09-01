@@ -41,7 +41,7 @@ __all__ = [
 ]
 
 _RETRY_MODES = frozenset({"direct", "recover_then_retry", "non_retryable"})
-ACTION_CONTRACT_VERSION = "action_contract_v2"
+ACTION_CONTRACT_VERSION = "action_contract_v3"
 _PREDICATES = frozenset(
     {
         "arm_free",
@@ -360,6 +360,8 @@ def build_atomic_capability_registry() -> AtomicCapabilityRegistry:
         MoveHeldObjectOptions,
         MoveJoints,
         MoveJointsOptions,
+        OpenDoor,
+        OpenDoorOptions,
         PickUp,
         PickUpOptions,
         Place,
@@ -464,7 +466,7 @@ def build_atomic_capability_registry() -> AtomicCapabilityRegistry:
             contract_resolver_hook=_resolve_pour_contract,
         ),
         AtomicCapability(
-            "PullArticulatedPart",
+            "Slide",
             Slide,
             SlideOptions,
             frozenset({"articulation_goal"}),
@@ -472,29 +474,31 @@ def build_atomic_capability_registry() -> AtomicCapabilityRegistry:
             "single_arm_object",
             "articulation_change",
             "slide",
-            motion_base="Press",
+            motion_base="Slide",
             verifier="postcondition",
+            failure_classifier="articulation",
             retry_mode="non_retryable",
             contract_resolver_hook=_resolve_articulation_contract,
             allows_target_contact=True,
         ),
         AtomicCapability(
-            "PushArticulatedPart",
-            Slide,
-            SlideOptions,
+            "OpenDoor",
+            OpenDoor,
+            OpenDoorOptions,
             frozenset({"articulation_goal"}),
             frozenset({"arm"}),
             "single_arm_object",
             "articulation_change",
-            "slide",
-            motion_base="Press",
+            "open_door",
+            motion_base="OpenDoor",
             verifier="postcondition",
+            failure_classifier="articulation",
             retry_mode="non_retryable",
             contract_resolver_hook=_resolve_articulation_contract,
             allows_target_contact=True,
         ),
         AtomicCapability(
-            "TurnKnob",
+            "Twist",
             Twist,
             TwistOptions,
             frozenset({"articulation_goal"}),
@@ -502,8 +506,9 @@ def build_atomic_capability_registry() -> AtomicCapabilityRegistry:
             "single_arm_object",
             "articulation_change",
             "twist",
-            motion_base="Press",
+            motion_base="Twist",
             verifier="postcondition",
+            failure_classifier="articulation",
             retry_mode="non_retryable",
             contract_resolver_hook=_resolve_articulation_contract,
             allows_target_contact=True,
@@ -518,6 +523,7 @@ def build_atomic_capability_registry() -> AtomicCapabilityRegistry:
             "preserve",
             "press",
             verifier="pressed",
+            failure_classifier="articulation",
             allows_target_contact=True,
         ),
         AtomicCapability(
@@ -1012,6 +1018,12 @@ def _verify_arm_clearance(
     if transfer_arm not in {"left_arm", "right_arm"}:
         return torch.zeros_like(attempted)
     entity = executor.env.sim.get_rigid_object(object_uid)
+    if entity is None:
+        entity = getattr(
+            executor.env.sim,
+            "get_articulation",
+            lambda _uid: None,
+        )(object_uid)
     getter = getattr(executor.env, "get_current_xpos_agent", None)
     if entity is None or not callable(getter):
         return torch.zeros_like(attempted)

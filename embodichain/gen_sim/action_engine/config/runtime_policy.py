@@ -43,8 +43,8 @@ __all__ = [
     "runtime_policy_hash",
 ]
 
-ACTION_ENGINE_DEFAULTS_SCHEMA: Final = "action_engine_defaults_v1"
-RUNTIME_POLICY_SCHEMA: Final = "action_engine_runtime_policy_v8"
+ACTION_ENGINE_DEFAULTS_SCHEMA: Final = "action_engine_defaults_v2"
+RUNTIME_POLICY_SCHEMA: Final = "action_engine_runtime_policy_v9"
 _PRE_GRIPPER_PROFILE_RUNTIME_POLICY_SCHEMA: Final = "action_engine_runtime_policy_v7"
 _PRE_AXIS_RUNTIME_POLICY_SCHEMA: Final = "action_engine_runtime_policy_v6"
 _PREVIOUS_RUNTIME_POLICY_SCHEMA: Final = "action_engine_runtime_policy_v5"
@@ -71,6 +71,9 @@ _GROUNDING_KEYS = {
         "press_depth",
         "retreat_height",
         "maximum_eef_height",
+        "interaction_staging_distance",
+        "safe_retreat_distance",
+        "safe_retreat_height",
     },
     "arrangement": {
         "slot_margin",
@@ -166,6 +169,9 @@ _MOTION_DEFAULT_ACTIONS = {
     "PickUp",
     "Place",
     "Press",
+    "Slide",
+    "OpenDoor",
+    "Twist",
 }
 _PREDICATE_KEYS = {
     "held_position_tolerance",
@@ -716,7 +722,7 @@ def runtime_policy_hash(policy: RuntimePolicyCfg | Mapping[str, Any]) -> str:
 
 
 def resolve_agent_runtime_policy(agent_config: Mapping[str, Any]) -> RuntimePolicyCfg:
-    """Resolve a generated snapshot or fall back for a legacy v1 artifact."""
+    """Resolve one current generated snapshot or package default."""
     snapshot = agent_config.get("runtime_policy")
     expected_hash = agent_config.get("runtime_policy_hash")
     if snapshot is None:
@@ -734,6 +740,11 @@ def resolve_agent_runtime_policy(agent_config: Mapping[str, Any]) -> RuntimePoli
     if _mapping_hash(snapshot) != expected_hash:
         raise ValueError(
             "agent_config runtime policy hash does not match its snapshot."
+        )
+    if snapshot.get("schema_version") != RUNTIME_POLICY_SCHEMA:
+        raise ValueError(
+            "Runtime policy schema is incompatible; regenerate the Action Engine "
+            f"bundle with {RUNTIME_POLICY_SCHEMA}."
         )
     if snapshot.get("schema_version") == _PRE_GRIPPER_PROFILE_RUNTIME_POLICY_SCHEMA:
         migrated = deepcopy(dict(snapshot))

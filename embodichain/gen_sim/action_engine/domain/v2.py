@@ -933,8 +933,8 @@ def _action_contract(value: Any, context: str) -> dict[str, Any]:
     if set(contract) != _ACTION_CONTRACT_KEYS:
         missing = sorted(_ACTION_CONTRACT_KEYS - set(contract))
         raise ValueError(f"{context} is missing required fields: {missing}.")
-    if contract["version"] != "action_contract_v2":
-        raise ValueError(f"{context}.version must be 'action_contract_v2'.")
+    if contract["version"] != "action_contract_v3":
+        raise ValueError(f"{context}.version must be 'action_contract_v3'.")
     contract["requires"] = [
         _state_atom(item, f"{context}.requires[{index}]")
         for index, item in enumerate(

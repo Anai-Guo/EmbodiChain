@@ -35,7 +35,7 @@ def _task() -> dict:
         "required_arm": "right_arm",
     }
     return {
-        "schema_version": "action_engine_task_spec_v2",
+        "schema_version": "action_engine_task_spec_v3",
         "task_id": "e3_single",
         "level": "L1",
         "instruction": "Pour from the source container into the target container.",

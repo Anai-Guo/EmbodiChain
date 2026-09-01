@@ -96,12 +96,12 @@ def load_execution_program(
         raise ValueError(
             "SeedGraph v2 lacks persisted Action Contracts and cannot be loaded; "
             "regenerate seed_task_graph.json and agent_config.json with the current "
-            "generator to produce action_engine_seed_graph_v3."
+            "generator to produce action_engine_seed_graph_v4."
         )
     if schema == EXECUTION_PROGRAM_SCHEMA:
         raise ValueError(
             "Action Engine v1 execution programs are no longer accepted; "
-            "regenerate the task to produce action_engine_seed_graph_v3."
+            "regenerate the task to produce action_engine_seed_graph_v4."
         )
     raise ValueError(f"Unsupported Action Engine graph schema {schema!r}.")
 

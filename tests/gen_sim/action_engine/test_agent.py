@@ -86,7 +86,7 @@ def test_plan_hash_matches_direct_seed_graph_instantiation(monkeypatch) -> None:
 def test_planning_only_graph_is_rejected_before_executor_construction() -> None:
     task, requirements = _task_of_type("E6")
     bindings = _bindings(requirements)
-    registry = _registry_with_planning_only("PullArticulatedPart")
+    registry = _registry_with_planning_only("Slide")
     graph = instantiate_seed_graph(task, bindings, registry=registry)
     constructed = False
 
@@ -210,7 +210,7 @@ def test_runtime_exception_is_reported_as_aborted() -> None:
 def test_preflight_raises_for_planning_only_graph() -> None:
     task, requirements = _task_of_type("E8")
     bindings = _bindings(requirements)
-    registry = _registry_with_planning_only("TurnKnob")
+    registry = _registry_with_planning_only("Twist")
 
     with pytest.raises(ValueError, match="planning-only"):
         ActionAgent(registry=registry).preflight(

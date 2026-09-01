@@ -40,6 +40,13 @@ from embodichain.gen_sim.action_engine.runtime import (
     load_agent_execution_program,
     load_execution_program,
 )
+from embodichain.gen_sim.action_engine.runtime.articulation import (
+    _active_joint_candidates,
+    _closed_open_endpoints,
+    _effective_joint_limits,
+    _effective_joint_position,
+    _select_joint_candidate,
+)
 from embodichain.gen_sim.action_engine.runtime.solver_compat import (
     install_action_engine_solver_compat,
     repair_action_engine_ur5_solver_cfg,
@@ -155,7 +162,35 @@ class ActionEngineEnv(EmbodiedEnv):
         self.agent_initial_object_heights = {
             uid: item["height"].clone() for uid, item in self.obj_info.items()
         }
+        self._capture_articulation_qpos_offsets()
         self._runtime_state_ready = True
+
+    def _capture_articulation_qpos_offsets(self) -> None:
+        """Use each generated USD revolute reset pose as its semantic zero."""
+        list_articulations = getattr(self.sim, "get_articulation_uid_list", None)
+        get_articulation = getattr(self.sim, "get_articulation", None)
+        if not callable(list_articulations) or not callable(get_articulation):
+            return
+        for uid in list_articulations():
+            articulation = get_articulation(str(uid))
+            if articulation is None:
+                continue
+            source = str(getattr(getattr(articulation, "cfg", None), "fpath", ""))
+            if not source.lower().endswith((".usd", ".usda", ".usdc")):
+                continue
+            raw_qpos = torch.as_tensor(
+                articulation.get_qpos(),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            offsets = {
+                joint_id: raw_qpos[:, joint_id].clone()
+                for joint_id, _, _ in _active_joint_candidates(
+                    articulation,
+                    joint_types={"revolute"},
+                )
+            }
+            setattr(articulation, "_gen_sim_revolute_qpos_offsets", offsets)
 
     def _resolve_arm_slots(self) -> dict[str, dict[str, str | None] | None]:
         configured = getattr(self, "agent_arm_slots", None)
@@ -264,28 +299,72 @@ class ActionEngineEnv(EmbodiedEnv):
             and not isinstance(values, (str, bytes, bytearray))
             and len(values) >= 2
         ]
-        if len(matches) != 1:
-            return torch.zeros(int(self.num_envs), dtype=torch.bool, device=self.device)
-        joint_name, raw_values = matches[0]
-        values = torch.as_tensor(
-            raw_values, dtype=torch.float32, device=self.device
-        ).flatten()
-        if not torch.isfinite(values).all():
-            return torch.zeros(int(self.num_envs), dtype=torch.bool, device=self.device)
+        if len(matches) == 1:
+            joint_name, raw_values = matches[0]
+            values = torch.as_tensor(
+                raw_values, dtype=torch.float32, device=self.device
+            ).flatten()
+            if not torch.isfinite(values).all():
+                return torch.zeros(
+                    int(self.num_envs), dtype=torch.bool, device=self.device
+                )
+            inactive = values[0]
+            activated = values[-1]
+            unique = torch.unique(values, sorted=True)
+            if unique.numel() < 2:
+                return torch.zeros(
+                    int(self.num_envs), dtype=torch.bool, device=self.device
+                )
+            minimum_spacing = torch.diff(unique).abs().min()
+            joint_id = articulation.joint_names.index(joint_name)
+        else:
+            try:
+                candidates = _active_joint_candidates(
+                    articulation,
+                    joint_types={"prismatic"},
+                )
+                preferred_tokens = ("button", "press")
+                if not candidates:
+                    candidates = _active_joint_candidates(
+                        articulation,
+                        joint_types={"revolute"},
+                    )
+                    preferred_tokens = ("rocker", "switch", "toggle")
+                joint_id, joint_name, joint_info = _select_joint_candidate(
+                    candidates,
+                    preferred_name_tokens=preferred_tokens,
+                    context="Button verification",
+                )
+                limits = _effective_joint_limits(articulation, joint_id, joint_info)
+                inactive_rows, activated_rows = _closed_open_endpoints(limits)
+            except (TypeError, ValueError):
+                return torch.zeros(
+                    int(self.num_envs), dtype=torch.bool, device=self.device
+                )
+            inactive = inactive_rows
+            activated = activated_rows
+            minimum_spacing = torch.abs(activated_rows - inactive_rows).min()
         if terminal_state == "activated":
-            target = values[-1]
+            target = activated
         elif terminal_state == "inactive":
-            target = values[0]
+            target = inactive
         else:
             return torch.zeros(int(self.num_envs), dtype=torch.bool, device=self.device)
-        unique = torch.unique(values, sorted=True)
-        if unique.numel() < 2:
-            return torch.zeros(int(self.num_envs), dtype=torch.bool, device=self.device)
-        minimum_spacing = torch.diff(unique).abs().min()
         fallback = float(self.runtime_policy.predicate_fallbacks["axis_tolerance"])
         tolerance = min(fallback, float(minimum_spacing) * 0.25)
-        joint_id = articulation.joint_names.index(joint_name)
-        qpos = articulation.get_qpos()[:, joint_id]
+        joint_info = (
+            _select_joint_candidate(
+                _active_joint_candidates(
+                    articulation,
+                    joint_types={"prismatic", "revolute"},
+                ),
+                preferred_name_tokens=(joint_name,),
+                context="Button verification",
+            )[2]
+            if len(matches) == 1
+            else joint_info
+        )
+        qpos = _effective_joint_position(articulation, joint_id, joint_info)
         return torch.isfinite(qpos) & (torch.abs(qpos - target) <= tolerance)
 
     def set_current_qpos_agent(

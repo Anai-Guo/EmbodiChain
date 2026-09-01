@@ -372,7 +372,7 @@ def test_fast_gym_config_has_runnable_franka_contract(gym_export: Path) -> None:
     )
     assert (
         config["env"]["extensions"]["action_engine"]["defaults_schema_version"]
-        == "action_engine_defaults_v1"
+        == "action_engine_defaults_v2"
     )
     registry = config["env"]["events"]["register_info_to_env"]["params"]["registry"]
     assert [entry["entity_cfg"]["uid"] for entry in registry] == ["interact_can"]
@@ -443,6 +443,54 @@ def test_fast_gym_config_normalizes_usdc_articulation_runtime_fields(
             "proxy_body_scale",
         }
         & articulation.keys()
+    )
+
+
+def test_prepare_scene_infers_generated_knob_settings_in_radians(
+    gym_export: Path,
+) -> None:
+    from pxr import Usd, UsdGeom, UsdPhysics
+
+    usda_path = gym_export / "rotary_switch.usda"
+    stage = Usd.Stage.CreateNew(usda_path.as_posix())
+    root = UsdGeom.Xform.Define(stage, "/World/rotary_switch")
+    stage.SetDefaultPrim(root.GetPrim())
+    joint = UsdPhysics.RevoluteJoint.Define(
+        stage,
+        "/World/rotary_switch/knob_rotation",
+    )
+    joint.CreateLowerLimitAttr(-150.0)
+    joint.CreateUpperLimitAttr(150.0)
+    stage.GetRootLayer().Save()
+
+    source_path = gym_export / "gym_config.json"
+    source = json.loads(source_path.read_text(encoding="utf-8"))
+    source["articulation"] = [
+        {
+            "uid": "switch_001",
+            "category": "switch_plate",
+            "name": "rotary switch",
+            "description": "A switch plate with one rotary knob.",
+            "is_articulated": True,
+            "fpath": usda_path.name,
+            "proxy_glb_fpath": "mesh_assets/can.glb",
+            "proxy_body_scale": [1.0, 1.0, 1.0],
+            "init_pos": [0.0, 0.0, 0.7],
+            "init_rot": [0.0, 0.0, 0.0],
+            "body_scale": [1.0, 1.0, 1.0],
+            "fix_base": True,
+        }
+    ]
+    source_path.write_text(json.dumps(source), encoding="utf-8")
+
+    scene = prepare_scene(gym_export)
+    knob = next(
+        item for item in scene.planner_objects if item["role"] == "articulation"
+    )
+
+    assert knob["affordances"] == ["articulated", "turnable"]
+    assert knob["attributes"]["joint_settings"]["knob_rotation"] == pytest.approx(
+        [-2.6179939, 0.0, 2.6179939]
     )
 
 
@@ -772,7 +820,7 @@ def test_agent_config_owns_articulation_setting_calibration(
     settings = {"microwave": {"timer_joint": [-1.0, 0.0, 1.0]}}
 
     agent = build_agent_config(
-        task_name="turn_knob",
+        task_name="twist",
         robot_profile="franka",
         execution_program_hash="f" * 64,
         source_config_path=scene.source_config_path,
@@ -788,7 +836,7 @@ def test_agent_config_owns_articulation_setting_calibration(
 
 def test_ab_scene_requirements_declare_four_vlm_views() -> None:
     requirements = {
-        "schema_version": "action_engine_scene_requirements_v2",
+        "schema_version": "action_engine_scene_requirements_v3",
         "task_id": "ab",
         "objects": [
             {
@@ -1321,13 +1369,13 @@ def test_generation_calls_interpreter_recipe_and_renderer_once(
     assert rendered["program"] is published["program"]
 
     agent_config = json.loads(paths.agent_config.read_text(encoding="utf-8"))
-    assert agent_config["schema_version"] == "action_engine_config_v2"
+    assert agent_config["schema_version"] == "action_engine_config_v3"
     assert agent_config["task_spec"] == "task_spec.json"
     assert agent_config["scene_requirements"] == "scene_requirements.json"
     assert agent_config["seed_task_graph"] == "seed_task_graph.json"
     assert len(agent_config["seed_task_graph_hash"]) == 64
     assert agent_config["runtime_policy"]["schema_version"] == (
-        "action_engine_runtime_policy_v8"
+        "action_engine_runtime_policy_v9"
     )
     assert agent_config["runtime_policy"]["planner"]["dynamic_collision"] is True
     assert agent_config["runtime_policy"]["planner"]["static_obstacle_uids"] == [

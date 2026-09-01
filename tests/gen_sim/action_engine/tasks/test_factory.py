@@ -32,7 +32,34 @@ from tests.gen_sim.action_engine.task_fixtures import (
     TASK2_1_HISTORICAL_ROLE_BINDINGS,
     TASK2_1_HISTORICAL_SCENE_FINGERPRINT,
     make_task2_1_historical_spec,
+    make_task_spec,
 )
+
+
+def test_e6_e9_recipes_use_staging_interaction_retreat_and_home() -> None:
+    expected = {"E6": "Slide", "E7": "OpenDoor", "E8": "Twist", "E9": "Press"}
+    for task_type, interaction in expected.items():
+        task, _ = make_task_spec(task_type)
+        graph = instantiate_seed_graph(task, {"object_01": "interaction_target"})
+        nodes = graph["nodes"]
+        assert [node["atomic_action"] for node in nodes] == [
+            "MoveEndEffector",
+            interaction,
+            "MoveEndEffector",
+            "MoveJoints",
+        ]
+        assert [node["contract"]["failure_policy"] for node in nodes] == [
+            "task_required",
+            "task_required",
+            "safety_required",
+            "best_effort",
+        ]
+        assert nodes[2]["target_binding"]["operation"] == "safe_retreat"
+        assert nodes[3]["target_binding"] == {
+            "kind": "joint_state",
+            "source": "initial",
+            "required_home": False,
+        }
 
 
 def _selector(
@@ -199,7 +226,7 @@ def test_historical_task2_1_reacquires_objects_after_release() -> None:
 
 def test_orient_then_handover_releases_then_reacquires_with_role_side_pickup() -> None:
     task = {
-        "schema_version": "action_engine_task_spec_v2",
+        "schema_version": "action_engine_task_spec_v3",
         "task_id": "orient_then_handover",
         "level": "L3",
         "instruction": "test-instruction-orient-handover",
@@ -401,7 +428,7 @@ def test_orient_then_handover_releases_then_reacquires_with_role_side_pickup() -
 
 def test_pour_recipe_completes_release_and_home_without_observable_contents() -> None:
     task = {
-        "schema_version": "action_engine_task_spec_v2",
+        "schema_version": "action_engine_task_spec_v3",
         "task_id": "pour_contents",
         "level": "L1",
         "instruction": "Pour the ball from the cup into the bin.",
@@ -459,7 +486,7 @@ def test_pour_recipe_completes_release_and_home_without_observable_contents() ->
 
 def test_handover_to_place_uses_receiver_hold_without_repickup() -> None:
     task = {
-        "schema_version": "action_engine_task_spec_v2",
+        "schema_version": "action_engine_task_spec_v3",
         "task_id": "handover_then_place",
         "level": "L3",
         "instruction": "test-instruction-handover-place",
@@ -570,7 +597,7 @@ def test_handover_to_place_uses_receiver_hold_without_repickup() -> None:
 
 def test_e4_hold_owns_receiver_safe_exit() -> None:
     task = {
-        "schema_version": "action_engine_task_spec_v2",
+        "schema_version": "action_engine_task_spec_v3",
         "task_id": "handover_hold",
         "level": "L1",
         "instruction": "Hand the can to the right arm and keep holding it.",
@@ -615,7 +642,7 @@ def test_e4_hold_owns_receiver_safe_exit() -> None:
 
 def test_e4_place_owns_receiver_placement_without_e1(monkeypatch) -> None:
     task = {
-        "schema_version": "action_engine_task_spec_v2",
+        "schema_version": "action_engine_task_spec_v3",
         "task_id": "handover_place",
         "level": "L1",
         "instruction": "Hand the can to the right arm and place it on the notebook.",

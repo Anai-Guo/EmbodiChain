@@ -54,6 +54,11 @@ from embodichain.gen_sim.action_engine.domain import (
 )
 from embodichain.gen_sim.action_engine.environment import agent_env as env_module
 from embodichain.gen_sim.action_engine.runtime.actions import AtomicActionAdapter
+from embodichain.gen_sim.action_engine.runtime.articulation import (
+    _effective_joint_limits,
+    _effective_joint_position,
+    _named_link_geometry,
+)
 from embodichain.gen_sim.action_engine.runtime.executor import (
     ProgramExecutor,
     _EdgeResult,
@@ -103,6 +108,8 @@ from embodichain.lab.sim.atomic_actions import (
     HeldObjectState,
     JointPositionGoal,
     ObjectSemantics,
+    OpenDoorAffordance,
+    OpenDoorGoal,
     PickUpOptions,
     PourGoal,
     PressAffordance,
@@ -190,6 +197,8 @@ class _FakeArticulation:
         self.all_joint_names = ["slide_joint", "fixed_handle"]
         self._qpos = torch.tensor([[qpos]], dtype=torch.float32)
         self._limits = torch.tensor([[[0.0, 0.2]]], dtype=torch.float32)
+        self.cfg = SimpleNamespace(body_scale=(1.0, 1.0, 1.0), fpath="")
+        self.device = torch.device("cpu")
         self._pose = _pose(0.0, 0.0, 0.7)
         self._handle_pose = _pose(0.05, 0.0, 0.72)
         self._handle_pose[:, :3, :3] = torch.tensor(
@@ -199,6 +208,7 @@ class _FakeArticulation:
         self._handle_vertices = _box_vertices(0.02)
         self._triangles = torch.tensor([[0, 1, 2], [0, 2, 3]], dtype=torch.int64)
         self._joint_info = SimpleNamespace(
+            name="slide_joint",
             joint_type=SimpleNamespace(name="PRISMATIC"),
             child_link_name="drawer_link",
             parent_link_name="base",
@@ -224,9 +234,16 @@ class _FakeArticulation:
         assert to_matrix
         return self._pose.clone()
 
-    def get_link_pose(self, link_name: str, *, to_matrix: bool) -> torch.Tensor:
+    def get_link_pose(
+        self,
+        link_name: str,
+        env_ids: list[int] | None = None,
+        *,
+        to_matrix: bool,
+    ) -> torch.Tensor:
         assert link_name in self.link_names
         assert to_matrix
+        del env_ids
         if link_name == "handle":
             return self._handle_pose.clone()
         return self._pose.clone()
@@ -242,6 +259,21 @@ class _FakeArticulation:
 
     def get_qpos_limits(self, *, joint_ids: list[int]) -> torch.Tensor:
         return self._limits[:, joint_ids].clone()
+
+    def get_parent_joint_chain(self, link_name: str) -> tuple[SimpleNamespace, ...]:
+        assert link_name in self.link_names
+        lower, upper = self._limits[0, 0].tolist()
+        return (
+            SimpleNamespace(
+                name="slide_joint",
+                joint_type=str(self._joint_info.joint_type.name).lower(),
+                child_link_name="drawer_link",
+                parent_link_name="base",
+                axis=self._joint_info.axis,
+                origin_pose=self._joint_info.origin_pose,
+                joint_limits=(float(lower), float(upper)),
+            ),
+        )
 
 
 class _FakeSim:
@@ -261,6 +293,9 @@ class _FakeSim:
 
     def get_articulation(self, uid: str) -> _FakeArticulation | None:
         return self.articulations.get(uid)
+
+    def get_articulation_uid_list(self) -> list[str]:
+        return list(self.articulations)
 
     def update(self, *, step: int) -> None:
         del step
@@ -388,6 +423,10 @@ def _pose(x: float, y: float, z: float) -> torch.Tensor:
     return result
 
 
+def _interaction_edge(program):
+    return program.edges[1]
+
+
 def test_press_grounding_adapts_top_surface_and_depth_to_mainline_contract() -> None:
     entity = _FakeEntity("button", _pose(0.1, -0.2, 0.75), _box_vertices(0.03))
     env = _FakeEnv({"button": entity})
@@ -455,7 +494,7 @@ def test_press_grounding_uses_calibrated_prismatic_button_state() -> None:
     step = program.semantic_steps[0]
 
     grounded = ActionGrounder(program, env, lambda _uid: semantics).ground(
-        program.edges[0].actions[0],
+        _interaction_edge(program).actions[0],
         step,
         arm="left_arm",
         state=ExecutionState(last_qpos=env.robot.get_qpos()),
@@ -467,6 +506,152 @@ def test_press_grounding_uses_calibrated_prismatic_button_state() -> None:
     assert torch.allclose(affordance.press_axis, torch.tensor([0.0, 0.0, -1.0]))
     assert grounded.cfg["press_distance"] == pytest.approx(0.02)
     assert grounded.cfg["articulation_target_qpos"].item() == pytest.approx(0.02)
+
+
+def test_press_grounding_uses_zero_nearest_endpoint_without_calibration() -> None:
+    task, _ = make_task_spec("E9")
+    program = load_execution_program(
+        instantiate_seed_graph(task, {"object_01": "button"})
+    )
+    articulation = _FakeArticulation("button", 0.0)
+    articulation._joint_info.axis = torch.tensor([0.0, 0.0, -1.0])
+    articulation._limits = torch.tensor([[[-0.02, 0.0]]])
+    env = _FakeEnv(articulations={"button": articulation})
+    env.agent_config = {"articulation_settings": {}}
+    env.runtime_policy = default_runtime_policy("dual_franka")
+    semantics = ObjectSemantics(
+        affordance=Affordance(),
+        geometry={},
+        entity_id="button",
+        label="button",
+    )
+    step = program.semantic_steps[0]
+
+    grounded = ActionGrounder(program, env, lambda _uid: semantics).ground(
+        _interaction_edge(program).actions[0],
+        step,
+        arm="left_arm",
+        state=ExecutionState(last_qpos=env.robot.get_qpos()),
+    )
+
+    assert isinstance(grounded.target, PressGoal)
+    assert grounded.cfg["press_distance"] == pytest.approx(0.02)
+    assert grounded.cfg["articulation_target_qpos"].item() == pytest.approx(-0.02)
+    from embodichain.gen_sim.action_engine.environment.agent_env import ActionEngineEnv
+
+    assert not bool(ActionEngineEnv.is_object_pressed(env, "button")[0])
+    articulation._qpos[0, 0] = -0.019
+    assert bool(ActionEngineEnv.is_object_pressed(env, "button")[0])
+
+
+def test_prismatic_grounding_uses_physics_scaled_runtime_limits() -> None:
+    task, _ = make_task_spec("E9")
+    program = load_execution_program(
+        instantiate_seed_graph(task, {"object_01": "button"})
+    )
+    articulation = _FakeArticulation("button", 0.0)
+    articulation._joint_info.axis = torch.tensor([0.0, 0.0, -1.0])
+    articulation._limits = torch.tensor([[[-0.004, 0.0]]])
+    articulation.cfg.body_scale = (0.25, 0.25, 0.25)
+    env = _FakeEnv(articulations={"button": articulation})
+    env.agent_config = {"articulation_settings": {}}
+    env.runtime_policy = default_runtime_policy("dual_franka")
+    step = program.semantic_steps[0]
+
+    grounded = ActionGrounder(
+        program,
+        env,
+        lambda uid: ObjectSemantics(
+            affordance=Affordance(),
+            geometry={},
+            entity_id=uid,
+            label=uid,
+        ),
+    ).ground(
+        _interaction_edge(program).actions[0],
+        step,
+        arm="left_arm",
+        state=ExecutionState(last_qpos=env.robot.get_qpos()),
+    )
+
+    assert grounded.cfg["press_distance"] == pytest.approx(0.001)
+    assert grounded.cfg["articulation_target_qpos"].item() == pytest.approx(-0.001)
+    articulation._qpos[0, 0] = -0.001
+    from embodichain.gen_sim.action_engine.environment.agent_env import ActionEngineEnv
+
+    assert bool(ActionEngineEnv.is_object_pressed(env, "button")[0])
+
+
+def test_executor_skips_articulation_action_when_goal_is_already_satisfied() -> None:
+    task, _ = make_task_spec("E9")
+    program = load_execution_program(
+        instantiate_seed_graph(task, {"object_01": "button"})
+    )
+    articulation = _FakeArticulation("button", -0.001)
+    articulation._limits = torch.tensor([[[-0.004, 0.0]]])
+    articulation.cfg.body_scale = (0.25, 0.25, 0.25)
+    env = _FakeEnv(articulations={"button": articulation})
+    env.agent_config = {"articulation_settings": {}}
+    env.runtime_policy = default_runtime_policy("dual_franka")
+    from embodichain.gen_sim.action_engine.environment.agent_env import ActionEngineEnv
+
+    env.is_object_pressed = lambda uid, terminal_state="activated": (
+        ActionEngineEnv.is_object_pressed(env, uid, terminal_state)
+    )
+    executor = ProgramExecutor(program, env, record_runtime=False)
+
+    satisfied = executor._already_satisfied_articulation_rows(
+        _interaction_edge(program),
+        program.semantic_steps[0],
+        active=torch.ones(1, dtype=torch.bool),
+    )
+
+    assert satisfied.tolist() == [True]
+
+
+def test_press_grounding_supports_a_revolute_rocker_switch() -> None:
+    task, _ = make_task_spec("E9")
+    program = load_execution_program(
+        instantiate_seed_graph(task, {"object_01": "switch"})
+    )
+    articulation = _FakeArticulation("switch", -0.1)
+    articulation.joint_names = ["rocker_pivot"]
+    articulation.all_joint_names = ["rocker_pivot"]
+    articulation._joint_info.name = "rocker_pivot"
+    articulation._joint_info.joint_type = SimpleNamespace(name="REVOLUTE")
+    articulation._joint_info.axis = torch.tensor([1.0, 0.0, 0.0])
+    articulation._limits = torch.tensor([[[-0.1, 0.1]]])
+    articulation._entities = [
+        SimpleNamespace(get_joint_info=lambda _name: articulation._joint_info)
+    ]
+    env = _FakeEnv(articulations={"switch": articulation})
+    above = _pose(0.0, 0.0, 1.1)
+    env.get_current_xpos_agent = lambda: (above.clone(), above.clone())
+    env.agent_config = {"articulation_settings": {}}
+    env.runtime_policy = default_runtime_policy("dual_franka")
+    semantics = ObjectSemantics(
+        affordance=Affordance(),
+        geometry={},
+        entity_id="switch",
+        label="switch",
+    )
+
+    grounded = ActionGrounder(program, env, lambda _uid: semantics).ground(
+        _interaction_edge(program).actions[0],
+        program.semantic_steps[0],
+        arm="right_arm",
+        state=ExecutionState(last_qpos=env.robot.get_qpos()),
+    )
+
+    assert isinstance(grounded.target, PressGoal)
+    assert isinstance(grounded.target.semantics.affordance, PressAffordance)
+    assert grounded.cfg["articulation_target_qpos"].item() == pytest.approx(0.1)
+    assert grounded.cfg["press_distance"] > 0.0
+    from embodichain.gen_sim.action_engine.environment.agent_env import ActionEngineEnv
+
+    assert not bool(ActionEngineEnv.is_object_pressed(env, "switch")[0])
+    articulation._qpos[0, 0] = 0.1
+    assert bool(ActionEngineEnv.is_object_pressed(env, "switch")[0])
 
 
 def test_pressed_provider_requires_live_calibrated_joint_state() -> None:
@@ -516,7 +701,7 @@ def test_loader_regenerates_in_memory_without_execution_artifact(
     task_path = tmp_path / "task_spec.json"
     task_path.write_text(json.dumps(task_spec), encoding="utf-8")
     agent_config = {
-        "schema_version": "action_engine_config_v2",
+        "schema_version": "action_engine_config_v3",
         "task_spec": task_path.name,
         "seed_task_graph": "not_written.json",
     }
@@ -820,7 +1005,7 @@ def test_runtime_policy_discards_legacy_support_z_fallbacks() -> None:
     assert "support_max_z_offset" not in policy.predicate_fallbacks
 
 
-def test_runtime_policy_v4_migrates_grasp_direction_count() -> None:
+def test_runtime_policy_v4_is_rejected() -> None:
     snapshot = default_runtime_policy("dual_franka").as_mapping()
     snapshot["schema_version"] = "action_engine_runtime_policy_v4"
     snapshot["grasp"].pop("n_deviated_approach_directions")
@@ -833,19 +1018,17 @@ def test_runtime_policy_v4_migrates_grasp_direction_count() -> None:
         ).encode("utf-8")
     ).hexdigest()
 
-    policy = resolve_agent_runtime_policy(
-        {
-            "robot_profile": "dual_franka",
-            "runtime_policy": snapshot,
-            "runtime_policy_hash": snapshot_hash,
-        }
-    )
-
-    assert policy.schema_version == "action_engine_runtime_policy_v8"
-    assert policy.grasp["n_deviated_approach_directions"] == 4
+    with pytest.raises(ValueError, match="schema is incompatible"):
+        resolve_agent_runtime_policy(
+            {
+                "robot_profile": "dual_franka",
+                "runtime_policy": snapshot,
+                "runtime_policy_hash": snapshot_hash,
+            }
+        )
 
 
-def test_runtime_policy_v5_migrates_support_geometry_thresholds() -> None:
+def test_runtime_policy_v5_is_rejected() -> None:
     snapshot = default_runtime_policy("dual_franka").as_mapping()
     snapshot["schema_version"] = "action_engine_runtime_policy_v5"
     snapshot["grounding"]["placement"]["clearance"] = 0.019
@@ -879,18 +1062,14 @@ def test_runtime_policy_v5_migrates_support_geometry_thresholds() -> None:
         ).encode("utf-8")
     ).hexdigest()
 
-    policy = resolve_agent_runtime_policy(
-        {
-            "robot_profile": "dual_franka",
-            "runtime_policy": snapshot,
-            "runtime_policy_hash": snapshot_hash,
-        }
-    )
-
-    assert policy.schema_version == "action_engine_runtime_policy_v8"
-    assert policy.predicate_fallbacks["support_min_overlap_ratio"] == 0.25
-    assert policy.grounding["placement"]["clearance"] == 0.019
-    assert policy.grounding["placement"]["candidate_count"] == 5
+    with pytest.raises(ValueError, match="schema is incompatible"):
+        resolve_agent_runtime_policy(
+            {
+                "robot_profile": "dual_franka",
+                "runtime_policy": snapshot,
+                "runtime_policy_hash": snapshot_hash,
+            }
+        )
 
 
 def test_runtime_recorder_writes_checkpoints_and_rendered_env_graphs(
@@ -4200,7 +4379,7 @@ def test_pour_grounding_targets_receiver_without_physical_contents() -> None:
 
 @pytest.mark.parametrize(
     ("task_type", "initial_qpos", "direction", "target_state"),
-    (("E6", 0.0, "pull", "open"), ("E7", 0.2, "push", "closed")),
+    (("E6", 0.0, "pull", "open"), ("E6", 0.2, "push", "closed")),
 )
 def test_articulation_grounding_reuses_slide_and_observes_joint_state(
     task_type: str,
@@ -4209,6 +4388,7 @@ def test_articulation_grounding_reuses_slide_and_observes_joint_state(
     target_state: str,
 ) -> None:
     task, _ = make_task_spec(task_type)
+    task["task_instances"][0]["params"]["target_state"] = target_state
     graph = instantiate_seed_graph(task, {"object_01": "drawer"})
     program = load_execution_program(graph)
     articulation = _FakeArticulation("drawer", initial_qpos)
@@ -4224,7 +4404,7 @@ def test_articulation_grounding_reuses_slide_and_observes_joint_state(
         ),
     )
     step = program.semantic_steps[0]
-    edge = program.edges[0]
+    edge = _interaction_edge(program)
 
     grounded = grounder.ground(
         edge.actions[0],
@@ -4263,10 +4443,171 @@ def test_articulation_grounding_reuses_slide_and_observes_joint_state(
     assert bool(evaluate_predicate(env, predicate)[0])
 
 
-def test_turn_knob_requires_setting_map_and_reuses_twist() -> None:
+def test_named_link_geometry_extracts_only_matching_usd_shapes(tmp_path: Path) -> None:
+    from pxr import Usd, UsdGeom
+
+    path = tmp_path / "drawer.usda"
+    stage = Usd.Stage.CreateNew(path.as_posix())
+    drawer = UsdGeom.Xform.Define(stage, "/World/item/rigid_bodies/drawer")
+    handle = UsdGeom.Mesh.Define(
+        stage,
+        "/World/item/rigid_bodies/drawer/shapes/pull_handle",
+    )
+    handle.CreatePointsAttr([(0.0, 0.0, 0.0), (0.1, 0.0, 0.0), (0.0, 0.1, 0.0)])
+    handle.CreateFaceVertexCountsAttr([3])
+    handle.CreateFaceVertexIndicesAttr([0, 1, 2])
+    mount = UsdGeom.Mesh.Define(
+        stage,
+        "/World/item/rigid_bodies/drawer/shapes/pull_handle_mount",
+    )
+    mount.CreatePointsAttr([(0.0, 0.0, 0.0), (0.5, 0.0, 0.0), (0.0, 0.5, 0.0)])
+    mount.CreateFaceVertexCountsAttr([3])
+    mount.CreateFaceVertexIndicesAttr([0, 1, 2])
+    panel = UsdGeom.Mesh.Define(
+        stage,
+        "/World/item/rigid_bodies/drawer/shapes/front_panel",
+    )
+    panel.CreatePointsAttr([(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)])
+    panel.CreateFaceVertexCountsAttr([3])
+    panel.CreateFaceVertexIndicesAttr([0, 1, 2])
+    stage.GetRootLayer().Save()
+    articulation = SimpleNamespace(
+        cfg=SimpleNamespace(fpath=path.as_posix(), body_scale=(2.0, 2.0, 2.0))
+    )
+
+    geometry = _named_link_geometry(
+        articulation,
+        drawer.GetPrim().GetName(),
+        name_tokens=("handle",),
+    )
+
+    assert geometry is not None
+    vertices, triangles = geometry
+    assert vertices.shape == (3, 3)
+    assert triangles.tolist() == [[0, 1, 2]]
+    assert vertices.max(dim=0).values.tolist() == pytest.approx([0.2, 0.2, 0.0])
+
+
+def test_generated_usd_revolute_uses_authored_limits_and_wraps_qpos(
+    tmp_path: Path,
+) -> None:
+    from pxr import Usd, UsdGeom, UsdPhysics
+
+    path = tmp_path / "dial.usda"
+    stage = Usd.Stage.CreateNew(path.as_posix())
+    root = UsdGeom.Xform.Define(stage, "/World/dial")
+    stage.SetDefaultPrim(root.GetPrim())
+    joint = UsdPhysics.RevoluteJoint.Define(stage, "/World/dial/slide_joint")
+    joint.CreateLowerLimitAttr(-150.0)
+    joint.CreateUpperLimitAttr(150.0)
+    stage.GetRootLayer().Save()
+
+    articulation = _FakeArticulation("dial", -4.0 * float(torch.pi))
+    articulation._joint_info.joint_type = SimpleNamespace(name="REVOLUTE")
+    articulation._limits = torch.tensor(
+        [[[-2.0 * float(torch.pi), 2.0 * float(torch.pi)]]]
+    )
+    articulation.cfg.fpath = path.as_posix()
+    articulation._gen_sim_revolute_qpos_offsets = {
+        0: articulation.get_qpos()[:, 0].clone()
+    }
+
+    limits = _effective_joint_limits(articulation, 0, articulation._joint_info)
+    position = _effective_joint_position(articulation, 0, articulation._joint_info)
+
+    assert limits[0].tolist() == pytest.approx([-2.6179939, 2.6179939])
+    assert position.item() == pytest.approx(0.0, abs=1.0e-6)
+
+
+@pytest.mark.parametrize(
+    ("task_type", "initial_qpos", "target_state", "target_qpos"),
+    (
+        ("E6", 0.0, "open", -0.28),
+        ("E6", -0.28, "closed", 0.0),
+    ),
+)
+def test_slide_uses_zero_nearest_closed_endpoint(
+    task_type: str,
+    initial_qpos: float,
+    target_state: str,
+    target_qpos: float,
+) -> None:
+    task, _ = make_task_spec(task_type)
+    task["task_instances"][0]["params"]["target_state"] = target_state
+    program = load_execution_program(
+        instantiate_seed_graph(task, {"object_01": "drawer"})
+    )
+    articulation = _FakeArticulation("drawer", initial_qpos)
+    articulation._limits = torch.tensor([[[-0.28, 0.0]]])
+    articulation.all_joint_names = ["slide_joint"]
+    env = _FakeEnv(articulations={"drawer": articulation})
+    step = program.semantic_steps[0]
+
+    grounded = ActionGrounder(program, env, lambda _uid: None).ground(
+        _interaction_edge(program).actions[0],
+        step,
+        arm="right_arm",
+        state=ExecutionState(last_qpos=env.robot.get_qpos()),
+    )
+
+    assert isinstance(grounded.target, SlideGoal)
+    assert grounded.target.semantics.entity_id == "drawer:drawer_link"
+    assert grounded.cfg["articulation_target_qpos"].item() == pytest.approx(target_qpos)
+    predicate = {
+        "type": "articulation_joint_near",
+        "object": "drawer",
+        "target_state": target_state,
+    }
+    assert not bool(evaluate_predicate(env, predicate)[0])
+    articulation._qpos[0, 0] = target_qpos
+    assert bool(evaluate_predicate(env, predicate)[0])
+
+
+def test_articulation_grounding_dispatches_revolute_door_to_open_door() -> None:
+    task, _ = make_task_spec("E7")
+    program = load_execution_program(
+        instantiate_seed_graph(task, {"object_01": "cabinet"})
+    )
+    articulation = _FakeArticulation("cabinet", 0.0)
+    articulation._joint_info.joint_type = SimpleNamespace(name="REVOLUTE")
+    articulation._vertices += torch.tensor([0.0, 0.1, 0.0])
+    articulation._limits = torch.tensor([[[-1.0, 0.0]]])
+    env = _FakeEnv(articulations={"cabinet": articulation})
+    step = program.semantic_steps[0]
+    state = ExecutionState(last_qpos=env.robot.get_qpos())
+
+    grounded = ActionGrounder(program, env, lambda _uid: None).ground(
+        _interaction_edge(program).actions[0],
+        step,
+        arm="right_arm",
+        state=state,
+    )
+
+    assert grounded.action_class == "OpenDoor"
+    assert isinstance(grounded.target, OpenDoorGoal)
+    assert isinstance(grounded.target.semantics.affordance, OpenDoorAffordance)
+    assert grounded.target.open_fraction == pytest.approx(1.0)
+    assert grounded.target.semantics.affordance.opening_direction == pytest.approx(-1.0)
+    assert grounded.cfg["articulation_target_qpos"].item() == pytest.approx(-1.0)
+    snapshot = AtomicActionAdapter(env)._scene_snapshot(grounded, state)
+    assert torch.allclose(
+        snapshot.articulation_joints[("cabinet", "slide_joint")].position,
+        articulation.get_qpos(),
+    )
+    predicate = {
+        "type": "articulation_joint_near",
+        "object": "cabinet",
+        "target_state": "open",
+    }
+    assert not bool(evaluate_predicate(env, predicate)[0])
+    articulation._qpos[0, 0] = -1.0
+    assert bool(evaluate_predicate(env, predicate)[0])
+
+
+def test_twist_requires_setting_map_and_reuses_twist() -> None:
     task = {
         "schema_version": TASK_SPEC_SCHEMA,
-        "task_id": "turn_knob",
+        "task_id": "twist",
         "level": "L1",
         "instruction": "Turn the knob to setting two.",
         "reasoning_type": "none",
@@ -4308,7 +4649,7 @@ def test_turn_knob_requires_setting_map_and_reuses_twist() -> None:
     step = program.semantic_steps[0]
 
     grounded = grounder.ground(
-        program.edges[0].actions[0],
+        _interaction_edge(program).actions[0],
         step,
         arm="right_arm",
         state=ExecutionState(last_qpos=env.robot.get_qpos()),
@@ -4343,11 +4684,61 @@ def test_turn_knob_requires_setting_map_and_reuses_twist() -> None:
                 label=uid,
             ),
         ).ground(
-            program.edges[0].actions[0],
+            _interaction_edge(program).actions[0],
             program.semantic_steps[0],
             arm="right_arm",
             state=ExecutionState(last_qpos=env.robot.get_qpos()),
         )
+
+
+def test_twist_approaches_from_the_live_arm_side_of_the_axis() -> None:
+    task = {
+        "schema_version": TASK_SPEC_SCHEMA,
+        "task_id": "twist_axis_side",
+        "level": "L1",
+        "instruction": "Turn the knob to setting two.",
+        "reasoning_type": "none",
+        "task_instances": [
+            {
+                "id": "task_01",
+                "task_type": "E8",
+                "params": {
+                    "object_role": "knob",
+                    "target_setting": 2,
+                    "required_arm": "right_arm",
+                },
+                "depends_on": [],
+                "role": "primary",
+            }
+        ],
+        "success": {"type": "articulation_joint_near"},
+        "oracle": {},
+        "metadata": {},
+    }
+    program = load_execution_program(instantiate_seed_graph(task, {"knob": "dial"}))
+    articulation = _FakeArticulation("dial", 0.0)
+    articulation._joint_info.joint_type = SimpleNamespace(name="REVOLUTE")
+    articulation._joint_info.axis = torch.tensor([0.0, 0.0, 1.0])
+    articulation._limits = torch.tensor([[[-1.0, 1.0]]])
+    env = _FakeEnv(articulations={"dial": articulation})
+    above = _pose(0.0, 0.0, 1.1)
+    env.get_current_xpos_agent = lambda: (above.clone(), above.clone())
+    env.agent_config = {
+        "articulation_settings": {"dial": {"slide_joint": [-1.0, 0.0, 1.0]}}
+    }
+
+    grounded = ActionGrounder(program, env, lambda _uid: None).ground(
+        _interaction_edge(program).actions[0],
+        program.semantic_steps[0],
+        arm="right_arm",
+        state=ExecutionState(last_qpos=env.robot.get_qpos()),
+    )
+
+    affordance = grounded.target.semantics.affordance
+    assert isinstance(affordance, TwistAffordance)
+    grasp_pose = affordance.get_grasp_pose(grounded.target.target_pose)
+    assert grasp_pose[0, 2, 2] == pytest.approx(-1.0)
+    assert grounded.cfg["twist_angle"] == pytest.approx(-1.0)
 
 
 def test_directional_spacing_accepts_articulation_reference() -> None:
@@ -5842,6 +6233,8 @@ def test_v2_executor_retries_one_complete_atomic_action_twice(
 
     def execute(_edge, _step, *, failed):
         nonlocal attempts
+        if _edge.actions[0]["atomic_action_class"] != "Press":
+            return SimpleNamespace(actions=[], failed=failed.clone(), grounded=[])
         attempts += 1
         action_failed = failed.clone()
         if attempts < 3:
@@ -5861,6 +6254,63 @@ def test_v2_executor_retries_one_complete_atomic_action_twice(
     assert result.retry_count == 2
     assert bool(result.success[0])
     assert result.failure_events == []
+
+
+def test_stop_policy_still_runs_articulation_safety_retreat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task, requirements = make_task_spec("E9")
+    bindings = {
+        item["role_id"]: f"uid_{item['role_id']}" for item in requirements["objects"]
+    }
+    program = load_execution_program(instantiate_seed_graph(task, bindings))
+    executor = ProgramExecutor(
+        program,
+        _FakeEnv(),
+        settle_steps=0,
+        record_runtime=False,
+        failure_policy="stop",
+    )
+    monkeypatch.setattr(
+        executor,
+        "_ensure_assignment",
+        lambda step, _failed: executor._assignments.setdefault(step.id, ["left_arm"]),
+    )
+    active_by_operation: dict[str, list[bool]] = {}
+
+    def execute(edge: ExecutionEdge, _step: SemanticStep, *, failed: torch.Tensor):
+        action = edge.actions[0]
+        operation = str(
+            action["target_binding"].get(
+                "operation",
+                action["atomic_action_class"],
+            )
+        )
+        active_by_operation[operation] = (~failed).tolist()
+        result_failed = failed.clone()
+        if action["atomic_action_class"] == "Press":
+            result_failed[:] = True
+        elif bool((~failed).any()):
+            result_failed[:] = False
+        return _EdgeResult(
+            actions=[],
+            failed=result_failed,
+            grounded=[],
+            executed=~failed,
+        )
+
+    monkeypatch.setattr(executor, "_execute_edge", execute)
+    monkeypatch.setattr(
+        executor,
+        "_verify_step",
+        lambda _step, failed: (failed, ~failed, torch.zeros(1, 3)),
+    )
+
+    result = executor.run()
+
+    assert active_by_operation["safe_retreat"] == [True]
+    assert active_by_operation["MoveJoints"] == [True]
+    assert not bool(result.success[0])
 
 
 def test_v2_executor_stops_at_transition_budget() -> None:
@@ -7110,7 +7560,7 @@ def test_online_environment_preserves_result_and_disables_terminations(
     cfg = SimpleNamespace(ignore_terminations=False, robot=robot_cfg)
     env = env_module.ActionEngineEnv(
         cfg,
-        agent_config={"schema_version": "action_engine_config_v2"},
+        agent_config={"schema_version": "action_engine_config_v3"},
         task_name="task",
         agent_config_path="/tmp/agent_config.json",
     )

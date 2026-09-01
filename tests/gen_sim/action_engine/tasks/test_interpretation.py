@@ -977,7 +977,7 @@ def test_e5_rejects_explicitly_incompatible_scene_evidence(
         (
             {"role": "articulation", "affordances": ["articulated"]},
             False,
-            "missing affordances.*pullable",
+            "missing affordances.*slideable",
         ),
         ({"role": "rigid_object"}, False, "requires articulation structure"),
     ),
@@ -1468,7 +1468,7 @@ def test_missing_e6_object_reaches_targeted_repair() -> None:
 
     assert result.attempts == 2
     assert result.intent == repaired
-    assert "Opening or pulling out a drawer is E6" in prompts[0]
+    assert "Opening or pulling out a drawer or sliding tray is E6" in prompts[0]
     assert "Missing-object repair rule" in prompts[1]
 
 
