@@ -106,6 +106,8 @@ def test_robotiq_profile_separates_commanded_mimics_from_state_joint() -> None:
         (0.0, 0.0, 0.0, 1.0),
     )
     assert profile.grasp_model.model_id == "robotiq_arg2f_140"
+    assert profile.grasp_model.min_opening_width == pytest.approx(0.001)
+    assert profile.grasp_model.min_opening_width < 0.00856
     assert profile.grasp_model.max_opening_width == pytest.approx(0.15)
     assert profile.grasp_model.finger_length == pytest.approx(0.13)
     assert profile.grasp_model.opening_margin == pytest.approx(0.01)

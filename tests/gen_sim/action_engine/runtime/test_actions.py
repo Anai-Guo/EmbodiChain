@@ -915,6 +915,7 @@ def test_robotiq_grasp_generator_preserves_existing_geometry() -> None:
 
     assert generators["physical_right_eef"] is generator
     assert generator.gripper_model.model_id == "robotiq_arg2f_140"
+    assert generator.gripper_model.min_opening_width == pytest.approx(0.001)
     assert generator.gripper_model.max_opening_width == pytest.approx(0.15)
     assert generator.gripper_model.finger_length == pytest.approx(0.13)
     assert generator.collision_cfg.opening_margin == pytest.approx(0.01)
