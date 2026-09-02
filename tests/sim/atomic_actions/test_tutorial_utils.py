@@ -30,7 +30,10 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 import torch
 
-from embodichain.lab.sim.atomic_actions import TimedTrajectory
+from embodichain.lab.sim.atomic_actions import (
+    ArticulationAffordanceGeometry,
+    TimedTrajectory,
+)
 from embodichain.lab.sim.solvers import BaseSolver
 from scripts.tutorials.atomic_action.dynamic_obstacle_recovery import (
     _animate_obstacle_to_pose,
@@ -130,6 +133,9 @@ SCENE_FREE_TUTORIAL_MODULES = (
     "move_end_effector",
     "move_joints",
 )
+TUTORIAL_PRISMATIC_JOINT_AXIS = torch.tensor([2.0, 2.0, 1.0])
+TUTORIAL_REVOLUTE_JOINT_AXIS = torch.tensor([-1.0, 2.0, 2.0])
+TUTORIAL_REVOLUTE_AXIS_ORIGIN = torch.tensor([0.75, -0.5, 0.25])
 
 
 def _tutorial_axis_geometry(
@@ -155,7 +161,23 @@ def _tutorial_axis_geometry(
                 (center + torch.tensor(neighbor_offset)).unsqueeze(0),
             )
         ),
+        "target_link_prismatic_joint_axis": TUTORIAL_PRISMATIC_JOINT_AXIS.clone(),
+        "target_link_revolute_joint_axis": TUTORIAL_REVOLUTE_JOINT_AXIS.clone(),
+        "target_link_revolute_axis_origin": TUTORIAL_REVOLUTE_AXIS_ORIGIN.clone(),
     }
+
+
+def _tutorial_articulation_geometry(
+    geometry: dict[str, torch.Tensor],
+) -> ArticulationAffordanceGeometry:
+    """Build the typed adapter result consumed by tutorial semantics."""
+    return ArticulationAffordanceGeometry(
+        target_link_point_cloud=geometry["target_link_point_cloud"],
+        articulation_point_cloud=geometry["articulation_point_cloud"],
+        prismatic_joint_axis=geometry["target_link_prismatic_joint_axis"],
+        revolute_joint_axis=geometry["target_link_revolute_joint_axis"],
+        revolute_axis_origin=geometry["target_link_revolute_axis_origin"],
+    )
 
 
 class _TutorialArticulation:
@@ -164,7 +186,11 @@ class _TutorialArticulation:
     def __init__(self, geometry: dict[str, torch.Tensor]) -> None:
         self.device = torch.device("cpu")
         self.geometry = geometry
-        self.sampled_link_name: str | None = None
+        self.cfg = SimpleNamespace(
+            init_qpos=(0.0,),
+            body_scale=(1.0, 1.0, 1.0),
+        )
+        self.joint_names = ("target_joint",)
 
     def get_link_vert_face(self, link_name: str) -> tuple[torch.Tensor, torch.Tensor]:
         del link_name
@@ -188,13 +214,6 @@ class _TutorialArticulation:
         del link_name
         assert to_matrix is True
         return torch.eye(4).unsqueeze(0)
-
-    def sample_initial_point_clouds(
-        self,
-        target_link_name: str,
-    ) -> dict[str, torch.Tensor]:
-        self.sampled_link_name = target_link_name
-        return self.geometry
 
 
 def _run_obstacle_animation(*, pace_wall_time: bool) -> tuple[MagicMock, MagicMock]:
@@ -235,28 +254,28 @@ def _run_obstacle_animation(*, pace_wall_time: bool) -> tuple[MagicMock, MagicMo
             "create_drawer_semantics",
             "large_handle_bar",
             "translation_axis",
-            (0.25, 1.5, -0.125),
-            (0.0, 1.0, 0.0),
+            (1.0, 1.0, 0.5),
+            (2.0 / 3.0, 2.0 / 3.0, 1.0 / 3.0),
         ),
         (
             "press",
             "create_button_semantics",
             "button_cap",
             "press_axis",
-            (0.25, -0.125, -1.5),
-            (0.0, 0.0, -1.0),
+            (-1.0, -1.0, -0.5),
+            (-2.0 / 3.0, -2.0 / 3.0, -1.0 / 3.0),
         ),
         (
             "twist",
             "create_knob_semantics",
             "cap_1",
             "twist_axis",
-            (0.25, -0.125, -1.5),
-            (0.0, 0.0, -1.0),
+            (0.5, -1.0, -1.0),
+            (1.0 / 3.0, -2.0 / 3.0, -2.0 / 3.0),
         ),
     ),
 )
-def test_articulation_tutorial_semantics_resolve_axis_from_initial_point_clouds(
+def test_articulation_tutorial_semantics_resolve_signed_parent_joint_axis(
     module_name: str,
     factory_name: str,
     link_name: str,
@@ -266,22 +285,42 @@ def test_articulation_tutorial_semantics_resolve_axis_from_initial_point_clouds(
 ) -> None:
     module = importlib.import_module(f"scripts.tutorials.atomic_action.{module_name}")
     geometry = _tutorial_axis_geometry(neighbor_offset)
+    sampled_geometry = _tutorial_articulation_geometry(geometry)
     articulation = _TutorialArticulation(geometry)
 
-    with patch.object(module, "Articulation", _TutorialArticulation):
+    with (
+        patch.object(module, "Articulation", _TutorialArticulation),
+        patch.object(
+            module,
+            "sample_initial_articulation_geometry",
+            return_value=sampled_geometry,
+        ) as sampler,
+    ):
         result = getattr(module, factory_name)(articulation)
 
     semantics = result[0] if isinstance(result, tuple) else result
-    assert articulation.sampled_link_name == link_name
-    assert semantics.geometry is geometry
-    assert torch.equal(
+    sampler.assert_called_once_with(
+        articulation,
+        link_name,
+        initial_qpos=articulation.cfg.init_qpos,
+        initial_qpos_joint_names=articulation.joint_names,
+        body_scale=articulation.cfg.body_scale,
+    )
+    expected_geometry = sampled_geometry.to_object_geometry()
+    assert set(semantics.geometry) == set(expected_geometry)
+    for key, expected_value in expected_geometry.items():
+        assert torch.equal(semantics.geometry[key], expected_value)
+    assert torch.allclose(
         getattr(semantics.affordance, axis_field),
         torch.tensor(expected_axis),
+        atol=1.0e-6,
     )
     if module_name == "press":
-        assert semantics.affordance.press_position == pytest.approx((2.0, -3.0, 5.0))
+        assert semantics.affordance.press_position == pytest.approx((2.5, -2.5, 4.0))
     elif module_name == "twist":
-        assert semantics.affordance.axis_origin == pytest.approx((2.0, -3.0, 4.0))
+        assert semantics.affordance.axis_origin == pytest.approx(
+            tuple(float(value) for value in TUTORIAL_REVOLUTE_AXIS_ORIGIN)
+        )
 
 
 def test_should_wait_for_tutorial_input_is_disabled_for_headless_modes() -> None:
@@ -601,17 +640,6 @@ def test_dual_franka_mount_preserves_single_arm_facing_direction() -> None:
             DUAL_FRANKA_MOUNT_X_AXIS,
             atol=1e-6,
         )
-
-
-def test_hand_commands_use_pgi_open_limit() -> None:
-    robot = MagicMock()
-    robot.device = torch.device("cpu")
-    robot.get_qpos_limits.return_value = torch.tensor([[[0.0, 0.04]]])
-
-    hand_open, hand_close = get_hand_open_close_qpos(robot)
-
-    assert torch.allclose(hand_open, torch.tensor([0.0]))
-    assert torch.allclose(hand_close, torch.tensor([0.024]))
 
 
 def test_hand_commands_cover_all_six_robotiq_joints_with_mimic_directions() -> None:

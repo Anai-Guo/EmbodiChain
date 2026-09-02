@@ -18,11 +18,14 @@ Articulations are configured using the {class}`~cfg.ArticulationCfg` dataclass.
 | `init_qpos` | `List[float]` | `None` | Initial joint positions. |
 | `qpos_limits` | `Tensor` / `Dict[str, List[float]]` | `None` | Override joint position limits. Replaces asset limits and may either tighten or expand the range. |
 | `body_scale` | `List[float]` | `[1.0, 1.0, 1.0]` | Scaling factors for the articulation links. |
-| `disable_self_collisions` | `bool` | `True` | Whether to disable self-collisions. |
+| `disable_self_collision` | `bool` | `True` | Whether to disable self-collisions. |
+| `enable_gravity` | `bool` | `True` | Whether gravity affects the articulation. This runtime flag also applies when `use_usd_properties=True`. |
 | `drive_pros` | `JointDrivePropertiesCfg` | `drive_type="none"` | Default drive properties. |
 | `attrs` | `RigidBodyAttributesCfg` | `...` | Default rigid body attributes applied to all links. |
 | `link_attrs` | `dict[str, LinkPhysicsOverrideCfg]` | `None` | Optional per-link overrides keyed by group name; each group matches link names via regex. |
 
+At runtime, call `articulation.set_gravity(...)` to change gravity for every
+environment or for a selected set of environment indices.
 
 ### Per-link physics (`link_attrs`)
 
@@ -181,7 +184,6 @@ State data is accessed via getter methods that return batched tensors (`N` envir
 | :--- | :--- | :--- |
 | `get_local_pose(to_matrix=False)` | `(N, 7)` or `(N, 4, 4)` | Root link pose `[x, y, z, qw, qx, qy, qz]` or a 4x4 matrix. |
 | `get_link_pose(link_name, to_matrix=False)` | `(N, 7)` or `(N, 4, 4)` | Specific link pose `[x, y, z, qw, qx, qy, qz]` or a 4x4 matrix. |
-| `sample_initial_point_clouds(target_link_name)` | `Dict[str, Tensor]` | Uniformly sample the target link and merged articulation surface at `init_qpos`, both in the target link's initial local frame. |
 | `get_qpos(target=False)` | `(N, dof)` | Current joint positions (or joint targets if `target=True`). |
 | `get_qvel(target=False)` | `(N, dof)` | Current joint velocities (or velocity targets if `target=True`). |
 | `get_joint_drive()` | `Tuple[Tensor, ...]` | Returns `(stiffness, damping, max_effort, max_velocity, friction, armature)`, each shaped `(N, dof)`. |
@@ -194,33 +196,18 @@ print(f"Current Joint Positions: {articulation.get_qpos()}")
 print(f"End Effector Pose: {articulation.get_link_pose('ee_link')}")
 ```
 
-### Initial Link-Local Point Clouds
+### Atomic Action Geometry Adapter
 
-`sample_initial_point_clouds()` uses the configured initial joint positions and
-forward kinematics, rather than the articulation's mutable runtime state. It
-transforms every link mesh into the requested target link's initial frame,
-merges the meshes, and uses Open3D uniform surface sampling on the combined
-triangle mesh. Sampling the merged mesh makes each surface's representation
-proportional to triangle area instead of assigning the same point count to
-every link. The returned float32 tensors are moved back to the articulation
-device and are ready to store in an atomic action's `ObjectSemantics.geometry`:
+`Articulation` exposes deterministic, domain-neutral facts through APIs such as
+`get_link_vert_face()`, `compute_fk()`, and `get_parent_joint_chain()`. Atomic
+Action integrations compose those facts with initial-state mesh transforms,
+Open3D surface sampling, and affordance-specific geometry metadata through
+`sample_initial_articulation_geometry()` in
+`embodichain.lab.sim.atomic_actions`. The adapter returns a typed value; call
+`to_object_geometry()` only at the `ObjectSemantics.geometry` boundary.
 
-```python
-geometry = articulation.sample_initial_point_clouds(
-    "button_cap",
-    articulation_point_count=100_000,
-    target_point_count=5_000,
-)
-target_points = geometry["target_link_point_cloud"]
-articulation_points = geometry["articulation_point_cloud"]
-```
-
-The shown point counts are the defaults. Open3D draws random uniform samples
-from the target mesh and merged articulation mesh independently, so repeated
-calls are not expected to be bitwise identical and consumers should rely on
-the spatial distribution rather than point-for-point correspondence. The
-method requires a built kinematic chain and currently supports unit
-`body_scale`.
+Keeping this stochastic conversion in the Atomic Action layer means simulation
+objects do not own private point-cloud keys or affordance interpretation.
 
 ### Visual Appearance
 
