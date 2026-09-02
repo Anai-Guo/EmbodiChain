@@ -350,7 +350,12 @@ def build_fast_gym_config(
         gripper_profile=gripper_profile,
         ik_solver=selected_ik_solver,
     )
-    observations = _make_observations(robot, gripper_profile)
+    controlled_parts = ("left_arm", "left_eef", "right_arm", "right_eef")
+    observations = _make_observations(
+        robot,
+        gripper_profile,
+        controlled_parts=controlled_parts,
+    )
     # These two template fields describe serialization order to generation, not
     # RobotCfg. Remove them after deriving observation IDs to avoid parser noise.
     robot.pop("observation_joint_parts", None)
@@ -423,6 +428,7 @@ def build_fast_gym_config(
         "max_episodes": int(max_episodes),
         "max_episode_steps": int(max_episode_steps),
         "env": {
+            "control_parts": list(controlled_parts),
             "extensions": extensions,
             "events": _make_events(
                 sensors[0],
@@ -563,6 +569,7 @@ def _runtime_articulation_config(value: Mapping[str, Any]) -> dict[str, Any]:
     path = Path(str(result.get("fpath", "")))
     if path.suffix.lower() in _USD_ARTICULATION_SUFFIXES:
         result["build_pk_chain"] = False
+        result["enable_gravity"] = False
     return result
 
 
@@ -944,19 +951,30 @@ def _recording_policy(planning_mode: str) -> tuple[bool, tuple[int, int], int]:
 def _make_observations(
     robot: dict[str, Any],
     gripper_profile: GripperProfile,
+    *,
+    controlled_parts: Sequence[str],
 ) -> dict[str, Any]:
-    per_hand_dof = len(gripper_profile.simulated_joint_initial_positions)
-    arm_dof = len(robot["init_qpos"]) - 2 * per_hand_dof
-    if arm_dof <= 0:
-        raise ValueError("Robot initial posture does not contain arm joints.")
-    joint_ids: list[int] = []
-    for side_index, side in enumerate(("left", "right")):
-        simulated = gripper_profile.simulated_joint_names(side)
-        base = arm_dof + side_index * per_hand_dof
-        joint_ids.extend(
-            base + simulated.index(name)
-            for name in gripper_profile.control_joint_names(side)
+    control_parts = robot.get("control_parts")
+    if not isinstance(control_parts, Mapping):
+        raise ValueError("Robot template requires control_parts.")
+    active_joint_names: list[str] = []
+    mimic_joint_names = {
+        name
+        for side in ("left", "right")
+        for name in gripper_profile.mimic_joint_names(side)
+    }
+    for part in controlled_parts:
+        names = control_parts.get(part)
+        if not isinstance(names, Sequence) or isinstance(names, (str, bytes)):
+            raise ValueError(f"Robot template requires control part {part!r}.")
+        active_joint_names.extend(
+            str(name) for name in names if str(name) not in mimic_joint_names
         )
+    joint_ids = [
+        active_joint_names.index(name)
+        for side in ("left", "right")
+        for name in gripper_profile.state_joint_names(side)
+    ]
     return {
         "norm_robot_eef_joint": {
             "func": "normalize_robot_joint_data",

@@ -184,6 +184,9 @@ def test_e6_e7_defaults_match_atomic_action_tutorial_contracts() -> None:
         "sample_interval": 140,
         "hand_interp_steps": 12,
         "approach_distance": pytest.approx(0.10),
+        "is_filter_ground_collision": False,
+        "interaction_grasp_seed": 17394,
+        "interaction_grasp_candidate_count": 8,
         "articulation_grasp_settle_steps": 80,
         "postcondition_tolerance": pytest.approx(0.005),
     }
@@ -193,6 +196,9 @@ def test_e6_e7_defaults_match_atomic_action_tutorial_contracts() -> None:
         "door_waypoint_count": 50,
         "approach_distance": pytest.approx(0.10),
         "retract_distance": pytest.approx(0.10),
+        "is_filter_ground_collision": False,
+        "interaction_grasp_seed": 17394,
+        "interaction_grasp_candidate_count": 8,
         "postcondition_tolerance": pytest.approx(0.03),
     }
 

@@ -40,6 +40,8 @@ _UPRIGHT_SIDE_GRASP_MIN_AXIS_FRACTION = 0.35
 _UPRIGHT_SIDE_GRASP_MAX_AXIS_FRACTION = 0.75
 _UPRIGHT_SIDE_GRASP_HEIGHT_COST_WEIGHT = 2.0
 _UPRIGHT_SIDE_GRASP_CANDIDATE_LIMIT = 50
+_INTERACTION_MIN_TRANSLATION_SEPARATION = 0.01
+_INTERACTION_MIN_ROTATION_SEPARATION = float(torch.pi / 12.0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +74,7 @@ class _TracingAntipodalGraspPoseGenerator(AntipodalGraspPoseGenerator):
         super().__init__(*args, **kwargs)
         self._last_dual_trace: dict[str, Any] | None = None
         self._last_upright_trace: dict[str, Any] | None = None
+        self._last_interaction_trace: dict[str, Any] | None = None
         self._selection_context: _DualGraspSelectionContext | None = None
         self._upright_selection_context: _UprightGraspSelectionContext | None = None
         self._interaction_selection_context: (
@@ -87,6 +90,11 @@ class _TracingAntipodalGraspPoseGenerator(AntipodalGraspPoseGenerator):
     def last_upright_trace(self) -> dict[str, Any] | None:
         """Return an owned snapshot of the most recent upright-grasp trace."""
         return deepcopy(self._last_upright_trace)
+
+    @property
+    def last_interaction_trace(self) -> dict[str, Any] | None:
+        """Return an owned snapshot of the most recent interaction-grasp trace."""
+        return deepcopy(self._last_interaction_trace)
 
     @contextmanager
     def upright_selection_context(
@@ -127,6 +135,7 @@ class _TracingAntipodalGraspPoseGenerator(AntipodalGraspPoseGenerator):
             reference = reference.unsqueeze(0)
         if reference.ndim != 3 or reference.shape[1:] != (4, 4):
             raise ValueError("Interaction reference_xpos must have shape (B, 4, 4).")
+        self._last_interaction_trace = None
         self._interaction_selection_context = _InteractionGraspSelectionContext(
             reference_xpos=reference.clone(),
             candidate_rank=candidate_rank,
@@ -147,6 +156,7 @@ class _TracingAntipodalGraspPoseGenerator(AntipodalGraspPoseGenerator):
         rows = self.get_valid_grasp_poses(**kwargs)
         successes: list[bool] = []
         selected: list[torch.Tensor] = []
+        trace_rows: list[dict[str, Any]] = []
         for row_index, (poses, costs) in enumerate(rows):
             poses = torch.as_tensor(poses, dtype=torch.float32)
             costs = torch.as_tensor(costs, dtype=torch.float32, device=poses.device)
@@ -157,21 +167,77 @@ class _TracingAntipodalGraspPoseGenerator(AntipodalGraspPoseGenerator):
             ].to(device=poses.device, dtype=poses.dtype)
             canonical = _canonicalize_parallel_jaw_poses(poses, reference)
             scores = costs + canonical.selected_rotation_radians.to(costs) / torch.pi
-            ranked = torch.argsort(scores)
+            raw_ranked = torch.argsort(scores)
+            raw_ranked = raw_ranked[torch.isfinite(scores[raw_ranked])]
+            ranked = self._diverse_interaction_ranking(canonical.poses, raw_ranked)
             if context.candidate_rank >= ranked.numel() or not bool(
                 torch.isfinite(scores[ranked[context.candidate_rank]])
             ):
                 successes.append(False)
                 selected.append(torch.eye(4, dtype=poses.dtype, device=poses.device))
+                trace_rows.append(
+                    {
+                        "requested_candidate_rank": context.candidate_rank,
+                        "candidate_count": int(ranked.numel()),
+                        "raw_candidate_count": int(raw_ranked.numel()),
+                        "selected": False,
+                        "reason": "requested_candidate_rank_unavailable",
+                    }
+                )
                 continue
             index = int(ranked[context.candidate_rank])
             successes.append(True)
             selected.append(canonical.poses[index])
+            trace_rows.append(
+                {
+                    "requested_candidate_rank": context.candidate_rank,
+                    "candidate_count": int(ranked.numel()),
+                    "raw_candidate_count": int(raw_ranked.numel()),
+                    "selected": True,
+                    "selected_candidate_index": index,
+                    "selected_score": float(scores[index]),
+                    "selected_pose": canonical.poses[index].detach().cpu().tolist(),
+                }
+            )
+        self._last_interaction_trace = {"environment_rows": trace_rows}
         device = selected[0].device
         return (
             torch.tensor(successes, dtype=torch.bool, device=device),
             torch.stack(selected),
             torch.zeros(len(selected), dtype=torch.float32, device=device),
+        )
+
+    @staticmethod
+    def _diverse_interaction_ranking(
+        poses: torch.Tensor,
+        ranked_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Retain grasp ranks that differ in translation or orientation."""
+        retained: list[int] = []
+        for candidate_index in ranked_indices.tolist():
+            distinct = True
+            for retained_index in retained:
+                translation = torch.linalg.vector_norm(
+                    poses[candidate_index, :3, 3] - poses[retained_index, :3, 3]
+                )
+                relative = torch.matmul(
+                    poses[retained_index, :3, :3].transpose(0, 1),
+                    poses[candidate_index, :3, :3],
+                )
+                cosine = torch.clamp((torch.trace(relative) - 1.0) * 0.5, -1.0, 1.0)
+                rotation = torch.acos(cosine)
+                if (
+                    translation < _INTERACTION_MIN_TRANSLATION_SEPARATION
+                    and rotation < _INTERACTION_MIN_ROTATION_SEPARATION
+                ):
+                    distinct = False
+                    break
+            if distinct:
+                retained.append(int(candidate_index))
+        return torch.as_tensor(
+            retained,
+            dtype=torch.long,
+            device=ranked_indices.device,
         )
 
     @contextmanager

@@ -394,7 +394,7 @@ def test_fast_gym_config_has_runnable_franka_contract(gym_export: Path) -> None:
     )
     assert config["env"]["observations"]["norm_robot_eef_joint"]["params"][
         "joint_ids"
-    ] == [14, 16]
+    ] == [7, 15]
 
 
 def test_fast_gym_config_normalizes_usdc_articulation_runtime_fields(
@@ -435,6 +435,7 @@ def test_fast_gym_config_normalizes_usdc_articulation_runtime_fields(
     articulation = config["articulation"][0]
     assert articulation["fpath"] == usdc_path.resolve().as_posix()
     assert articulation["build_pk_chain"] is False
+    assert articulation["enable_gravity"] is False
     assert (
         not {
             "category",
@@ -1096,6 +1097,17 @@ def test_fast_gym_config_applies_one_complete_gripper_profile(
     assert extensions["gripper_open_state"] == list(profile.open_positions)
     assert extensions["gripper_close_state"] == list(profile.close_positions)
     assert extensions["gripper_profile"]["model"] == gripper_model
+    assert config["env"]["control_parts"] == [
+        "left_arm",
+        "left_eef",
+        "right_arm",
+        "right_eef",
+    ]
+    left_arm_dof = len(robot["control_parts"]["left_arm"])
+    right_arm_dof = len(robot["control_parts"]["right_arm"])
+    assert config["env"]["observations"]["norm_robot_eef_joint"]["params"][
+        "joint_ids"
+    ] == [left_arm_dof, left_arm_dof + 1 + right_arm_dof]
     assert robot["control_parts"]["left_eef"] == list(
         profile.control_joint_names("left")
     )

@@ -221,6 +221,60 @@ def test_upright_context_rejects_end_clamps_and_ranks_mid_body_grasps(
     assert trace["best_candidate_axis_fraction"] == 0.5
 
 
+def test_interaction_context_records_selected_candidate(monkeypatch) -> None:
+    generator = _TracingAntipodalGraspPoseGenerator(
+        ParallelJawGripperModelCfg(model_id="interaction_trace_test")
+    )
+    poses = torch.stack((_pose_with_y(0.01), _pose_with_y(0.04)))
+    monkeypatch.setattr(
+        AntipodalGraspPoseGenerator,
+        "get_valid_grasp_poses",
+        lambda _self, **_kwargs: [(poses, torch.tensor([0.2, 0.1]))],
+    )
+
+    with generator.interaction_selection_context(
+        reference_xpos=torch.eye(4).unsqueeze(0),
+        candidate_rank=1,
+    ):
+        success, selected, _ = generator.get_best_grasp_poses()
+
+    assert success.tolist() == [True]
+    torch.testing.assert_close(selected[0], poses[0])
+    trace = generator.last_interaction_trace
+    assert trace is not None
+    row = trace["environment_rows"][0]
+    assert row["requested_candidate_rank"] == 1
+    assert row["selected_candidate_index"] == 0
+    assert row["candidate_count"] == 2
+    assert generator.last_interaction_trace is not trace
+
+
+def test_interaction_context_skips_near_duplicate_ranks(monkeypatch) -> None:
+    generator = _TracingAntipodalGraspPoseGenerator(
+        ParallelJawGripperModelCfg(model_id="interaction_diversity_test")
+    )
+    poses = torch.stack((_pose_with_y(0.0), _pose_with_y(0.001), _pose_with_y(0.04)))
+    monkeypatch.setattr(
+        AntipodalGraspPoseGenerator,
+        "get_valid_grasp_poses",
+        lambda _self, **_kwargs: [(poses, torch.tensor([0.0, 0.01, 0.02]))],
+    )
+
+    with generator.interaction_selection_context(
+        reference_xpos=torch.eye(4).unsqueeze(0),
+        candidate_rank=1,
+    ):
+        success, selected, _ = generator.get_best_grasp_poses()
+
+    assert success.tolist() == [True]
+    torch.testing.assert_close(selected[0], poses[2])
+    trace = generator.last_interaction_trace
+    assert trace is not None
+    row = trace["environment_rows"][0]
+    assert row["raw_candidate_count"] == 3
+    assert row["candidate_count"] == 2
+
+
 def _pose_with_y(y: float) -> torch.Tensor:
     pose = torch.eye(4)
     pose[1, 3] = y

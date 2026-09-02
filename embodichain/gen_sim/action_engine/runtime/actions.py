@@ -117,6 +117,7 @@ _COLLISION_PARKING_Z_OFFSET = -100.0
 _BODY_GRASP_CANDIDATE_LIMIT = 500
 _BODY_GRASP_SEED = 17_392
 _COORDINATED_GRASP_SEED = 17_393
+_INTERACTION_GRASP_SEED = 17_394
 _FREE_YAW_SAMPLE_COUNT = 8
 _RETREAT_LOG_LOCK = RLock()
 
@@ -441,6 +442,7 @@ class AtomicActionAdapter:
         candidate_search_warnings: list[str] = []
         candidate_search_attempts = 0
         coordinated_search_attempts: list[dict[str, Any]] = []
+        interaction_search_attempts: list[dict[str, Any]] = []
         best_failure_count = self.num_envs + 1
         for candidate in grounded_candidates:
             candidate_engine = self._engine_for(candidate, capability)
@@ -453,7 +455,15 @@ class AtomicActionAdapter:
                 candidate.motion_policy.get("retreat_reachability_search", False)
                 or candidate.motion_policy.get("reorient_tool_down", False)
             )
+            interaction_rank = candidate.motion_policy.get(
+                "interaction_grasp_candidate_rank"
+            )
             grasp_seed = candidate.motion_policy.get("grasp_seed")
+            if interaction_rank is not None:
+                grasp_seed = candidate.motion_policy.get(
+                    "interaction_grasp_seed",
+                    _INTERACTION_GRASP_SEED,
+                )
             seed_context = (
                 nullcontext()
                 if grasp_seed is None
@@ -482,6 +492,28 @@ class AtomicActionAdapter:
                 _capture_retreat_warnings(capture_warnings) as warnings,
             ):
                 candidate_plan = candidate_engine.plan(candidate_invocation, context)
+            if interaction_rank is not None:
+                _, hand_part, _ = self._parts(candidate.arm)
+                generator = (
+                    None
+                    if hand_part is None
+                    else candidate_engine.grasp_pose_generators.get(hand_part)
+                )
+                trace = (
+                    generator.last_interaction_trace
+                    if isinstance(generator, _TracingAntipodalGraspPoseGenerator)
+                    else None
+                )
+                interaction_search_attempts.append(
+                    {
+                        "candidate_rank": int(interaction_rank),
+                        "seed": int(grasp_seed),
+                        "plan_success": candidate_plan.plan_success.detach()
+                        .cpu()
+                        .tolist(),
+                        "grasp": deepcopy(trace),
+                    }
+                )
             self._record_selected_upright_grasp(
                 candidate,
                 candidate_plan,
@@ -712,6 +744,7 @@ class AtomicActionAdapter:
                     }
                     for segment in plan.segments
                 },
+                "interaction_grasp_search": deepcopy(interaction_search_attempts),
             },
         )
 
@@ -1570,7 +1603,7 @@ class AtomicActionAdapter:
         """Expose bounded grasp ranks to the existing plan-candidate loop."""
         if capability.target_materializer not in {"slide", "open_door"}:
             return (grounded,)
-        count = int(grounded.motion_policy.get("interaction_grasp_candidate_count", 2))
+        count = int(grounded.motion_policy.get("interaction_grasp_candidate_count", 8))
         if not 1 <= count <= 8:
             raise ValueError("interaction_grasp_candidate_count must be in [1, 8].")
         return tuple(
@@ -2914,18 +2947,25 @@ class AtomicActionAdapter:
         grounded: GroundedAction,
         capability: AtomicCapability,
     ) -> AtomicActionEngine:
-        if capability.config_materializer != "coordinated_pickment":
+        is_coordinated = capability.config_materializer == "coordinated_pickment"
+        is_articulation_interaction = capability.target_materializer in {
+            "slide",
+            "open_door",
+        }
+        if not is_coordinated and not is_articulation_interaction:
             return self._engine()
         filter_ground_collision = grounded.cfg.get(
             "is_filter_ground_collision",
-            True,
+            not is_articulation_interaction,
         )
         if not isinstance(filter_ground_collision, bool):
             raise TypeError("is_filter_ground_collision must be a boolean.")
-        opening_margin = grounded.cfg.get(
-            "grasp_opening_margin",
-            self.gripper_profile.grasp_model.opening_margin,
-        )
+        opening_margin = self.gripper_profile.grasp_model.opening_margin
+        if is_coordinated:
+            opening_margin = grounded.cfg.get(
+                "grasp_opening_margin",
+                opening_margin,
+            )
         if isinstance(opening_margin, bool) or not isinstance(
             opening_margin, (int, float)
         ):
