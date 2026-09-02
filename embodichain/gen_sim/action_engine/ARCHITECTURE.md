@@ -199,15 +199,26 @@ The executable catalog currently contains:
 
 Articulation grounding reads live joint types, link geometry, limits, and
 positions. Zero-nearest joint endpoints represent closed or inactive states
-for generated binary mechanisms. The Scene Engine source adapter declares a
-three-position ordinal calibration only for unambiguous generated
-`knob`/`dial`/`rotary` joints, using the USD-authored revolute limits; authored
-`joint_settings` always win, and multiple calibrated joints remain an explicit
-ambiguity. GenSim converts authored prismatic limits to the uniformly scaled
-endpoints enforced by physics, reads USD revolute limits in radians, and wraps
-equivalent live angles before invoking `Slide`, `OpenDoor`, `Twist`, or `Press`.
-Rows already at their requested articulation state are verified without
-replaying motion.
+for generated binary mechanisms. The Scene Engine source adapter records each
+unambiguous `Slide`, `OpenDoor`, `Press`, or `Twist` joint together with its USD
+`body1` link in `agent_config.articulation_interaction_links`. Contact-driven
+`Slide` and `OpenDoor` targets additionally own one exact grasp mesh when USD
+authoring provides an unambiguous handle. Runtime grounding uses that exact
+joint, live link pose, and handle geometry, while old bundles retain the
+name-based single-joint fallback. For generated USD drawers, GenSim samples the
+exact handle and the complete scaled articulation in the moving-link frame and
+passes both point clouds through `ObjectSemantics`, allowing
+`SlideAffordance.resolve_from_object_geometry()` to own axis inference just as
+the direct Atomic Action tutorial does. The adapter also declares a three-position ordinal
+calibration only for unambiguous generated `knob`/`dial`/`rotary` joints, using
+the USD-authored revolute limits; authored `joint_settings` always win, and
+multiple calibrated joints remain an explicit ambiguity. GenSim converts
+authored prismatic limits and USD link geometry to runtime body scale, reads USD
+revolute limits in radians, and wraps equivalent live angles before invoking
+`Slide`, `OpenDoor`, `Twist`, or `Press`. Idempotent articulation targets may be
+accepted at entry. GenSim retains the tutorial `Slide` sampling and
+hand-interpolation budgets and inserts an explicit close-pose settle segment so
+simulator drives can converge before the drawer interaction starts.
 
 Adding an executable skill consists of registering its descriptor and reusable
 materializer/verifier hooks plus focused tests. Planner and executor dispatch

@@ -227,10 +227,17 @@ runtime:
         press_depth: 0.004
         postcondition_tolerance: 0.03
       Slide:
-        sample_interval: 80
-        postcondition_tolerance: 0.03
+        sample_interval: 140
+        hand_interp_steps: 12
+        approach_distance: 0.10
+        articulation_grasp_settle_steps: 80
+        postcondition_tolerance: 0.005
       OpenDoor:
-        sample_interval: 80
+        sample_interval: 300
+        hand_interp_steps: 30
+        door_waypoint_count: 50
+        approach_distance: 0.10
+        retract_distance: 0.10
         postcondition_tolerance: 0.03
       Twist:
         sample_interval: 80

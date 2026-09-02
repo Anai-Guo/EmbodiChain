@@ -58,6 +58,8 @@ from embodichain.gen_sim.action_engine.runtime.articulation import (
     _effective_joint_limits,
     _effective_joint_position,
     _named_link_geometry,
+    _sample_interaction_point_clouds,
+    _scaled_link_geometry,
 )
 from embodichain.gen_sim.action_engine.runtime.executor import (
     ProgramExecutor,
@@ -117,9 +119,11 @@ from embodichain.lab.sim.atomic_actions import (
     PressOptions,
     SlideAffordance,
     SlideGoal,
+    SlideOptions,
     StateDelta,
     TwistAffordance,
     TwistGoal,
+    TwistOptions,
 )
 
 from ..task_fixtures import make_task_spec
@@ -251,7 +255,7 @@ class _FakeArticulation:
     def get_link_vert_face(self, link_name: str) -> tuple[torch.Tensor, torch.Tensor]:
         if link_name == "handle":
             return self._handle_vertices.clone(), self._triangles.clone()
-        assert link_name == "drawer_link"
+        assert link_name in {"base", "drawer_link"}
         return self._vertices.clone(), self._triangles.clone()
 
     def get_qpos(self) -> torch.Tensor:
@@ -274,6 +278,122 @@ class _FakeArticulation:
                 joint_limits=(float(lower), float(upper)),
             ),
         )
+
+
+class _FakeMultiInteractionArticulation:
+    """Articulation whose configured interaction links disambiguate three joints."""
+
+    def __init__(self, uid: str) -> None:
+        self.uid = uid
+        self.joint_names = ["linear_a", "linear_b", "rotary_a", "rotary_b"]
+        self.active_joint_ids = [0, 1, 2, 3]
+        self.all_joint_names = list(self.joint_names)
+        self.link_names = ["base", "drawer", "button", "knob", "door"]
+        self._qpos = torch.zeros(1, 4, dtype=torch.float32)
+        self._limits = torch.tensor(
+            [[[-0.2, 0.0], [-0.02, 0.0], [-1.0, 1.0], [-1.5, 0.0]]],
+            dtype=torch.float32,
+        )
+        self.cfg = SimpleNamespace(body_scale=(1.0, 1.0, 1.0), fpath="")
+        self.device = torch.device("cpu")
+        self._pose = _pose(0.0, 0.0, 0.7)
+        self._link_poses = {
+            "base": self._pose.clone(),
+            "drawer": _pose(0.0, -0.2, 0.75),
+            "button": _pose(0.0, 0.0, 0.82),
+            "knob": _pose(0.0, 0.2, 0.78),
+            "door": _pose(0.0, 0.3, 0.8),
+        }
+        self._vertices = {
+            "drawer": _box_vertices(0.04),
+            "button": _box_vertices(0.02),
+            "knob": _box_vertices(0.03),
+        }
+        self._triangles = torch.tensor(
+            [[0, 1, 2], [0, 2, 3]],
+            dtype=torch.int64,
+        )
+        self._joint_infos = {
+            "linear_a": SimpleNamespace(
+                name="linear_a",
+                joint_type=SimpleNamespace(name="PRISMATIC"),
+                child_link_name="drawer",
+                parent_link_name="base",
+                axis=torch.tensor([0.0, 1.0, 0.0]),
+                origin_pose=torch.eye(4),
+            ),
+            "linear_b": SimpleNamespace(
+                name="linear_b",
+                joint_type=SimpleNamespace(name="PRISMATIC"),
+                child_link_name="button",
+                parent_link_name="base",
+                axis=torch.tensor([0.0, 0.0, -1.0]),
+                origin_pose=torch.eye(4),
+            ),
+            "rotary_a": SimpleNamespace(
+                name="rotary_a",
+                joint_type=SimpleNamespace(name="REVOLUTE"),
+                child_link_name="knob",
+                parent_link_name="base",
+                axis=torch.tensor([0.0, 0.0, 1.0]),
+                origin_pose=torch.eye(4),
+            ),
+            "rotary_b": SimpleNamespace(
+                name="rotary_b",
+                joint_type=SimpleNamespace(name="REVOLUTE"),
+                child_link_name="door",
+                parent_link_name="base",
+                axis=torch.tensor([0.0, 0.0, 1.0]),
+                origin_pose=torch.eye(4),
+            ),
+        }
+        self._gravity_enabled = True
+        self._dynamics_cleared = False
+        self._entities = [
+            SimpleNamespace(
+                get_joint_info=lambda name: self._joint_infos[name],
+                enable_gravity=lambda enabled: setattr(
+                    self, "_gravity_enabled", bool(enabled)
+                ),
+            )
+        ]
+
+    def get_local_pose(self, *, to_matrix: bool) -> torch.Tensor:
+        assert to_matrix
+        return self._pose.clone()
+
+    def get_link_pose(
+        self,
+        link_name: str,
+        env_ids: list[int] | None = None,
+        *,
+        to_matrix: bool,
+    ) -> torch.Tensor:
+        assert to_matrix
+        del env_ids
+        return self._link_poses[link_name].clone()
+
+    def get_link_vert_face(self, link_name: str) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._vertices[link_name].clone(), self._triangles.clone()
+
+    def get_qpos(self) -> torch.Tensor:
+        return self._qpos.clone()
+
+    def get_qpos_limits(self, *, joint_ids: list[int]) -> torch.Tensor:
+        return self._limits[:, joint_ids].clone()
+
+    def set_qpos(
+        self,
+        qpos: torch.Tensor,
+        joint_ids: list[int],
+        *,
+        target: bool,
+    ) -> None:
+        if not target:
+            self._qpos[:, joint_ids] = qpos
+
+    def clear_dynamics(self) -> None:
+        self._dynamics_cleared = True
 
 
 class _FakeSim:
@@ -574,7 +694,7 @@ def test_prismatic_grounding_uses_physics_scaled_runtime_limits() -> None:
         state=ExecutionState(last_qpos=env.robot.get_qpos()),
     )
 
-    assert grounded.cfg["press_distance"] == pytest.approx(0.001)
+    assert grounded.cfg["press_distance"] == pytest.approx(0.004)
     assert grounded.cfg["articulation_target_qpos"].item() == pytest.approx(-0.001)
     articulation._qpos[0, 0] = -0.001
     from embodichain.gen_sim.action_engine.environment.agent_env import ActionEngineEnv
@@ -582,31 +702,68 @@ def test_prismatic_grounding_uses_physics_scaled_runtime_limits() -> None:
     assert bool(ActionEngineEnv.is_object_pressed(env, "button")[0])
 
 
-def test_executor_skips_articulation_action_when_goal_is_already_satisfied() -> None:
-    task, _ = make_task_spec("E9")
+def test_slide_execution_inserts_configured_grasp_settle_segment() -> None:
+    task, _ = make_task_spec("E6")
     program = load_execution_program(
-        instantiate_seed_graph(task, {"object_01": "button"})
+        instantiate_seed_graph(task, {"object_01": "drawer"})
     )
-    articulation = _FakeArticulation("button", -0.001)
-    articulation._limits = torch.tensor([[[-0.004, 0.0]]])
-    articulation.cfg.body_scale = (0.25, 0.25, 0.25)
-    env = _FakeEnv(articulations={"button": articulation})
-    env.agent_config = {"articulation_settings": {}}
-    env.runtime_policy = default_runtime_policy("dual_franka")
-    from embodichain.gen_sim.action_engine.environment.agent_env import ActionEngineEnv
-
-    env.is_object_pressed = lambda uid, terminal_state="activated": (
-        ActionEngineEnv.is_object_pressed(env, uid, terminal_state)
-    )
+    env = _FakeEnv(articulations={"drawer": _FakeArticulation("drawer", 0.0)})
     executor = ProgramExecutor(program, env, record_runtime=False)
-
-    satisfied = executor._already_satisfied_articulation_rows(
-        _interaction_edge(program),
-        program.semantic_steps[0],
-        active=torch.ones(1, dtype=torch.bool),
+    state = ExecutionState(last_qpos=env.robot.get_qpos())
+    trajectory = (
+        torch.arange(4, dtype=torch.float32)
+        .reshape(1, 4, 1)
+        .repeat(1, 1, env.robot.dof)
+    )
+    grounded = GroundedAction(
+        action_class="Slide",
+        arm="right_arm",
+        control="arm",
+        target=SlideGoal(
+            semantics=ObjectSemantics(
+                affordance=SlideAffordance(
+                    mesh_vertices=_box_vertices(0.02),
+                    mesh_triangles=torch.tensor([[0, 1, 2], [0, 2, 3]]),
+                ),
+                geometry={},
+                entity_id="drawer:handle",
+                label="drawer:handle",
+            ),
+            target_pose=_pose(0.0, 0.0, 0.7),
+        ),
+        cfg={},
+        motion_policy={"articulation_grasp_settle_steps": 2},
+        object_uid="drawer",
+    )
+    outcome = ActionOutcome(
+        trajectory=trajectory,
+        success=torch.tensor([True]),
+        next_state=state,
+        grounded=grounded,
+        planner_trace={
+            "action_segments": {
+                "approach": {"start": 0, "stop": 1},
+                "close": {"start": 1, "stop": 2},
+                "pull": {"start": 2, "stop": 3},
+                "open": {"start": 3, "stop": 4},
+            }
+        },
     )
 
-    assert satisfied.tolist() == [True]
+    extended = executor._with_articulation_grasp_settle(
+        trajectory,
+        outcomes={"left_arm": None, "right_arm": outcome},
+        action_class="Slide",
+    )
+
+    assert extended[0, :, 0].tolist() == [0.0, 1.0, 1.0, 1.0, 2.0, 3.0]
+    assert outcome.planner_trace["action_segments"] == {
+        "approach": {"start": 0, "stop": 1},
+        "close": {"start": 1, "stop": 2},
+        "grasp_settle": {"start": 2, "stop": 4},
+        "pull": {"start": 4, "stop": 5},
+        "open": {"start": 5, "stop": 6},
+    }
 
 
 def test_press_grounding_supports_a_revolute_rocker_switch() -> None:
@@ -4444,6 +4601,165 @@ def test_articulation_grounding_reuses_slide_and_observes_joint_state(
     assert bool(evaluate_predicate(env, predicate)[0])
 
 
+def test_generated_usd_slide_axis_points_from_handle_toward_parent(
+    tmp_path: Path,
+) -> None:
+    from pxr import Usd, UsdGeom
+
+    task, _ = make_task_spec("E6")
+    program = load_execution_program(
+        instantiate_seed_graph(task, {"object_01": "drawer"})
+    )
+    articulation = _FakeArticulation("drawer", 0.0)
+    path = tmp_path / "drawer.usda"
+    stage = Usd.Stage.CreateNew(path.as_posix())
+    root = UsdGeom.Xform.Define(stage, "/World/item")
+    stage.SetDefaultPrim(root.GetPrim())
+    link = UsdGeom.Xform.Define(stage, "/World/item/rigid_bodies/drawer_link")
+    mesh = UsdGeom.Mesh.Define(
+        stage,
+        "/World/item/rigid_bodies/drawer_link/shapes/handle_grip",
+    )
+    mesh.CreatePointsAttr(
+        [
+            tuple(float(value) for value in row)
+            for row in articulation._handle_vertices + torch.tensor([0.05, 0.0, 0.0])
+        ]
+    )
+    mesh.CreateFaceVertexCountsAttr([3, 3])
+    mesh.CreateFaceVertexIndicesAttr(articulation._triangles.flatten().tolist())
+    stage.GetRootLayer().Save()
+    articulation.cfg.fpath = path.as_posix()
+    env = _FakeEnv(articulations={"drawer": articulation})
+    env.agent_config = {
+        "articulation_interaction_links": {
+            "drawer": {
+                "slide": {
+                    "joint_name": "slide_joint",
+                    "link_name": link.GetPrim().GetName(),
+                    "mesh_name": mesh.GetPrim().GetName(),
+                }
+            }
+        }
+    }
+
+    grounded = ActionGrounder(program, env, lambda _uid: None).ground(
+        _interaction_edge(program).actions[0],
+        program.semantic_steps[0],
+        arm="right_arm",
+        state=ExecutionState(last_qpos=env.robot.get_qpos()),
+    )
+
+    assert torch.allclose(
+        grounded.cfg["articulation_push_axis_world"],
+        torch.tensor([[-1.0, 0.0, 0.0]]),
+    )
+    assert torch.allclose(
+        grounded.target.semantics.affordance.translation_axis,
+        torch.tensor([-1.0, 0.0, 0.0]),
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "task_type",
+        "interaction",
+        "joint_name",
+        "link_name",
+        "goal_type",
+        "options_type",
+    ),
+    (("E6", "slide", "linear_a", "drawer", SlideGoal, SlideOptions),),
+)
+def test_articulation_grounding_uses_configured_interaction_link(
+    task_type: str,
+    interaction: str,
+    joint_name: str,
+    link_name: str,
+    goal_type: type,
+    options_type: type,
+) -> None:
+    """GenSim routes each interaction to its configured joint-owned link."""
+    task, _ = make_task_spec(task_type)
+    program = load_execution_program(
+        instantiate_seed_graph(task, {"object_01": "panel"})
+    )
+    articulation = _FakeMultiInteractionArticulation("panel")
+    env = _FakeEnv(articulations={"panel": articulation})
+    env.runtime_policy = default_runtime_policy("dual_franka")
+    env.agent_config = {
+        "articulation_settings": {"panel": {"rotary_a": [-1.0, 0.0, 1.0]}},
+        "articulation_interaction_links": {
+            "panel": {
+                "slide": {"joint_name": "linear_a", "link_name": "drawer"},
+                "press": {"joint_name": "linear_b", "link_name": "button"},
+                "twist": {"joint_name": "rotary_a", "link_name": "knob"},
+            }
+        },
+    }
+    semantics = ObjectSemantics(
+        affordance=Affordance(),
+        geometry={},
+        entity_id="panel",
+        label="panel",
+    )
+
+    grounded = ActionGrounder(program, env, lambda _uid: semantics).ground(
+        _interaction_edge(program).actions[0],
+        program.semantic_steps[0],
+        arm="right_arm",
+        state=ExecutionState(last_qpos=env.robot.get_qpos()),
+    )
+
+    assert isinstance(grounded.target, goal_type)
+    assert grounded.target.semantics.entity_id == f"panel:{link_name}"
+    assert grounded.cfg["articulation_joint_name"] == joint_name
+    assert grounded.cfg["articulation_target_link_name"] == link_name
+    assert torch.equal(
+        grounded.target.target_pose,
+        articulation._link_poses[link_name],
+    )
+    assert isinstance(
+        AtomicActionAdapter(env)._build_config(grounded, options_type),
+        options_type,
+    )
+
+
+@pytest.mark.parametrize("task_type", ("E6",))
+def test_articulation_staging_resolves_the_interaction_link_before_semantics(
+    task_type: str,
+) -> None:
+    """Staging must not request ambiguous root-articulation semantics."""
+    task, _ = make_task_spec(task_type)
+    program = load_execution_program(
+        instantiate_seed_graph(task, {"object_01": "panel"})
+    )
+    articulation = _FakeMultiInteractionArticulation("panel")
+    env = _FakeEnv(articulations={"panel": articulation})
+    env.agent_config = {
+        "articulation_settings": {"panel": {"rotary_a": [-1.0, 0.0, 1.0]}},
+        "articulation_interaction_links": {
+            "panel": {
+                "slide": {"joint_name": "linear_a", "link_name": "drawer"},
+                "press": {"joint_name": "linear_b", "link_name": "button"},
+                "twist": {"joint_name": "rotary_a", "link_name": "knob"},
+            }
+        },
+    }
+
+    def reject_root_semantics(uid: str) -> ObjectSemantics:
+        raise AssertionError(f"unexpected root semantics request for {uid}")
+
+    grounded = ActionGrounder(program, env, reject_root_semantics).ground(
+        program.edges[0].actions[0],
+        program.semantic_steps[0],
+        arm="right_arm",
+        state=ExecutionState(last_qpos=env.robot.get_qpos()),
+    )
+
+    assert isinstance(grounded.target, EndEffectorPoseGoal)
+
+
 def test_named_link_geometry_extracts_only_matching_usd_shapes(tmp_path: Path) -> None:
     from pxr import Usd, UsdGeom
 
@@ -4487,6 +4803,58 @@ def test_named_link_geometry_extracts_only_matching_usd_shapes(tmp_path: Path) -
     assert vertices.shape == (3, 3)
     assert triangles.tolist() == [[0, 1, 2]]
     assert vertices.max(dim=0).values.tolist() == pytest.approx([0.2, 0.2, 0.0])
+    assert (
+        _named_link_geometry(
+            articulation,
+            drawer.GetPrim().GetName(),
+            mesh_names=("missing_handle",),
+        )
+        is None
+    )
+
+
+def test_generated_usd_link_geometry_applies_runtime_body_scale(
+    tmp_path: Path,
+) -> None:
+    articulation = _FakeArticulation("button", 0.0)
+    articulation.cfg.fpath = (tmp_path / "button.usdc").as_posix()
+    articulation.cfg.body_scale = (0.25, 0.5, 0.75)
+
+    vertices, triangles = _scaled_link_geometry(articulation, "drawer_link")
+
+    assert torch.equal(
+        vertices,
+        articulation._vertices * torch.tensor([0.25, 0.5, 0.75]),
+    )
+    assert torch.equal(triangles, articulation._triangles)
+
+
+def test_generated_usd_interaction_point_clouds_use_scaled_handle_geometry(
+    tmp_path: Path,
+) -> None:
+    articulation = _FakeArticulation("drawer", 0.0)
+    articulation.cfg.fpath = (tmp_path / "drawer.usdc").as_posix()
+    articulation.cfg.body_scale = (0.5, 0.5, 0.5)
+    target_vertices = articulation._handle_vertices * 0.5
+
+    geometry = _sample_interaction_point_clouds(
+        articulation,
+        "handle",
+        target_vertices=target_vertices,
+        target_triangles=articulation._triangles,
+        prismatic_joint_axis=torch.tensor([0.0, 1.0, 0.0]),
+        articulation_point_count=256,
+        target_point_count=64,
+    )
+
+    assert set(geometry) == {
+        "articulation_point_cloud",
+        "target_link_point_cloud",
+        "target_link_prismatic_joint_axis",
+    }
+    assert geometry["articulation_point_cloud"].shape == (256, 3)
+    assert geometry["target_link_point_cloud"].shape == (64, 3)
+    assert geometry["target_link_point_cloud"].abs().max() <= 0.01 + 1.0e-6
 
 
 def test_generated_usd_revolute_uses_authored_limits_and_wraps_qpos(
@@ -4603,6 +4971,66 @@ def test_articulation_grounding_dispatches_revolute_door_to_open_door() -> None:
     assert not bool(evaluate_predicate(env, predicate)[0])
     articulation._qpos[0, 0] = -1.0
     assert bool(evaluate_predicate(env, predicate)[0])
+
+
+def test_open_door_defers_thin_handle_feasibility_to_grasp_sampler() -> None:
+    """A physically closable thin handle must reach the Atomic Action planner."""
+    task, _ = make_task_spec("E7")
+    program = load_execution_program(
+        instantiate_seed_graph(task, {"object_01": "cabinet"})
+    )
+    articulation = _FakeArticulation("cabinet", 0.0)
+    articulation._joint_info.joint_type = SimpleNamespace(name="REVOLUTE")
+    articulation._limits = torch.tensor([[[-1.0, 0.0]]])
+    half_extents = torch.tensor([0.07804, 0.00428, 0.00428])
+    articulation._vertices = torch.tensor(
+        [
+            [x, y, z]
+            for x in (-half_extents[0], half_extents[0])
+            for y in (-half_extents[1], half_extents[1])
+            for z in (-half_extents[2], half_extents[2])
+        ]
+    )
+    articulation._vertices += torch.tensor([0.0, 0.1, 0.0])
+    env = _FakeEnv(articulations={"cabinet": articulation})
+
+    grounded = ActionGrounder(program, env, lambda _uid: None).ground(
+        _interaction_edge(program).actions[0],
+        program.semantic_steps[0],
+        arm="left_arm",
+        state=ExecutionState(last_qpos=env.robot.get_qpos()),
+    )
+
+    assert isinstance(grounded.target, OpenDoorGoal)
+    assert grounded.target.semantics.affordance.mesh_vertices.shape == (8, 3)
+
+
+def test_articulation_checkpoint_metadata_reports_qpos_delta_and_error() -> None:
+    task, _ = make_task_spec("E7")
+    program = load_execution_program(
+        instantiate_seed_graph(task, {"object_01": "cabinet"})
+    )
+    articulation = _FakeArticulation("cabinet", -0.5)
+    articulation._joint_info.joint_type = SimpleNamespace(name="REVOLUTE")
+    articulation._limits = torch.tensor([[[-1.0, 0.0]]])
+    env = _FakeEnv(articulations={"cabinet": articulation})
+    executor = ProgramExecutor(program, env, record_runtime=False)
+    step = program.semantic_steps[0]
+    executor._policies[step.id] = {
+        "articulation_joint_name": "slide_joint",
+        "articulation_target_link_name": "drawer_link",
+        "articulation_target_mesh_name": "vertical_pull",
+        "articulation_initial_qpos": torch.tensor([0.0]),
+        "articulation_target_qpos": torch.tensor([-1.0]),
+    }
+
+    metadata = executor._step_runtime_metadata(step)[0]["articulation_state"]
+
+    assert metadata["target_link_name"] == "drawer_link"
+    assert metadata["target_mesh_name"] == "vertical_pull"
+    assert metadata["delta_qpos"].item() == pytest.approx(-0.5)
+    assert metadata["target_error"].item() == pytest.approx(0.5)
+    assert metadata["direction_ok"].tolist() == [True]
 
 
 def test_twist_requires_setting_map_and_reuses_twist() -> None:

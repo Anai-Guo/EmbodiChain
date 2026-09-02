@@ -257,6 +257,9 @@ def generate_action_engine_config(
             and isinstance(config.get("attributes"), Mapping)
             and config.get("attributes", {}).get("joint_settings")
         },
+        articulation_interaction_links=_articulation_interaction_links(
+            scene.planner_objects
+        ),
         planning_mode=planning_mode,
         seed_task_graph_path=graph_relative_path,
         vlm_model=vlm_model,
@@ -298,6 +301,24 @@ def generate_action_engine_config(
         overwrite=overwrite,
         planning_mode=planning_mode,
     )
+
+
+def _articulation_interaction_links(
+    planner_objects: Sequence[Mapping[str, Any]],
+) -> dict[str, dict[str, dict[str, str]]]:
+    """Extract generated articulation joint/link targets for runtime grounding."""
+    result: dict[str, dict[str, dict[str, str]]] = {}
+    for config in planner_objects:
+        if config.get("role") != "articulation":
+            continue
+        attributes = config.get("attributes", {})
+        if not isinstance(attributes, Mapping):
+            continue
+        interactions = attributes.get("interaction_links", {})
+        if not isinstance(interactions, Mapping) or not interactions:
+            continue
+        result[str(config["uid"])] = deepcopy(dict(interactions))
+    return result
 
 
 def _read_task_spec(

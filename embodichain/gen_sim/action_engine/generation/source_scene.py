@@ -578,7 +578,7 @@ def _generated_articulation_semantics(
     if path.suffix.lower() not in {".usd", ".usda", ".usdc"} or not path.is_file():
         return {}, ["articulated"]
     try:
-        from pxr import Usd, UsdPhysics
+        from pxr import Usd, UsdGeom, UsdPhysics
 
         stage = Usd.Stage.Open(path.as_posix())
     except (ImportError, RuntimeError):
@@ -588,6 +588,7 @@ def _generated_articulation_semantics(
 
     affordances = {"articulated"}
     joint_settings: dict[str, list[float]] = {}
+    interaction_link_candidates: dict[str, list[dict[str, str]]] = {}
     for prim in stage.Traverse():
         if prim.IsA(UsdPhysics.RevoluteJoint):
             joint_type = "revolute"
@@ -602,22 +603,27 @@ def _generated_articulation_semantics(
         normalized_name = joint_name.casefold()
         if not joint_name:
             continue
-        if joint_type == "prismatic" and any(
-            token in normalized_name for token in ("drawer", "slide", "tray")
-        ):
+        interaction = _generated_joint_interaction(joint_type, normalized_name)
+        link_name = _usd_joint_child_link_name(joint)
+        if interaction is not None and link_name is not None:
+            target = {"joint_name": joint_name, "link_name": link_name}
+            mesh_name = _generated_interaction_mesh_name(
+                stage,
+                link_name=link_name,
+                interaction=interaction,
+                mesh_type=UsdGeom.Mesh,
+            )
+            if mesh_name is not None:
+                target["mesh_name"] = mesh_name
+            interaction_link_candidates.setdefault(interaction, []).append(target)
+        if interaction == "slide":
             affordances.add("slideable")
-        if joint_type == "prismatic" and any(
-            token in normalized_name for token in ("button", "press")
-        ):
+        elif interaction == "press":
             affordances.add("pressable")
-        if joint_type == "revolute" and any(
-            token in normalized_name for token in ("door", "hinge")
-        ):
+        elif interaction == "twist":
+            affordances.add("turnable")
+        elif interaction == "open_door":
             affordances.add("openable")
-        if joint_type == "revolute" and any(
-            token in normalized_name for token in ("rocker", "switch", "toggle")
-        ):
-            affordances.add("pressable")
         if joint_type != "revolute" or not any(
             token in normalized_name for token in ("knob", "dial", "rotary")
         ):
@@ -639,9 +645,95 @@ def _generated_articulation_semantics(
             0.5 * (lower_radians + upper_radians),
             upper_radians,
         ]
-        affordances.add("turnable")
-    attributes = {"joint_settings": joint_settings} if joint_settings else {}
+    interaction_links = {
+        interaction: candidates[0]
+        for interaction, candidates in sorted(interaction_link_candidates.items())
+        if len(candidates) == 1
+    }
+    attributes = {}
+    if joint_settings:
+        attributes["joint_settings"] = joint_settings
+    if interaction_links:
+        attributes["interaction_links"] = interaction_links
     return attributes, sorted(affordances)
+
+
+def _generated_joint_interaction(
+    joint_type: str,
+    normalized_name: str,
+) -> str | None:
+    """Return the GenSim interaction owned by one semantically named joint."""
+    if joint_type == "prismatic":
+        if any(token in normalized_name for token in ("button", "press")):
+            return "press"
+        if any(token in normalized_name for token in ("drawer", "slide", "tray")):
+            return "slide"
+    if joint_type == "revolute":
+        if any(token in normalized_name for token in ("rocker", "switch", "toggle")):
+            return "press"
+        if any(token in normalized_name for token in ("knob", "dial", "rotary")):
+            return "twist"
+        if any(token in normalized_name for token in ("door", "hinge")):
+            return "open_door"
+    return None
+
+
+def _generated_interaction_mesh_name(
+    stage: Any,
+    *,
+    link_name: str,
+    interaction: str,
+    mesh_type: Any,
+) -> str | None:
+    """Return one unambiguous grasp/contact mesh owned by a moving USD link."""
+    if interaction not in {"open_door", "slide"}:
+        return None
+    link_prim = next(
+        (
+            prim
+            for prim in stage.Traverse()
+            if prim.GetName() == link_name and "/rigid_bodies/" in str(prim.GetPath())
+        ),
+        None,
+    )
+    if link_prim is None:
+        return None
+    candidates = [
+        prim
+        for prim in stage.Traverse()
+        if prim.IsA(mesh_type)
+        and prim.GetPath().HasPrefix(link_prim.GetPath())
+        and any(
+            token in prim.GetName().casefold() for token in ("handle", "pull", "grip")
+        )
+        and not any(
+            token in prim.GetName().casefold()
+            for token in ("mount", "bracket", "base", "support", "hinge", "post", "leg")
+        )
+    ]
+    for preferred in ("grip", "pull", "handle"):
+        matches = [
+            prim for prim in candidates if preferred in prim.GetName().casefold()
+        ]
+        if len(matches) == 1:
+            return str(matches[0].GetName())
+        if len(matches) > 1:
+            return None
+    return None
+
+
+def _usd_joint_child_link_name(joint: Any) -> str | None:
+    """Return one USD joint's live body1 link name when authoring is complete."""
+    targets = list(joint.GetBody1Rel().GetTargets())
+    if len(targets) == 1:
+        name = str(targets[0].name).strip()
+        if name:
+            return name
+    prim = joint.GetPrim()
+    attribute = prim.GetAttribute("articraft:body1")
+    authored = attribute.Get() if attribute and attribute.IsValid() else None
+    name = str(authored or "").strip()
+    return name or None
 
 
 def _runtime_object(config: Mapping[str, Any], *, role: str) -> dict[str, Any]:

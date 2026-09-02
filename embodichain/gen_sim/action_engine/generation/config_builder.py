@@ -70,6 +70,7 @@ _DEFAULT_TABLETOP_Z = float(_GENERATION_DEFAULTS["scene"]["default_tabletop_z"])
 _DEFAULT_GRIPPER_MODEL = str(_GENERATION_DEFAULTS["task"]["default_gripper_model"])
 _DEFAULT_IK_SOLVER = str(_GENERATION_DEFAULTS["task"]["default_ik_solver"])
 _USD_ARTICULATION_SUFFIXES = frozenset({".usd", ".usda", ".usdc"})
+_ARTICULATION_INTERACTIONS = frozenset({"open_door", "press", "slide", "twist"})
 _ARTICULATION_AUTHORING_KEYS = frozenset(
     {
         "attributes",
@@ -136,6 +137,9 @@ def build_agent_config(
     dynamic_obstacle_uids: Sequence[str] | None = None,
     table_top_z: float | None = None,
     articulation_settings: Mapping[str, Mapping[str, Sequence[float]]] | None = None,
+    articulation_interaction_links: (
+        Mapping[str, Mapping[str, Mapping[str, str]]] | None
+    ) = None,
     planning_mode: str = "offline",
     seed_task_graph_path: str | Path | None = EXECUTION_PROGRAM_FILENAME,
     vlm_model: str | None = None,
@@ -215,6 +219,9 @@ def build_agent_config(
         "articulation_settings": _normalize_articulation_settings(
             articulation_settings or {}
         ),
+        "articulation_interaction_links": _normalize_articulation_interaction_links(
+            articulation_interaction_links or {}
+        ),
     }
     if planning_mode == "ab":
         camera_uids = _normalize_vlm_camera_uids(vlm_camera_uids)
@@ -259,6 +266,50 @@ def _normalize_articulation_settings(
                 raise ValueError("articulation setting values must be finite.")
             normalized_joints[joint_name] = normalized
         result[uid] = normalized_joints
+    return dict(sorted(result.items()))
+
+
+def _normalize_articulation_interaction_links(
+    value: Mapping[str, Mapping[str, Mapping[str, str]]],
+) -> dict[str, dict[str, dict[str, str]]]:
+    """Own the joint and moving-link target for each articulation interaction."""
+    result: dict[str, dict[str, dict[str, str]]] = {}
+    for uid, interactions in value.items():
+        if not isinstance(uid, str) or not uid or not isinstance(interactions, Mapping):
+            raise ValueError(
+                "articulation_interaction_links must map UIDs to interactions."
+            )
+        normalized_interactions: dict[str, dict[str, str]] = {}
+        for interaction, target in interactions.items():
+            if interaction not in _ARTICULATION_INTERACTIONS:
+                raise ValueError(
+                    "articulation interaction must be one of: "
+                    f"{', '.join(sorted(_ARTICULATION_INTERACTIONS))}."
+                )
+            if (
+                not isinstance(target, Mapping)
+                or not {
+                    "joint_name",
+                    "link_name",
+                }.issubset(target)
+                or not set(target).issubset({"joint_name", "link_name", "mesh_name"})
+            ):
+                raise ValueError(
+                    "articulation interaction targets require joint_name and "
+                    "link_name with an optional mesh_name."
+                )
+            normalized_target = {
+                key: str(target[key]).strip() for key in ("joint_name", "link_name")
+            }
+            if "mesh_name" in target:
+                normalized_target["mesh_name"] = str(target["mesh_name"]).strip()
+            if not all(normalized_target.values()):
+                raise ValueError(
+                    "articulation interaction joint_name and link_name must be "
+                    "non-empty."
+                )
+            normalized_interactions[str(interaction)] = normalized_target
+        result[uid] = dict(sorted(normalized_interactions.items()))
     return dict(sorted(result.items()))
 
 

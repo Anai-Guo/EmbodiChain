@@ -24,6 +24,7 @@ import pytest
 from embodichain.gen_sim.video_archive import (
     _archive_task_recording,
     _archive_task_video,
+    _snapshot_task_recording,
 )
 
 SOURCE_STEM = "episode_0_record_cam_audience_view"
@@ -143,3 +144,30 @@ def test_task_recording_uses_runtime_recorder_path(tmp_path: Path) -> None:
 
 def test_task_recording_is_noop_when_recording_is_disabled() -> None:
     assert _archive_task_recording(_env(), "task2_1") is None
+
+
+def test_task_recording_rejects_unchanged_preexisting_source(tmp_path: Path) -> None:
+    recorder = record_camera_data(tmp_path)
+    _write_source(tmp_path, ".mp4", b"stale")
+    env = _env(recorder)
+    previous = _snapshot_task_recording(env)
+
+    with pytest.raises(RuntimeError, match="not produced by the current run"):
+        _archive_task_recording(env, "task2_1", previous_sources=previous)
+
+
+def test_task_recording_accepts_source_changed_after_snapshot(tmp_path: Path) -> None:
+    recorder = record_camera_data(tmp_path)
+    source = _write_source(tmp_path, ".mp4", b"stale")
+    env = _env(recorder)
+    previous = _snapshot_task_recording(env)
+    source.write_bytes(b"current-run")
+
+    destination = _archive_task_recording(
+        env,
+        "task2_1",
+        previous_sources=previous,
+    )
+
+    assert destination is not None
+    assert destination.read_bytes() == b"current-run"

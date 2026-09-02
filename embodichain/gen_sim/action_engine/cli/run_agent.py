@@ -44,7 +44,10 @@ from embodichain.gen_sim.action_engine.runtime import (
     load_agent_execution_program,
     write_execution_report,
 )
-from embodichain.gen_sim.video_archive import _archive_task_recording
+from embodichain.gen_sim.video_archive import (
+    _archive_task_recording,
+    _snapshot_task_recording,
+)
 from embodichain.lab.gym.utils.gym_utils import (
     add_env_launcher_args_to_parser,
     build_env_cfg_from_args,
@@ -238,6 +241,7 @@ def cli() -> int | None:
     episode_seed = None
     seed_graph = getattr(execution_program, "seed_graph", None)
     env = None
+    previous_video_sources = None
     try:
         env = gymnasium.make(
             id=gym_config["id"],
@@ -247,6 +251,7 @@ def cli() -> int | None:
             task_name=args.task_name,
             runtime_backend=args.runtime_backend,
         )
+        previous_video_sources = _snapshot_task_recording(env)
         for episode_index in range(episodes):
             episode_seed = None if args.seed is None else int(args.seed) + episode_index
             env.reset(seed=episode_seed)
@@ -303,7 +308,11 @@ def cli() -> int | None:
         # the final episode as well; otherwise only episodes followed by a next
         # iteration reach the configured dataset recorder.
         env.reset(options={"final": True})
-        archived_video = _archive_task_recording(env, str(args.task_name))
+        archived_video = _archive_task_recording(
+            env,
+            str(args.task_name),
+            previous_sources=previous_video_sources,
+        )
         if archived_video is not None:
             log_info(f"Archived task video: {archived_video}", color="green")
     except KeyboardInterrupt:

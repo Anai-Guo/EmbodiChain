@@ -19,20 +19,28 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from pathlib import Path
 import shutil
 import sys
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 __all__: list[str] = []
 
 
-def _archive_task_recording(env: Any, task_id: str) -> Path | None:
+def _archive_task_recording(
+    env: Any,
+    task_id: str,
+    *,
+    previous_sources: Mapping[str, str] | None = None,
+) -> Path | None:
     """Archive the generated audience video from a completed GenSim task.
 
     Args:
         env: Completed GenSim environment whose final reset flushed recording.
         task_id: ID of the task that produced the recording.
+        previous_sources: Optional content fingerprints captured before the run.
+            An unchanged source is rejected instead of being archived as new.
 
     Returns:
         Archived video path, or ``None`` when video recording is disabled.
@@ -42,6 +50,32 @@ def _archive_task_recording(env: Any, task_id: str) -> Path | None:
         ValueError: If the task ID can escape the video directory.
         FileNotFoundError: If the expected source recording does not exist.
     """
+    resolved = _task_recording_source(env)
+    if resolved is None:
+        return None
+    directory, source_stem = resolved
+    return _archive_task_video(
+        directory,
+        source_stem=source_stem,
+        task_id=task_id,
+        previous_sources=previous_sources,
+    )
+
+
+def _snapshot_task_recording(env: Any) -> dict[str, str] | None:
+    """Fingerprint any matching source video present before one task run."""
+    resolved = _task_recording_source(env)
+    if resolved is None:
+        return None
+    directory, source_stem = resolved
+    return {
+        path.as_posix(): _file_sha256(path)
+        for path in _video_candidates(directory, source_stem)
+    }
+
+
+def _task_recording_source(env: Any) -> tuple[Path, str] | None:
+    """Resolve the configured audience recording directory and source stem."""
     manager = getattr(env.unwrapped, "event_manager", None)
     mode_cfgs = getattr(manager, "_mode_functor_cfgs", {})
     recorders: list[Any] = []
@@ -77,11 +111,7 @@ def _archive_task_recording(env: Any, task_id: str) -> Path | None:
             f"Cannot archive video for task {task_id!r}: camera recorder does not "
             "expose its output path and name."
         )
-    return _archive_task_video(
-        save_path,
-        source_stem=f"episode_0_{recorder_name}",
-        task_id=task_id,
-    )
+    return Path(save_path).expanduser().resolve(), f"episode_0_{recorder_name}"
 
 
 def _archive_task_video(
@@ -89,6 +119,7 @@ def _archive_task_video(
     *,
     source_stem: str,
     task_id: str,
+    previous_sources: Mapping[str, str] | None = None,
 ) -> Path:
     """Copy a completed recording to ``<task_id>.<original extension>``.
 
@@ -96,6 +127,7 @@ def _archive_task_video(
         video_directory: Directory containing the completed recording.
         source_stem: Source file name without its video extension.
         task_id: ID of the task that produced the recording.
+        previous_sources: Optional source fingerprints captured before the run.
 
     Returns:
         Path to the archived recording.
@@ -107,16 +139,7 @@ def _archive_task_video(
     """
     _validate_task_id(task_id)
     directory = Path(video_directory).expanduser().resolve()
-    source_prefix = f"{source_stem}."
-    candidates = (
-        sorted(
-            path
-            for path in directory.iterdir()
-            if path.is_file() and path.name.startswith(source_prefix)
-        )
-        if directory.is_dir()
-        else []
-    )
+    candidates = _video_candidates(directory, source_stem)
     expected = directory / f"{source_stem}.<extension>"
     if not candidates:
         raise FileNotFoundError(
@@ -131,12 +154,42 @@ def _archive_task_video(
         )
 
     source = candidates[0]
+    if previous_sources is not None and previous_sources.get(
+        source.as_posix()
+    ) == _file_sha256(source):
+        raise RuntimeError(
+            f"Cannot archive video for task {task_id!r}: source {source} was not "
+            "produced by the current run."
+        )
     extension = source.name[len(source_stem) :]
     destination = directory / f"{task_id}{extension}"
     if destination.exists() or destination.is_symlink():
         destination.unlink()
     shutil.copy2(source, destination)
     return destination
+
+
+def _video_candidates(directory: Path, source_stem: str) -> list[Path]:
+    """Return matching completed source videos in deterministic order."""
+    source_prefix = f"{source_stem}."
+    return (
+        sorted(
+            path
+            for path in directory.iterdir()
+            if path.is_file() and path.name.startswith(source_prefix)
+        )
+        if directory.is_dir()
+        else []
+    )
+
+
+def _file_sha256(path: Path) -> str:
+    """Return a content fingerprint for one completed video artifact."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _validate_task_id(task_id: str) -> None:

@@ -193,9 +193,10 @@ def test_cli_archives_task_video_after_final_reset_and_before_close(
     )
     monkeypatch.setattr(run_agent_module.gymnasium, "make", lambda **_kwargs: env)
 
-    def archive(completed_env, task_id):
+    def archive(completed_env, task_id, *, previous_sources=None):
         assert completed_env is env
         assert env.final_reset is True
+        assert previous_sources is None
         events.append(f"archive:{task_id}")
 
     monkeypatch.setattr(run_agent_module, "_archive_task_recording", archive)

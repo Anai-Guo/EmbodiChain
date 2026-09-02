@@ -53,6 +53,7 @@ from embodichain.gen_sim.action_engine.generation.config_builder import (
 from embodichain.gen_sim.action_engine.gripper_profiles import get_gripper_profile
 from embodichain.gen_sim.action_engine.generation.generator import (
     _add_ab_camera_requirements,
+    _articulation_interaction_links,
     _scene_requirements_from_bindings,
     _task_spec_role_bindings,
     generate_action_engine_config,
@@ -455,10 +456,15 @@ def test_prepare_scene_infers_generated_knob_settings_in_radians(
     stage = Usd.Stage.CreateNew(usda_path.as_posix())
     root = UsdGeom.Xform.Define(stage, "/World/rotary_switch")
     stage.SetDefaultPrim(root.GetPrim())
+    knob_link = UsdGeom.Xform.Define(
+        stage,
+        "/World/rotary_switch/rigid_bodies/knob",
+    )
     joint = UsdPhysics.RevoluteJoint.Define(
         stage,
         "/World/rotary_switch/knob_rotation",
     )
+    joint.CreateBody1Rel().SetTargets([knob_link.GetPath()])
     joint.CreateLowerLimitAttr(-150.0)
     joint.CreateUpperLimitAttr(150.0)
     stage.GetRootLayer().Save()
@@ -492,6 +498,93 @@ def test_prepare_scene_infers_generated_knob_settings_in_radians(
     assert knob["attributes"]["joint_settings"]["knob_rotation"] == pytest.approx(
         [-2.6179939, 0.0, 2.6179939]
     )
+    assert knob["attributes"]["interaction_links"] == {
+        "twist": {"joint_name": "knob_rotation", "link_name": "knob"}
+    }
+
+
+def test_prepare_scene_infers_generated_articulation_interaction_links(
+    gym_export: Path,
+) -> None:
+    """Generated interaction targets retain their joint, link, and grasp mesh."""
+    from pxr import Usd, UsdGeom, UsdPhysics
+
+    usda_path = gym_export / "multi_interaction.usda"
+    stage = Usd.Stage.CreateNew(usda_path.as_posix())
+    root = UsdGeom.Xform.Define(stage, "/World/multi_interaction")
+    stage.SetDefaultPrim(root.GetPrim())
+    expected = {
+        "slide": {
+            "joint_name": "drawer_slide",
+            "link_name": "drawer",
+            "mesh_name": "handle_grip",
+        },
+        "open_door": {
+            "joint_name": "door_hinge",
+            "link_name": "door",
+            "mesh_name": "vertical_pull",
+        },
+        "press": {"joint_name": "button_slide", "link_name": "button"},
+        "twist": {"joint_name": "knob_rotation", "link_name": "knob"},
+    }
+    for interaction, target in expected.items():
+        link = UsdGeom.Xform.Define(
+            stage,
+            f"/World/multi_interaction/rigid_bodies/{target['link_name']}",
+        )
+        if interaction in {"slide", "press"}:
+            joint_cls = UsdPhysics.PrismaticJoint
+        else:
+            joint_cls = UsdPhysics.RevoluteJoint
+        joint = joint_cls.Define(
+            stage,
+            f"/World/multi_interaction/joints/{target['joint_name']}",
+        )
+        joint.CreateBody1Rel().SetTargets([link.GetPath()])
+        joint.CreateLowerLimitAttr(-1.0)
+        joint.CreateUpperLimitAttr(1.0)
+        mesh_name = target.get("mesh_name")
+        if mesh_name is not None:
+            mesh = UsdGeom.Mesh.Define(
+                stage,
+                f"{link.GetPath()}/shapes/{mesh_name}",
+            )
+            mesh.CreatePointsAttr([(0.0, 0.0, 0.0), (0.1, 0.0, 0.0), (0.0, 0.1, 0.0)])
+            mesh.CreateFaceVertexCountsAttr([3])
+            mesh.CreateFaceVertexIndicesAttr([0, 1, 2])
+    stage.GetRootLayer().Save()
+
+    source_path = gym_export / "gym_config.json"
+    source = json.loads(source_path.read_text(encoding="utf-8"))
+    source["articulation"] = [
+        {
+            "uid": "multi_001",
+            "name": "multi interaction panel",
+            "fpath": usda_path.name,
+            "init_pos": [0.0, 0.0, 0.7],
+            "init_rot": [0.0, 0.0, 0.0],
+            "body_scale": [1.0, 1.0, 1.0],
+            "fix_base": True,
+        }
+    ]
+    source_path.write_text(json.dumps(source), encoding="utf-8")
+
+    scene = prepare_scene(gym_export)
+    articulation = next(
+        item for item in scene.planner_objects if item["role"] == "articulation"
+    )
+
+    assert articulation["attributes"]["interaction_links"] == expected
+    assert articulation["affordances"] == [
+        "articulated",
+        "openable",
+        "pressable",
+        "slideable",
+        "turnable",
+    ]
+    assert _articulation_interaction_links(scene.planner_objects) == {
+        "multi_001": expected
+    }
 
 
 def test_fast_gym_config_rejects_usdc_with_pk_chain(gym_export: Path) -> None:
@@ -831,6 +924,54 @@ def test_agent_config_owns_articulation_setting_calibration(
 
     assert agent["articulation_settings"] == {
         "microwave": {"timer_joint": [-1.0, 0.0, 1.0]}
+    }
+
+
+def test_agent_config_owns_articulation_interaction_links(
+    gym_export: Path,
+) -> None:
+    links = {
+        "panel": {
+            "slide": {
+                "joint_name": "drawer_slide",
+                "link_name": "drawer",
+                "mesh_name": "handle_grip",
+            },
+            "open_door": {
+                "joint_name": "door_hinge",
+                "link_name": "door",
+                "mesh_name": "vertical_pull",
+            },
+            "press": {"joint_name": "button_press", "link_name": "button"},
+            "twist": {"joint_name": "knob_rotation", "link_name": "knob"},
+        }
+    }
+
+    agent = build_agent_config(
+        task_name="articulation_links",
+        robot_profile="franka",
+        execution_program_hash="f" * 64,
+        source_config_path=prepare_scene(gym_export).source_config_path,
+        uid_map={"panel": "panel"},
+        articulation_interaction_links=links,
+    )
+    links["panel"]["press"]["link_name"] = "wrong"
+
+    assert agent["articulation_interaction_links"] == {
+        "panel": {
+            "open_door": {
+                "joint_name": "door_hinge",
+                "link_name": "door",
+                "mesh_name": "vertical_pull",
+            },
+            "press": {"joint_name": "button_press", "link_name": "button"},
+            "slide": {
+                "joint_name": "drawer_slide",
+                "link_name": "drawer",
+                "mesh_name": "handle_grip",
+            },
+            "twist": {"joint_name": "knob_rotation", "link_name": "knob"},
+        }
     }
 
 

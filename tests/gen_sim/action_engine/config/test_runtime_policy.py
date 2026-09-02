@@ -177,6 +177,26 @@ def test_axis_align_defaults_preserve_action_engine_clearance_policy() -> None:
     }
 
 
+def test_e6_e7_defaults_match_atomic_action_tutorial_contracts() -> None:
+    motion = default_runtime_policy("dual_franka").motion_defaults
+
+    assert motion["Slide"] == {
+        "sample_interval": 140,
+        "hand_interp_steps": 12,
+        "approach_distance": pytest.approx(0.10),
+        "articulation_grasp_settle_steps": 80,
+        "postcondition_tolerance": pytest.approx(0.005),
+    }
+    assert motion["OpenDoor"] == {
+        "sample_interval": 300,
+        "hand_interp_steps": 30,
+        "door_waypoint_count": 50,
+        "approach_distance": pytest.approx(0.10),
+        "retract_distance": pytest.approx(0.10),
+        "postcondition_tolerance": pytest.approx(0.03),
+    }
+
+
 def test_place_defaults_fit_the_mainline_motion_sample_budget() -> None:
     place = default_runtime_policy("dual_ur10").motion_defaults["Place"]
     sample_count = int(place["sample_interval"])

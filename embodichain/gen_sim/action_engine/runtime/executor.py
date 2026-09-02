@@ -1016,6 +1016,15 @@ class ProgramExecutor:
 
     def _object_not_fallen(self, step: SemanticStep) -> torch.Tensor | None:
         """Return the live posture predicate when the object supports it."""
+        list_articulations = getattr(
+            self.env.sim,
+            "get_articulation_uid_list",
+            None,
+        )
+        if callable(list_articulations) and step.object_uid in {
+            str(uid) for uid in list_articulations()
+        }:
+            return None
         try:
             return evaluate_predicate(
                 self.env,
@@ -3046,6 +3055,11 @@ class ProgramExecutor:
                 executed=torch.zeros_like(failed),
             )
         trajectory, action_success = self.adapter.combine(outcomes, masks)
+        trajectory = self._with_articulation_grasp_settle(
+            trajectory,
+            outcomes=outcomes,
+            action_class=action_class,
+        )
         active = assigned & action_success & ~failed & ~planning_failed
         observation_points: dict[int, list[str]] = {}
         execution_observations: dict[str, dict[str, torch.Tensor]] = {}
@@ -3056,6 +3070,10 @@ class ProgramExecutor:
             observed_segments = set(
                 diagnostics.get("execution_observation_segments", ())
             )
+            if action_class == "Slide":
+                observed_segments.update({"close", "pull", "push"})
+            elif action_class == "OpenDoor":
+                observed_segments.update({"close", "open"})
             for name, segment in outcome.planner_trace.get(
                 "action_segments", {}
             ).items():
@@ -3067,7 +3085,8 @@ class ProgramExecutor:
         def observe_waypoint(waypoint_index: int) -> None:
             for name in observation_points.get(waypoint_index, ()):
                 execution_observations[name] = self._action_execution_observation(
-                    step.object_uid
+                    step.object_uid,
+                    grounded=grounded_items[0],
                 )
 
         actions = (
@@ -3160,8 +3179,65 @@ class ProgramExecutor:
     def _action_execution_observation(
         self,
         object_uid: str,
+        *,
+        grounded: GroundedAction,
     ) -> dict[str, torch.Tensor]:
         """Capture live object and TCP state at one requested segment boundary."""
+        articulation = getattr(
+            self.env.sim,
+            "get_articulation",
+            lambda _uid: None,
+        )(object_uid)
+        if articulation is not None:
+            policy = grounded.motion_policy
+            joint_name = policy.get("articulation_joint_name")
+            link_name = policy.get("articulation_target_link_name")
+            if (
+                not isinstance(joint_name, str)
+                or joint_name not in articulation.joint_names
+            ):
+                raise ValueError(
+                    f"Unknown action observation joint for articulation {object_uid!r}."
+                )
+            if (
+                not isinstance(link_name, str)
+                or link_name not in articulation.link_names
+            ):
+                raise ValueError(
+                    f"Unknown action observation link for articulation {object_uid!r}."
+                )
+            backend_entities = getattr(
+                articulation,
+                "_entities",
+                getattr(articulation, "entities", ()),
+            )
+            if not backend_entities:
+                raise ValueError("Articulation observation requires backend metadata.")
+            joint_id = articulation.joint_names.index(joint_name)
+            joint_info = backend_entities[0].get_joint_info(joint_name)
+            return {
+                "object_pose": torch.as_tensor(
+                    articulation.get_local_pose(to_matrix=True),
+                    dtype=torch.float32,
+                    device=self.env.device,
+                )
+                .detach()
+                .clone(),
+                "target_link_pose": torch.as_tensor(
+                    articulation.get_link_pose(link_name, to_matrix=True),
+                    dtype=torch.float32,
+                    device=self.env.device,
+                )
+                .detach()
+                .clone(),
+                "articulation_qpos": _effective_joint_position(
+                    articulation,
+                    joint_id,
+                    joint_info,
+                )
+                .detach()
+                .clone(),
+            }
         entity = self.env.sim.get_rigid_object(object_uid)
         if entity is None:
             raise ValueError(f"Unknown action observation object {object_uid!r}.")
@@ -3250,6 +3326,63 @@ class ProgramExecutor:
                 .clone()
             )
         return observation
+
+    def _with_articulation_grasp_settle(
+        self,
+        trajectory: torch.Tensor,
+        *,
+        outcomes: Mapping[str, ActionOutcome | None],
+        action_class: str,
+    ) -> torch.Tensor:
+        """Hold the planned close pose so physical arm and hand drives converge."""
+        if action_class != "Slide":
+            return trajectory
+        present = [outcome for outcome in outcomes.values() if outcome is not None]
+        if not present:
+            return trajectory
+        segments = present[0].planner_trace.get("action_segments", {})
+        close = segments.get("close") if isinstance(segments, Mapping) else None
+        if not isinstance(close, Mapping):
+            return trajectory
+        close_stop = int(close.get("stop", 0))
+        settle_steps = max(
+            int(
+                outcome.grounded.motion_policy.get(
+                    "articulation_grasp_settle_steps",
+                    0,
+                )
+            )
+            for outcome in present
+        )
+        if settle_steps <= 0 or not 0 < close_stop <= trajectory.shape[1]:
+            return trajectory
+        hold = trajectory[:, close_stop - 1 : close_stop].repeat(
+            1,
+            settle_steps,
+            1,
+        )
+        extended = torch.cat(
+            (trajectory[:, :close_stop], hold, trajectory[:, close_stop:]),
+            dim=1,
+        )
+        for outcome in present:
+            raw_segments = outcome.planner_trace.get("action_segments", {})
+            shifted: dict[str, dict[str, int]] = {}
+            for name, segment in raw_segments.items():
+                start = int(segment["start"])
+                stop = int(segment["stop"])
+                if start >= close_stop:
+                    start += settle_steps
+                    stop += settle_steps
+                shifted[str(name)] = {"start": start, "stop": stop}
+                if str(name) == "close":
+                    shifted["grasp_settle"] = {
+                        "start": close_stop,
+                        "stop": close_stop + settle_steps,
+                    }
+            outcome.planner_trace["action_segments"] = shifted
+            outcome.planner_trace["articulation_grasp_settle_steps"] = settle_steps
+        return extended
 
     def _plan_live_hold(
         self,
@@ -4512,16 +4645,35 @@ class ProgramExecutor:
                     getattr(articulation, "entities", ()),
                 )
                 joint_info = backend_entities[0].get_joint_info(joint_name)
+                observed_qpos = _effective_joint_position(
+                    articulation,
+                    joint_id,
+                    joint_info,
+                )
+                initial_qpos = policy.get("articulation_initial_qpos")
+                target_qpos = policy.get("articulation_target_qpos")
                 articulation_state = {
                     "joint_name": joint_name,
-                    "initial_qpos": policy.get("articulation_initial_qpos"),
-                    "target_qpos": policy.get("articulation_target_qpos"),
-                    "observed_qpos": _effective_joint_position(
-                        articulation,
-                        joint_id,
-                        joint_info,
-                    ),
+                    "target_link_name": policy.get("articulation_target_link_name"),
+                    "target_mesh_name": policy.get("articulation_target_mesh_name"),
+                    "initial_qpos": initial_qpos,
+                    "target_qpos": target_qpos,
+                    "observed_qpos": observed_qpos,
                 }
+                if initial_qpos is not None:
+                    initial = torch.as_tensor(initial_qpos).to(observed_qpos)
+                    articulation_state["delta_qpos"] = observed_qpos - initial
+                if target_qpos is not None:
+                    target = torch.as_tensor(target_qpos).to(observed_qpos)
+                    articulation_state["target_error"] = torch.abs(
+                        observed_qpos - target
+                    )
+                    if initial_qpos is not None:
+                        requested_delta = target - initial
+                        observed_delta = observed_qpos - initial
+                        articulation_state["direction_ok"] = (
+                            observed_delta * requested_delta >= 0.0
+                        )
         result = []
         for env_id, assignment in enumerate(assignments):
             same_side_arm = self._preferred_live_pickup_arm(step, env_id)
@@ -4648,6 +4800,8 @@ class ProgramExecutor:
                 predicate["joint_name"] = policy["articulation_joint_name"]
             if "articulation_target_qpos" in policy:
                 predicate["target_qpos"] = policy["articulation_target_qpos"]
+            if "postcondition_tolerance" in policy:
+                predicate["tolerance"] = float(policy["postcondition_tolerance"])
             satisfied = evaluate_predicate(self.env, predicate)
         elif relation == "inside" and isinstance(reference, str):
             satisfied = evaluate_predicate(
