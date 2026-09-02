@@ -208,7 +208,8 @@ runtime:
         preserve_orientation_tolerance: 0.2617993877991494
       Place:
         sample_interval: 120
-        lift_height: 0.14
+        # GenSim transports to the final pose before Place; the next phase owns retreat.
+        lift_height: 0.0
         post_hold_steps: 60
         cartesian_waypoint_count: 2
         hand_interp_steps: 12
@@ -219,7 +220,7 @@ runtime:
         maximum_eef_height: 1.10
         postcondition_tolerance: 0.05
       MoveJoints:
-        sample_interval: 30
+        sample_interval: 120
         postcondition_tolerance: 0.05
       Press:
         sample_interval: 80

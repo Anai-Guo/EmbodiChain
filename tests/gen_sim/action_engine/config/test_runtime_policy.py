@@ -150,9 +150,10 @@ def test_e1_motion_defaults_match_atomic_action_tutorial_cadence() -> None:
         "hand_interp_steps": 12,
     }
     assert motion["MoveHeldObject"]["sample_interval"] == 120
+    assert motion["MoveJoints"]["sample_interval"] == 120
     assert motion["Place"] == {
         "sample_interval": 120,
-        "lift_height": pytest.approx(0.14),
+        "lift_height": pytest.approx(0.0),
         "post_hold_steps": 60,
         "cartesian_waypoint_count": 2,
         "hand_interp_steps": 12,

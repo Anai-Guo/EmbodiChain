@@ -2272,6 +2272,7 @@ def test_handover_continuation_uses_stable_upright_policies() -> None:
     assert (
         grounded_release.cfg["post_hold_steps"] == release_defaults["post_hold_steps"]
     )
+    assert grounded_release.cfg["lift_height"] == pytest.approx(0.0)
     assert (
         grounded_retreat.cfg["sample_interval"] == retreat_defaults["sample_interval"]
     )
