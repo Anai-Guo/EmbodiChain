@@ -35,6 +35,7 @@ import torch
 from tensordict import TensorDict
 from tqdm import tqdm
 
+from embodichain.utils._exceptions import add_exception_note
 from embodichain.utils.logger import log_info, log_error
 from embodichain.utils import configclass
 
@@ -354,6 +355,7 @@ def _run_sim_worker(
                     result = execute_demo_episode(
                         env,
                         episode_index=rollout_idx,
+                        attempt_id=attempt - 1,
                         should_stop=close_signal.is_set,
                         progress=lambda actions, description: tqdm(
                             actions,
@@ -699,8 +701,8 @@ class OnlineDataEngine:
                     forced_shutdown = self._shutdown_worker()
                 except BaseException as caught_cleanup_error:
                     cleanup_error = caught_cleanup_error
-                    error.add_note(
-                        f"Worker cleanup also failed: {caught_cleanup_error}"
+                    add_exception_note(
+                        error, f"Worker cleanup also failed: {caught_cleanup_error}"
                     )
                 else:
                     self._cleanup_complete = True
@@ -712,9 +714,10 @@ class OnlineDataEngine:
                 # primary, but never lose that late durability error.
                 channel_error = self._receive_worker_error()
                 if channel_error is not None and channel_error is not error:
-                    error.add_note(
+                    add_exception_note(
+                        error,
                         "Worker also failed during cleanup: "
-                        f"{type(channel_error).__name__}: {channel_error}"
+                        f"{type(channel_error).__name__}: {channel_error}",
                     )
 
                 if forced_shutdown:
@@ -722,7 +725,7 @@ class OnlineDataEngine:
                     if channel_error is None:
                         self._record_worker_error(durability_error)
                         channel_error = durability_error
-                    error.add_note(str(durability_error))
+                    add_exception_note(error, str(durability_error))
 
                 if (
                     stop_requested
@@ -916,9 +919,10 @@ class OnlineDataEngine:
 
         Only fully valid windows are candidates, so padding or stale tail
         frames are never returned. ``episode`` mode allows a window to cross
-        segment boundaries, ``segment`` keeps every window inside one segment,
-        and ``boundary`` deliberately samples windows crossing an internal
-        segment boundary.
+        segment boundaries within one causal-continuity region, ``segment``
+        keeps every window inside one accepted segment, and ``boundary``
+        deliberately samples windows crossing a boundary between accepted
+        segments. No mode crosses a discontinuous state-restore boundary.
 
         After sampling the internal :attr:`_sample_count` is incremented by
         *batch_size*; if the count exceeds
@@ -990,6 +994,17 @@ class OnlineDataEngine:
             if segment_ids is None:
                 segment_ids = torch.zeros_like(valid, dtype=torch.int64)
 
+            continuity_ids = self.shared_buffer.get("continuity_id", None)
+            if continuity_ids is None:
+                # Schema-v2 and earlier buffers contain no out-of-band state
+                # restore, so the complete row belongs to continuity region 0.
+                continuity_ids = torch.zeros_like(valid, dtype=torch.int64)
+            continuity_windows = continuity_ids.unfold(1, chunk_size, 1)
+            same_continuity = (continuity_windows == continuity_windows[..., :1]).all(
+                dim=-1
+            ) & (continuity_windows[..., 0] >= 0)
+            valid_windows &= same_continuity
+
             if sampling_mode == "segment":
                 segment_windows = segment_ids.unfold(1, chunk_size, 1)
                 same_segment = (segment_windows == segment_windows[..., :1]).all(
@@ -1002,6 +1017,15 @@ class OnlineDataEngine:
                     segment_windows[..., 1:] != segment_windows[..., :-1]
                 ).any(dim=-1)
                 valid_windows &= crosses_boundary
+
+            if sampling_mode in {"segment", "boundary"}:
+                segment_accepted = self.shared_buffer.get("segment_accepted", None)
+                if segment_accepted is None:
+                    # Older successful-only online buffers predate explicit
+                    # segment qualification and remain fully eligible.
+                    segment_accepted = torch.ones_like(valid, dtype=torch.bool)
+                accepted_windows = segment_accepted.bool().unfold(1, chunk_size, 1)
+                valid_windows &= accepted_windows.all(dim=-1)
 
             candidate_rows = (
                 valid_windows.any(dim=1).nonzero(as_tuple=False).squeeze(-1)
@@ -1226,12 +1250,12 @@ class OnlineDataEngine:
                         self._record_worker_error(durability_error)
                         worker_error = durability_error
                     else:
-                        worker_error.add_note(str(durability_error))
+                        add_exception_note(worker_error, str(durability_error))
                 self._set_state(OnlineDataEngineState.FAILED)
                 self._lifecycle_condition.notify_all()
                 if worker_error is not None:
-                    worker_error.add_note(
-                        f"Worker cleanup also failed: {cleanup_error}"
+                    add_exception_note(
+                        worker_error, f"Worker cleanup also failed: {cleanup_error}"
                     )
                     raise worker_error
                 self._worker_error = cleanup_error
@@ -1247,7 +1271,7 @@ class OnlineDataEngine:
                     self._record_worker_error(durability_error)
                     worker_error = durability_error
                 else:
-                    worker_error.add_note(str(durability_error))
+                    add_exception_note(worker_error, str(durability_error))
 
             self._cleanup_complete = True
             if worker_error is not None:
@@ -1276,9 +1300,10 @@ class OnlineDataEngine:
         except BaseException as cleanup_error:
             if exc_value is None:
                 raise
-            exc_value.add_note(
+            add_exception_note(
+                exc_value,
                 "OnlineDataEngine cleanup also failed: "
-                f"{type(cleanup_error).__name__}: {cleanup_error}"
+                f"{type(cleanup_error).__name__}: {cleanup_error}",
             )
         return None
 
