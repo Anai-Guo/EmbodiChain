@@ -70,6 +70,7 @@ EmbodiChain/
 │   │   │   ├── runtime/          # Sequential/parallel Semantic Call execution
 │   │   │   └── integrations/     # Explicit environment and simulation assembly
 │   │   ├── visualization/        # Browser visualization protocol, runtime, and Viser backend
+│   │   ├── trajectory_generation/ # Fixed-scene host, rollout runner, validation adapters and sinks
 │   │   ├── gym/                  # OpenAI Gym-compatible environments
 │   │   │   ├── envs/             # BaseEnv, EmbodiedEnv, narrow Task Program Gym bridge
 │   │   │   │   ├── managers/     # Observation, event, reward, record, dataset managers
@@ -82,9 +83,11 @@ EmbodiChain/
 │   │   │   ├── objects/          # Robot, RigidObject, Articulation, Light, Gizmo, SoftObject
 │   │   │   ├── sensors/          # Camera, StereoCamera, BaseSensor
 │   │   │   ├── robots/           # Robot-specific configs and params (dexforce_w1, cobotmagic)
-│   │   │   ├── planners/         # Motion planners (TOPPRA, motion generator)
-│   │   │   ├── solvers/          # IK solvers (SRS, OPW, pink, pinocchio, pytorch)
-│   │   │   └── workspace/        # Reachability analysis and runtime workspace queries
+│   │   │   └── motion/           # Robot motion capabilities; subpackages load lazily
+│   │   │       ├── solvers/      # IK/FK solvers (SRS, OPW, pink, pinocchio, pytorch)
+│   │   │       ├── planners/     # Motion planners (TOPPRA, motion generator)
+│   │   │       ├── workspace/    # Reachability analysis and runtime workspace queries
+│   │   │       └── trajectory_augmentation/  # Trajectory candidates, operators, coverage, bookkeeping
 │   │   ├── devices/              # Real-device controllers
 │   │   └── scripts/              # Environment, preview, and analysis entry points
 │   ├── toolkits/                 # Standalone tools
@@ -105,6 +108,15 @@ EmbodiChain/
 ├── setup.py                      # Package setup
 └── VERSION                       # Package version file
 ```
+
+Import motion APIs from `embodichain.lab.sim.motion.{solvers,planners,workspace,trajectory_augmentation}`.
+The `motion` parent resolves subpackages lazily to preserve the
+`Robot → solvers` and `planners → SimulationManager` initialization boundary;
+workspace analyzer and visualization exports also remain lazy. Trajectory
+augmentation algorithms do not directly depend on Gym; execution, reset, and
+dataset persistence belong to host integrations. Importing augmentation follows
+the normal `lab/sim` initialization lifecycle. Low-level Warp kernels remain
+under `utils/warp/kinematics/`.
 
 Official tasks use a task-first layout:
 

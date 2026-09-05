@@ -137,6 +137,16 @@ implementation `_plan(request, context)` hook.
 - `ExecutionRunner` drives that session against observation, command, and clock
   ports without blocking `step()`.
 
+For selected trajectory candidates, `engine.start(...,
+initial_plan_provider=provider)` materializes the first invocation's initial
+`ActionPlan` from the newly resolved request and current `PlanningContext`.
+The framework still binds collision options, authorizes command destinations,
+checks plan identities and scene revisions, and installs tracking and phase
+gates. The provider is consumed only during session construction; subsequent
+invocations and recovery use the registered skill planner. Rebuild the plan,
+binding-dependent effects, and session after reset instead of retaining runtime
+state from a previous rollout.
+
 ## PlanningContext invariants
 
 `PlanningContext` carries robot observation, scene snapshot, symbolic
@@ -179,6 +189,11 @@ Held-object guards and phase-effect gates are observational:
 
 Pick gates attachment before lift. Place gates detachment before retract.
 HandOver owns independent source/destination transfer boundaries.
+
+PickUp's ragged grasp sampling uses an explicit candidate mask. Empty rows and
+padding carry a safe current FK pose and cannot win selection; an entirely
+empty batch fails without candidate IK. Failed or non-finite IK outputs retain
+the preceding valid seed before later pickup stages are screened.
 
 ## Row-local state
 
@@ -271,3 +286,18 @@ python docs/scripts/check_api_docs.py
 For public API changes also run the docs checker tests and Sphinx dummy build.
 For simulator adapters add an environment-level test that exercises normal
 `env.step()` consumption and safe cancellation.
+
+## Offline PickUp export for fixed-scene collection
+
+`lab/trajectory_generation/integrations/atomic.py::export_pickup_templates`
+exports a successful MoveEndEffector → PickUp compilation into protected phase
+qpos templates. It retains approach/close/lift boundaries, expands passive
+mimic geometry and appends real hold commands. Only transit permits residuals.
+`cube_pickup_collection.py` uses this source with full-state/contact validation
+and confirmed LeRobot persistence across repeated full-batch restoration.
+
+This is an offline atomic source: the qpos executor owns physical validation;
+no projected `HeldObjectState` is committed as observed evidence. It does not
+consume `initial_plan_provider` or run AtomicActionRuntime tracking/recovery.
+The runtime adapter and contact-aware Gym source/host matrix remain separate
+acceptance work. Keep the existing runtime and task-state contracts intact.

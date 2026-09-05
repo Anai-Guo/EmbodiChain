@@ -19,7 +19,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from functools import cached_property
@@ -64,7 +64,7 @@ from .tracking import (
 
 if TYPE_CHECKING:
     from embodichain.lab.sim.objects import Robot
-    from embodichain.lab.sim.planners import MotionGenerator
+    from embodichain.lab.sim.motion.planners import MotionGenerator
 
     from .runtime import ActionPlanningServices
     from .state import PlanningContext
@@ -406,11 +406,22 @@ class AtomicAction(Generic[GoalT, OptionsT], ABC):
         Returns:
             Scene-bound action plan with expected, uncommitted effects.
         """
+        return self._plan_with_provider(request, context, self._plan)
+
+    def _plan_with_provider(
+        self,
+        request: ResolvedActionRequest[GoalT, OptionsT],
+        context: PlanningContext,
+        plan_provider: Callable[
+            [ResolvedActionRequest[GoalT, OptionsT], PlanningContext], ActionPlan
+        ],
+    ) -> ActionPlan:
+        """Apply framework validation to an ordinary or supplied initial plan."""
         self.require_goal(request)
         prepared = self._prepare_request(request, context)
-        plan = self._plan(prepared, context)
+        plan = plan_provider(prepared, context)
         if not isinstance(plan, ActionPlan):
-            raise TypeError("AtomicAction._plan() must return an ActionPlan.")
+            raise TypeError("Atomic action plan provider must return an ActionPlan.")
         return replace(
             plan,
             commands=self._authorize_command_targets(prepared, plan.commands),
