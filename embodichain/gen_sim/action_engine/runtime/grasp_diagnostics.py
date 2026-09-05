@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -42,6 +43,8 @@ _UPRIGHT_SIDE_GRASP_HEIGHT_COST_WEIGHT = 2.0
 _UPRIGHT_SIDE_GRASP_CANDIDATE_LIMIT = 50
 _INTERACTION_MIN_TRANSLATION_SEPARATION = 0.01
 _INTERACTION_MIN_ROTATION_SEPARATION = float(torch.pi / 12.0)
+_INTERACTION_APERTURE_COST_WEIGHT = 2.0
+_INTERACTION_ANCHOR_ROLL_COUNT = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,13 +68,33 @@ class _DualGraspSelectionContext:
 class _InteractionGraspSelectionContext:
     reference_xpos: torch.Tensor
     candidate_rank: int
+    roll_degrees: tuple[float, ...]
+    support_surface_z: torch.Tensor | None
+    minimum_support_clearance: float
 
 
 class _TracingAntipodalGraspPoseGenerator(AntipodalGraspPoseGenerator):
     """Retain compact S1-S5 evidence from the concrete GenSim grasp backend."""
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        interaction_depth_offset: float = 0.0,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
+        if (
+            isinstance(interaction_depth_offset, bool)
+            or not isinstance(interaction_depth_offset, (int, float))
+            or not 0.0
+            <= float(interaction_depth_offset)
+            <= 0.5 * self.gripper_model.finger_length
+        ):
+            raise ValueError(
+                "interaction_depth_offset must be non-negative and no greater "
+                "than half the gripper finger length."
+            )
+        self._interaction_depth_offset = float(interaction_depth_offset)
         self._last_dual_trace: dict[str, Any] | None = None
         self._last_upright_trace: dict[str, Any] | None = None
         self._last_interaction_trace: dict[str, Any] | None = None
@@ -124,6 +147,9 @@ class _TracingAntipodalGraspPoseGenerator(AntipodalGraspPoseGenerator):
         *,
         reference_xpos: torch.Tensor,
         candidate_rank: int,
+        roll_degrees: Any = (0.0,),
+        support_surface_z: Any = None,
+        minimum_support_clearance: float = 0.0,
     ) -> Iterator[None]:
         """Select one kinematically distinct single-arm grasp candidate."""
         if self._interaction_selection_context is not None:
@@ -136,9 +162,43 @@ class _TracingAntipodalGraspPoseGenerator(AntipodalGraspPoseGenerator):
         if reference.ndim != 3 or reference.shape[1:] != (4, 4):
             raise ValueError("Interaction reference_xpos must have shape (B, 4, 4).")
         self._last_interaction_trace = None
+        if not isinstance(roll_degrees, (tuple, list)) or not roll_degrees:
+            raise ValueError("Interaction roll_degrees must be a non-empty sequence.")
+        normalized_roll: list[float] = []
+        for value in roll_degrees:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError("Interaction roll values must be real numbers.")
+            angle = float(value)
+            if not torch.isfinite(torch.tensor(angle)) or abs(angle) > 85.0:
+                raise ValueError(
+                    "Interaction roll values must be finite and within [-85, 85]."
+                )
+            normalized_roll.append(angle)
+        support = None
+        if support_surface_z is not None:
+            support = torch.as_tensor(
+                support_surface_z,
+                dtype=torch.float32,
+            ).reshape(-1)
+            if support.numel() not in {1, reference.shape[0]} or not bool(
+                torch.isfinite(support).all().item()
+            ):
+                raise ValueError(
+                    "Interaction support_surface_z must contain one finite value "
+                    "or one value per environment."
+                )
+        if (
+            isinstance(minimum_support_clearance, bool)
+            or not isinstance(minimum_support_clearance, (int, float))
+            or not torch.isfinite(torch.tensor(float(minimum_support_clearance)))
+        ):
+            raise ValueError("Interaction minimum_support_clearance must be finite.")
         self._interaction_selection_context = _InteractionGraspSelectionContext(
             reference_xpos=reference.clone(),
             candidate_rank=candidate_rank,
+            roll_degrees=tuple(normalized_roll),
+            support_surface_z=None if support is None else support.clone(),
+            minimum_support_clearance=float(minimum_support_clearance),
         )
         try:
             yield
@@ -166,37 +226,186 @@ class _TracingAntipodalGraspPoseGenerator(AntipodalGraspPoseGenerator):
                 min(row_index, context.reference_xpos.shape[0] - 1)
             ].to(device=poses.device, dtype=poses.dtype)
             canonical = _canonicalize_parallel_jaw_poses(poses, reference)
-            scores = costs + canonical.selected_rotation_radians.to(costs) / torch.pi
+            opening_widths = self._interaction_opening_widths(
+                canonical.poses,
+                kwargs,
+                row_index=row_index,
+            )
+            scores = (
+                costs
+                + canonical.selected_rotation_radians.to(costs) / torch.pi
+                + opening_widths.to(costs)
+                / float(self.gripper_model.max_opening_width)
+                * _INTERACTION_APERTURE_COST_WEIGHT
+            )
             raw_ranked = torch.argsort(scores)
             raw_ranked = raw_ranked[torch.isfinite(scores[raw_ranked])]
             ranked = self._diverse_interaction_ranking(canonical.poses, raw_ranked)
-            if context.candidate_rank >= ranked.numel() or not bool(
-                torch.isfinite(scores[ranked[context.candidate_rank]])
-            ):
+            support_z = (
+                None
+                if context.support_surface_z is None
+                else float(
+                    context.support_surface_z[
+                        min(row_index, context.support_surface_z.numel() - 1)
+                    ]
+                )
+            )
+            support_rejection_count = 0
+            expanded_by_base: list[
+                list[
+                    tuple[
+                        int,
+                        int,
+                        float,
+                        float,
+                        torch.Tensor,
+                        float | None,
+                        float,
+                    ]
+                ]
+            ] = []
+            for base_rank, raw_index in enumerate(ranked.tolist()):
+                index = int(raw_index)
+                variants: list[
+                    tuple[
+                        int,
+                        int,
+                        float,
+                        float,
+                        torch.Tensor,
+                        float | None,
+                        float,
+                    ]
+                ] = []
+                for roll_degrees in context.roll_degrees:
+                    angle = torch.deg2rad(poses.new_tensor(roll_degrees))
+                    roll = torch.eye(4, dtype=poses.dtype, device=poses.device)
+                    roll[1, 1] = torch.cos(angle)
+                    roll[1, 2] = -torch.sin(angle)
+                    roll[2, 1] = torch.sin(angle)
+                    roll[2, 2] = torch.cos(angle)
+                    base_candidate = torch.matmul(canonical.poses[index], roll).clone()
+                    depth_offsets = (
+                        (0.0, self._interaction_depth_offset)
+                        if self._interaction_depth_offset > 0.0
+                        else (0.0,)
+                    )
+                    for depth_offset in depth_offsets:
+                        candidate = base_candidate.clone()
+                        candidate[:3, 3] -= candidate[:3, 2] * depth_offset
+                        relative = torch.matmul(
+                            reference[:3, :3].transpose(0, 1),
+                            candidate[:3, :3],
+                        )
+                        rotation_distance = float(
+                            torch.acos(
+                                torch.clamp(
+                                    (torch.trace(relative) - 1.0) * 0.5,
+                                    -1.0,
+                                    1.0,
+                                )
+                            )
+                        )
+                        support_clearance = (
+                            None
+                            if support_z is None
+                            else self._interaction_support_clearance(
+                                candidate,
+                                opening_width=float(opening_widths[index]),
+                                support_surface_z=support_z,
+                            )
+                        )
+                        if (
+                            support_clearance is not None
+                            and support_clearance < context.minimum_support_clearance
+                        ):
+                            support_rejection_count += 1
+                            continue
+                        variants.append(
+                            (
+                                base_rank,
+                                index,
+                                roll_degrees,
+                                depth_offset,
+                                candidate,
+                                support_clearance,
+                                rotation_distance,
+                            )
+                        )
+                preferred_depth = (
+                    self._interaction_depth_offset
+                    if float(opening_widths[index])
+                    >= self.gripper_model.finger_thickness
+                    else 0.0
+                )
+                variants.sort(
+                    key=lambda item: (
+                        item[-1],
+                        abs(item[2]),
+                        abs(item[3] - preferred_depth),
+                    )
+                )
+                if variants:
+                    expanded_by_base.append(variants)
+            expanded: list[
+                tuple[int, int, float, float, torch.Tensor, float | None, float]
+            ] = []
+            if expanded_by_base:
+                anchor = expanded_by_base[0]
+                secondary = expanded_by_base[1:]
+                anchor_count = min(_INTERACTION_ANCHOR_ROLL_COUNT, len(anchor))
+                expanded.extend(anchor[:anchor_count])
+                expanded.extend(variants[0] for variants in secondary if variants)
+                expanded.extend(anchor[anchor_count:])
+                for variants in secondary:
+                    expanded.extend(variants[1:])
+            if context.candidate_rank >= len(expanded):
                 successes.append(False)
                 selected.append(torch.eye(4, dtype=poses.dtype, device=poses.device))
                 trace_rows.append(
                     {
                         "requested_candidate_rank": context.candidate_rank,
-                        "candidate_count": int(ranked.numel()),
+                        "candidate_count": len(expanded),
                         "raw_candidate_count": int(raw_ranked.numel()),
+                        "support_rejection_count": support_rejection_count,
                         "selected": False,
                         "reason": "requested_candidate_rank_unavailable",
                     }
                 )
                 continue
-            index = int(ranked[context.candidate_rank])
+            (
+                base_rank,
+                index,
+                roll_degrees,
+                depth_offset,
+                candidate,
+                support_clearance,
+                rotation_distance,
+            ) = expanded[context.candidate_rank]
             successes.append(True)
-            selected.append(canonical.poses[index])
+            selected.append(candidate)
             trace_rows.append(
                 {
                     "requested_candidate_rank": context.candidate_rank,
-                    "candidate_count": int(ranked.numel()),
+                    "candidate_count": len(expanded),
                     "raw_candidate_count": int(raw_ranked.numel()),
+                    "support_rejection_count": support_rejection_count,
                     "selected": True,
                     "selected_candidate_index": index,
+                    "selected_base_candidate_rank": base_rank,
+                    "selected_roll_degrees": roll_degrees,
                     "selected_score": float(scores[index]),
-                    "selected_pose": canonical.poses[index].detach().cpu().tolist(),
+                    "selected_opening_width": float(opening_widths[index]),
+                    "selected_pose": candidate.detach().cpu().tolist(),
+                    "interaction_depth_offset": depth_offset,
+                    "support_surface_z": support_z,
+                    "support_clearance": support_clearance,
+                    "minimum_support_clearance": (
+                        context.minimum_support_clearance
+                        if support_z is not None
+                        else None
+                    ),
+                    "reference_rotation_distance": rotation_distance,
                 }
             )
         self._last_interaction_trace = {"environment_rows": trace_rows}
@@ -206,6 +415,77 @@ class _TracingAntipodalGraspPoseGenerator(AntipodalGraspPoseGenerator):
             torch.stack(selected),
             torch.zeros(len(selected), dtype=torch.float32, device=device),
         )
+
+    @staticmethod
+    def _interaction_opening_widths(
+        poses: torch.Tensor,
+        call_kwargs: Mapping[str, Any],
+        *,
+        row_index: int,
+    ) -> torch.Tensor:
+        """Estimate full target width along each candidate's closing axis."""
+        vertices = call_kwargs.get("mesh_vertices")
+        object_poses = call_kwargs.get("obj_poses")
+        if vertices is None or object_poses is None:
+            return torch.zeros(poses.shape[0], dtype=poses.dtype, device=poses.device)
+        vertices = torch.as_tensor(vertices, dtype=poses.dtype, device=poses.device)
+        object_poses = torch.as_tensor(
+            object_poses,
+            dtype=poses.dtype,
+            device=poses.device,
+        )
+        if object_poses.ndim == 2:
+            object_poses = object_poses.unsqueeze(0)
+        object_pose = object_poses[min(row_index, object_poses.shape[0] - 1)]
+        world_vertices = (
+            vertices @ object_pose[:3, :3].transpose(0, 1) + object_pose[:3, 3]
+        )
+        projections = torch.matmul(world_vertices, poses[:, :3, 0].transpose(0, 1))
+        return projections.max(dim=0).values - projections.min(dim=0).values
+
+    def _interaction_support_clearance(
+        self,
+        grasp_pose: torch.Tensor,
+        *,
+        opening_width: float,
+        support_surface_z: float,
+    ) -> float:
+        """Estimate gripper-box clearance above the live support surface."""
+
+        def box_minimum_z(
+            center: torch.Tensor,
+            half_extents: tuple[float, float, float],
+        ) -> torch.Tensor:
+            extents = center.new_tensor(half_extents)
+            return center[2] - torch.sum(torch.abs(grasp_pose[2, :3]) * extents)
+
+        model = self.gripper_model
+        root_center = grasp_pose[:3, 3] - grasp_pose[:3, 2] * (
+            0.5 * (model.finger_length + model.palm_depth)
+        )
+        minimum_z = box_minimum_z(
+            root_center,
+            (
+                0.5 * model.max_opening_width,
+                0.5 * model.finger_width,
+                0.5 * model.palm_depth,
+            ),
+        )
+        finger_offset = opening_width + self._collision_cfg.opening_margin
+        finger_half_extents = (
+            0.5 * model.finger_thickness,
+            0.5 * model.finger_width,
+            0.5 * model.finger_length,
+        )
+        for sign in (-1.0, 1.0):
+            finger_center = grasp_pose[:3, 3] + grasp_pose[:3, 0] * (
+                sign * finger_offset
+            )
+            minimum_z = torch.minimum(
+                minimum_z,
+                box_minimum_z(finger_center, finger_half_extents),
+            )
+        return float(minimum_z - support_surface_z)
 
     @staticmethod
     def _diverse_interaction_ranking(

@@ -275,6 +275,142 @@ def test_interaction_context_skips_near_duplicate_ranks(monkeypatch) -> None:
     assert row["candidate_count"] == 2
 
 
+def test_interaction_context_expands_axial_roll_and_depth_candidates(
+    monkeypatch,
+) -> None:
+    generator = _TracingAntipodalGraspPoseGenerator(
+        ParallelJawGripperModelCfg(model_id="interaction_frame_test"),
+        interaction_depth_offset=0.025,
+    )
+    sampled = _pose_with_y(0.04).unsqueeze(0)
+    monkeypatch.setattr(
+        AntipodalGraspPoseGenerator,
+        "get_valid_grasp_poses",
+        lambda _self, **_kwargs: [(sampled, torch.zeros(1))],
+    )
+
+    with generator.interaction_selection_context(
+        reference_xpos=torch.eye(4).unsqueeze(0),
+        candidate_rank=3,
+        roll_degrees=(0.0, -30.0),
+    ):
+        success, selected, _ = generator.get_best_grasp_poses()
+
+    angle = torch.deg2rad(torch.tensor(-30.0))
+    roll = torch.eye(4)
+    roll[1, 1] = torch.cos(angle)
+    roll[1, 2] = -torch.sin(angle)
+    roll[2, 1] = torch.sin(angle)
+    roll[2, 2] = torch.cos(angle)
+    expected = sampled[0] @ roll
+    expected[:3, 3] -= expected[:3, 2] * 0.025
+    assert success.tolist() == [True]
+    torch.testing.assert_close(selected[0], expected)
+    trace = generator.last_interaction_trace
+    assert trace is not None
+    assert trace["environment_rows"][0]["selected_roll_degrees"] == -30.0
+    assert trace["environment_rows"][0]["interaction_depth_offset"] == 0.025
+
+
+def test_interaction_context_prefers_handle_cross_section_over_long_axis(
+    monkeypatch,
+) -> None:
+    generator = _TracingAntipodalGraspPoseGenerator(
+        ParallelJawGripperModelCfg(
+            model_id="interaction_aperture_test",
+            max_opening_width=0.1,
+        )
+    )
+    along_length = torch.eye(4)
+    across_width = torch.tensor(
+        [
+            [0.0, -1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    )
+    poses = torch.stack((along_length, across_width))
+    monkeypatch.setattr(
+        AntipodalGraspPoseGenerator,
+        "get_valid_grasp_poses",
+        lambda _self, **_kwargs: [(poses, torch.zeros(2))],
+    )
+    vertices = torch.tensor(
+        [
+            [x, y, z]
+            for x in (-0.04, 0.04)
+            for y in (-0.005, 0.005)
+            for z in (-0.005, 0.005)
+        ]
+    )
+
+    with generator.interaction_selection_context(
+        reference_xpos=torch.eye(4).unsqueeze(0),
+        candidate_rank=0,
+    ):
+        success, selected, _ = generator.get_best_grasp_poses(
+            mesh_vertices=vertices,
+            mesh_triangles=torch.tensor([[0, 1, 2]]),
+            obj_poses=torch.eye(4).unsqueeze(0),
+            approach_direction=torch.tensor([0.0, 0.0, 1.0]),
+        )
+
+    assert success.tolist() == [True]
+    torch.testing.assert_close(selected[0], across_width)
+    trace = generator.last_interaction_trace
+    assert trace is not None
+    assert abs(trace["environment_rows"][0]["selected_opening_width"] - 0.01) < 1.0e-6
+
+
+def test_interaction_context_rejects_gripper_geometry_below_support(
+    monkeypatch,
+) -> None:
+    generator = _TracingAntipodalGraspPoseGenerator(
+        ParallelJawGripperModelCfg(model_id="interaction_support_test")
+    )
+    unsafe = torch.tensor(
+        [
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0, 0.04],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    )
+    safe = torch.tensor(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, -1.0, 0.0],
+            [0.0, 1.0, 0.0, 0.04],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    )
+    monkeypatch.setattr(
+        AntipodalGraspPoseGenerator,
+        "get_valid_grasp_poses",
+        lambda _self, **_kwargs: [
+            (torch.stack((unsafe, safe)), torch.tensor([0.0, 0.1]))
+        ],
+    )
+
+    with generator.interaction_selection_context(
+        reference_xpos=torch.eye(4).unsqueeze(0),
+        candidate_rank=0,
+        support_surface_z=torch.tensor([0.0]),
+        minimum_support_clearance=0.0,
+    ):
+        success, selected, _ = generator.get_best_grasp_poses()
+
+    assert success.tolist() == [True]
+    torch.testing.assert_close(selected[0], safe)
+    trace = generator.last_interaction_trace
+    assert trace is not None
+    row = trace["environment_rows"][0]
+    assert row["support_rejection_count"] == 1
+    assert row["support_surface_z"] == 0.0
+    assert row["support_clearance"] > 0.0
+
+
 def _pose_with_y(y: float) -> torch.Tensor:
     pose = torch.eye(4)
     pose[1, 3] = y

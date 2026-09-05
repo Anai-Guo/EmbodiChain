@@ -36,8 +36,20 @@ from tests.gen_sim.action_engine.task_fixtures import (
 )
 
 
-def test_e6_e9_recipes_use_staging_interaction_retreat_and_home() -> None:
-    expected = {"E6": "Slide", "E7": "OpenDoor", "E8": "Twist", "E9": "Press"}
+def test_e6_e7_recipes_delegate_the_complete_interaction_to_atomic_action() -> None:
+    expected = {"E6": "Slide", "E7": "OpenDoor"}
+    for task_type, interaction in expected.items():
+        task, _ = make_task_spec(task_type)
+        graph = instantiate_seed_graph(task, {"object_01": "interaction_target"})
+        nodes = graph["nodes"]
+        assert [node["atomic_action"] for node in nodes] == [interaction]
+        assert [node["contract"]["failure_policy"] for node in nodes] == [
+            "task_required"
+        ]
+
+
+def test_e8_e9_recipes_use_staging_interaction_retreat_and_home() -> None:
+    expected = {"E8": "Twist", "E9": "Press"}
     for task_type, interaction in expected.items():
         task, _ = make_task_spec(task_type)
         graph = instantiate_seed_graph(task, {"object_01": "interaction_target"})

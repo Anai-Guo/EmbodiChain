@@ -21,7 +21,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import logging
 import math
 from threading import RLock
@@ -90,6 +90,17 @@ from .models import ActionOutcome, GroundedAction
 from .state import _CollisionOverrideSceneSnapshot, ExecutionState
 
 __all__ = ["AtomicActionAdapter"]
+
+
+@dataclass(slots=True)
+class _WaypointProgressGate:
+    """Repeat an existing segment waypoint until measured progress catches up."""
+
+    start: int
+    stop: int
+    maximum_repeats: int
+    needs_repeat: Callable[[int], torch.Tensor]
+    trace: dict[str, Any]
 
 
 _DEFAULT_PLANNER_POLICY: dict[str, Any] = {
@@ -235,7 +246,9 @@ class AtomicActionAdapter:
         self.capabilities = capability_registry or build_atomic_capability_registry()
         self._motion_generator: MotionGenerator | None = None
         self._atomic_engine: AtomicActionEngine | None = None
-        self._coordinated_engines: dict[tuple[bool, float], AtomicActionEngine] = {}
+        self._coordinated_engines: dict[
+            tuple[bool, float, bool], AtomicActionEngine
+        ] = {}
         self._semantics: dict[str, ObjectSemantics] = {}
         self._scene_time = 0.0
         if scene_provider is not None and not isinstance(scene_provider, SceneProvider):
@@ -658,6 +671,13 @@ class AtomicActionAdapter:
             )
             combined_success |= fallback_plan.plan_success.to(self.device)
 
+        selected_positions = self._with_full_articulation_release(
+            selected_positions,
+            plan=plan,
+            grounded=grounded,
+            capability=capability,
+        )
+
         options = invocation.skill_options
         if capability.config_materializer == "handover":
             combined_success &= self._handover_receiver_hold_mask(
@@ -743,6 +763,7 @@ class AtomicActionAdapter:
                         "stop": int(segment.stop),
                     }
                     for segment in plan.segments
+                    if segment.start < selected_positions.shape[1]
                 },
                 "interaction_grasp_search": deepcopy(interaction_search_attempts),
             },
@@ -1592,6 +1613,19 @@ class AtomicActionAdapter:
                 device=self.device,
             ),
             candidate_rank=int(rank),
+            roll_degrees=candidate.motion_policy.get(
+                "interaction_grasp_roll_degrees",
+                (0.0,),
+            ),
+            support_surface_z=candidate.motion_policy.get(
+                "interaction_support_surface_z"
+            ),
+            minimum_support_clearance=float(
+                candidate.motion_policy.get(
+                    "interaction_grasp_minimum_support_clearance",
+                    -0.01,
+                )
+            ),
         ):
             yield
 
@@ -2796,6 +2830,59 @@ class AtomicActionAdapter:
             dim=1,
         )
 
+    def _with_full_articulation_release(
+        self,
+        positions: torch.Tensor,
+        *,
+        plan: ActionPlan,
+        grounded: GroundedAction,
+        capability: AtomicCapability,
+    ) -> torch.Tensor:
+        """Replace articulation pre-shape release with the fully open hand state."""
+        release_name = {
+            "slide": "open",
+            "open_door": "release",
+        }.get(capability.target_materializer)
+        if release_name is None:
+            return positions
+        release = next(
+            (segment for segment in plan.segments if segment.name == release_name),
+            None,
+        )
+        if (
+            release is None
+            or not 0 <= release.start < release.stop <= positions.shape[1]
+        ):
+            raise ValueError(
+                f"{grounded.action_class} requires a valid {release_name!r} segment."
+            )
+        _, hand_part, hand_dof = self._parts(grounded.arm)
+        if hand_part is None or hand_dof == 0:
+            raise ValueError(f"{grounded.action_class} requires a configured hand.")
+        hand_ids = self.env.robot.get_joint_ids(name=hand_part)
+        full_open = _as_hand_qpos(self.env.open_state, hand_dof, self.device).to(
+            positions
+        )
+        start = positions[:, release.start, hand_ids]
+        weights = torch.linspace(
+            0.0,
+            1.0,
+            steps=release.stop - release.start,
+            dtype=positions.dtype,
+            device=positions.device,
+        )
+        result = positions.clone()
+        result[:, release.start : release.stop, hand_ids] = torch.lerp(
+            start[:, None],
+            full_open[None, None],
+            weights[None, :, None],
+        )
+        if capability.target_materializer == "open_door" and not bool(
+            grounded.motion_policy.get("articulation_retract_after_release", True)
+        ):
+            return result[:, : release.stop]
+        return result
+
     @staticmethod
     def _merge_plan_rows(
         primary: torch.Tensor,
@@ -2848,6 +2935,7 @@ class AtomicActionAdapter:
         *,
         active: torch.Tensor,
         waypoint_observer: Callable[[int], None] | None = None,
+        waypoint_progress_gate: _WaypointProgressGate | None = None,
     ) -> list[torch.Tensor]:
         """Advance the environment while holding inactive vectorized rows."""
         if trajectory.ndim != 3 or trajectory.shape[0] != self.num_envs:
@@ -2858,17 +2946,70 @@ class AtomicActionAdapter:
             dtype=trajectory.dtype,
         )
         commands: list[torch.Tensor] = []
-        for waypoint_index, waypoint in enumerate(trajectory.unbind(dim=1)):
-            command = torch.where(active[:, None], waypoint, current)
+        gate = waypoint_progress_gate
+        if gate is not None:
+            if not 0 <= gate.start < gate.stop <= trajectory.shape[1]:
+                raise ValueError("Waypoint progress gate is outside the trajectory.")
+            if gate.maximum_repeats < 1:
+                raise ValueError("Waypoint progress gate requires positive repeats.")
+            gate.trace["segment"] = {"start": gate.start, "stop": gate.stop}
+            gate.trace["repeated_waypoints"] = []
+
+        def step_command(command: torch.Tensor) -> None:
             self.env.step(command)
             self._scene_time += self._scene_step_duration()
             update = getattr(self.env, "update_obj_info", None)
             if callable(update):
                 update()
+            commands.append(command.detach())
+
+        for waypoint_index, waypoint in enumerate(trajectory.unbind(dim=1)):
+            command = torch.where(active[:, None], waypoint, current)
+            step_command(command)
+            current = command
+            repeats = 0
+            waiting = torch.zeros_like(active)
+            if gate is not None and gate.start <= waypoint_index < gate.stop:
+                waiting = gate.needs_repeat(waypoint_index).to(
+                    device=trajectory.device,
+                    dtype=torch.bool,
+                )
+                if waiting.shape != active.shape:
+                    raise ValueError("Waypoint progress gate returned an invalid mask.")
+                waiting &= active
+                while bool(waiting.any()) and repeats < gate.maximum_repeats:
+                    repeated = torch.where(waiting[:, None], waypoint, current)
+                    step_command(repeated)
+                    current = repeated
+                    repeats += 1
+                    waiting = gate.needs_repeat(waypoint_index).to(
+                        device=trajectory.device,
+                        dtype=torch.bool,
+                    )
+                    if waiting.shape != active.shape:
+                        raise ValueError(
+                            "Waypoint progress gate returned an invalid mask."
+                        )
+                    waiting &= active
+                if repeats or bool(waiting.any()):
+                    gate.trace["repeated_waypoints"].append(
+                        {
+                            "waypoint_index": waypoint_index,
+                            "repeats": repeats,
+                            "timed_out_env_ids": (
+                                torch.nonzero(waiting, as_tuple=False)
+                                .flatten()
+                                .detach()
+                                .cpu()
+                                .tolist()
+                            ),
+                        }
+                    )
             if waypoint_observer is not None:
                 waypoint_observer(waypoint_index)
-            commands.append(command.detach())
-            current = command
+        if gate is not None:
+            gate.trace["execution_steps"] = len(commands)
+            gate.trace["direct_qpos_write"] = False
         sync = getattr(self.env, "sync_agent_state_from_qpos", None)
         if callable(sync) and commands:
             sync(commands[-1])
@@ -2981,15 +3122,24 @@ class AtomicActionAdapter:
                 "than the selected gripper's maximum opening width."
             )
         profile_margin = self.gripper_profile.grasp_model.opening_margin
-        if filter_ground_collision and opening_margin == profile_margin:
+        if (
+            not is_articulation_interaction
+            and filter_ground_collision
+            and opening_margin == profile_margin
+        ):
             return self._engine()
-        cache_key = (filter_ground_collision, opening_margin)
+        cache_key = (
+            filter_ground_collision,
+            opening_margin,
+            is_articulation_interaction,
+        )
         cached = self._coordinated_engines.get(cache_key)
         if cached is None:
             cached = self._new_engine(
                 MotionGenerator(cfg=self._motion_generator_cfg()),
                 filter_ground_collision=filter_ground_collision,
                 opening_margin=opening_margin,
+                articulation_interaction=is_articulation_interaction,
             )
             self._coordinated_engines[cache_key] = cached
         return cached
@@ -3000,14 +3150,21 @@ class AtomicActionAdapter:
         *,
         filter_ground_collision: bool,
         opening_margin: float | None = None,
+        articulation_interaction: bool = False,
     ) -> AtomicActionEngine:
         from embodichain.gen_sim.action_engine.capabilities import HeldObjectHandOver
 
-        from .atomic_compat import ActionEngineMoveJoints, ExactTargetMoveHeldObject
+        from .atomic_compat import (
+            _ActionEngineOpenDoor,
+            ActionEngineMoveJoints,
+            ExactTargetMoveHeldObject,
+        )
 
         engine = AtomicActionEngine(
             motion_generator,
-            control_profiles=self._control_profiles(),
+            control_profiles=self._control_profiles(
+                articulation_interaction=articulation_interaction
+            ),
             grasp_pose_generators=self._grasp_pose_generators(
                 filter_ground_collision=filter_ground_collision,
                 opening_margin=opening_margin,
@@ -3015,6 +3172,7 @@ class AtomicActionAdapter:
         )
         engine.register(ExactTargetMoveHeldObject(), replace=True)
         engine.register(ActionEngineMoveJoints(), replace=True)
+        engine.register(_ActionEngineOpenDoor(), replace=True)
         engine.register(HeldObjectHandOver(), replace=True)
         return engine
 
@@ -3075,8 +3233,13 @@ class AtomicActionAdapter:
             raise ValueError(f"Unsupported Action Engine planner backend {backend!r}.")
         return MotionGenCfg(planner_cfg=planner_cfg)
 
-    def _control_profiles(self) -> dict[str, ControlPartCommandProfile]:
+    def _control_profiles(
+        self,
+        *,
+        articulation_interaction: bool = False,
+    ) -> dict[str, ControlPartCommandProfile]:
         profiles: dict[str, ControlPartCommandProfile] = {}
+        articulation_open = self.gripper_profile.articulation_open_positions
         for side in ("left_arm", "right_arm"):
             try:
                 _, hand_part, hand_dof = self._parts(side)
@@ -3085,7 +3248,15 @@ class AtomicActionAdapter:
             if hand_part is None or hand_dof == 0 or hand_part in profiles:
                 continue
             profiles[hand_part] = ControlPartCommandProfile.joint_positions(
-                open=_as_hand_qpos(self.env.open_state, hand_dof, self.device),
+                open=_as_hand_qpos(
+                    (
+                        articulation_open
+                        if articulation_interaction
+                        else self.env.open_state
+                    ),
+                    hand_dof,
+                    self.device,
+                ),
                 grasp=_as_hand_qpos(self.env.close_state, hand_dof, self.device),
             )
         return profiles
@@ -3149,6 +3320,9 @@ class AtomicActionAdapter:
             algorithm_cfg=algorithm,
             collision_cfg=collision,
             annotation_cfg=annotation,
+            interaction_depth_offset=(
+                self.gripper_profile.articulation_grasp_depth_offset
+            ),
         )
         generators: dict[str, AntipodalGraspPoseGenerator] = {}
         for arm in ("left_arm", "right_arm"):

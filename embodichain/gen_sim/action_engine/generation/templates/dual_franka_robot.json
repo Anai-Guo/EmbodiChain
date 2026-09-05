@@ -86,8 +86,8 @@
       "right_eef": 100.0
     },
     "max_effort": {
-      "left_arm": 10000.0,
-      "right_arm": 10000.0,
+      "left_arm": 100000.0,
+      "right_arm": 100000.0,
       "left_eef": 10000.0,
       "right_eef": 10000.0
     }

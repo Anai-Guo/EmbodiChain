@@ -398,6 +398,9 @@ def build_fast_gym_config(
         "body_scale": list(scene.body_scale),
         "asset_hashes": dict(sorted(scene.asset_hashes.items())),
         "asset_provenance": [deepcopy(value) for value in scene.asset_provenance],
+        "articulation_origin_corrections": deepcopy(
+            scene.articulation_origin_corrections
+        ),
         "uid_map": dict(sorted(scene.uid_map.items())),
     }
     extensions = {
@@ -634,6 +637,7 @@ def _apply_ik_solver(robot: dict[str, Any], mode: str) -> None:
             if not isinstance(current, dict):
                 raise ValueError(f"Robot template requires solver_cfg.{arm}.")
             if current.get("class_type") == "PytorchSolver":
+                current["num_samples"] = 30
                 continue
             solvers[arm] = {
                 "class_type": "PytorchSolver",

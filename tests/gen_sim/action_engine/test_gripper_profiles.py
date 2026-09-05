@@ -44,6 +44,7 @@ def test_pgi_profile_owns_asset_control_mimic_tcp_and_grasp_geometry() -> None:
         "left_gripper_finger2_joint_1",
     )
     assert profile.open_positions == (0.0,)
+    assert profile.articulation_open_positions == (0.0,)
     assert profile.close_positions == (0.04,)
     assert profile.control_limits == ((0.0, 0.04),)
     assert profile.tcp_transform == (
@@ -52,6 +53,7 @@ def test_pgi_profile_owns_asset_control_mimic_tcp_and_grasp_geometry() -> None:
         (0.0, 0.0, 1.0, 0.121),
         (0.0, 0.0, 0.0, 1.0),
     )
+    assert profile.articulation_grasp_depth_offset == pytest.approx(0.0)
     assert profile.grasp_model.model_id == "dh_pgi_140_80"
     assert profile.grasp_model.max_opening_width == pytest.approx(0.100)
     assert profile.grasp_model.finger_length == pytest.approx(0.10)
@@ -98,13 +100,25 @@ def test_robotiq_profile_separates_commanded_mimics_from_state_joint() -> None:
         profile.mimic_joint_names("right")
     )
     assert profile.open_positions == (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    assert profile.articulation_open_positions == (
+        0.4,
+        -0.4,
+        0.4,
+        -0.4,
+        -0.4,
+        0.4,
+    )
     assert profile.close_positions == (0.7, -0.7, 0.7, -0.7, -0.7, 0.7)
+    assert profile.drive_stiffness == pytest.approx(1.0e3)
+    assert profile.drive_damping == pytest.approx(1.0e2)
+    assert profile.drive_max_effort == pytest.approx(1.0e3)
     assert profile.tcp_transform == (
         (0.0, -1.0, 0.0, 0.0),
         (1.0, 0.0, 0.0, 0.0),
         (0.0, 0.0, 1.0, 0.2),
         (0.0, 0.0, 0.0, 1.0),
     )
+    assert profile.articulation_grasp_depth_offset == pytest.approx(0.025)
     assert profile.grasp_model.model_id == "robotiq_arg2f_140"
     assert profile.grasp_model.min_opening_width == pytest.approx(0.001)
     assert profile.grasp_model.min_opening_width < 0.00856
@@ -128,4 +142,5 @@ def test_profile_manifest_records_tcp_frame_and_transform_conventions() -> None:
     assert manifest["tcp"]["transform_direction"] == "parent_link_to_tcp"
     assert manifest["tcp"]["matrix_layout"] == "row_major_homogeneous_4x4"
     assert manifest["tcp"]["quaternion_order"] == "not_applicable"
+    assert manifest["articulation_grasp_depth_offset"] == pytest.approx(0.0)
     assert manifest["grasp_model"]["model_id"] == "dh_pgi_140_80"

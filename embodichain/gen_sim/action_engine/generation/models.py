@@ -18,7 +18,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -81,3 +81,6 @@ class PreparedScene:
     asset_hashes: dict[str, str]
     source_scene_xy_translation: tuple[float, float] = (0.0, 0.0)
     asset_provenance: tuple[dict[str, Any], ...] = ()
+    articulation_origin_corrections: dict[str, dict[str, Any]] = field(
+        default_factory=dict
+    )

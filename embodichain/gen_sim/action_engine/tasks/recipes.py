@@ -1329,43 +1329,57 @@ def _single_arm_interaction(
     postcondition: Mapping[str, Any],
     role: str,
 ) -> list[dict[str, Any]]:
-    """Build staging, interaction, safety-retreat, and home nodes."""
-    staging = _node(
-        group_id,
-        1,
-        "MoveEndEffector",
-        task_type,
-        object_uid,
-        actor,
-        "arm",
-        {
-            "kind": "policy_pose",
-            "source": "interaction",
-            "operation": "interaction_staging",
-            "interaction": interaction,
-        },
-        dependencies,
-        role,
-        {},
-        motion_policy(),
-    )
+    """Build an interaction followed by safety retreat and best-effort home."""
+    nodes: list[dict[str, Any]] = []
+    previous = dependencies
+    next_index = 1
+    # Slide and OpenDoor already own approach-to-contact in their core Atomic
+    # Action. A separate collision-unaware pre-stage can disturb the live joint
+    # before those skills ground their target geometry.
+    if action_name not in {"Slide", "OpenDoor"}:
+        staging = _node(
+            group_id,
+            next_index,
+            "MoveEndEffector",
+            task_type,
+            object_uid,
+            actor,
+            "arm",
+            {
+                "kind": "policy_pose",
+                "source": "interaction",
+                "operation": "interaction_staging",
+                "interaction": interaction,
+            },
+            previous,
+            role,
+            {},
+            motion_policy(),
+        )
+        nodes.append(staging)
+        previous = [staging["id"]]
+        next_index += 1
     interaction_node = _node(
         group_id,
-        2,
+        next_index,
         action_name,
         task_type,
         object_uid,
         actor,
         "arm",
         target_binding,
-        [staging["id"]],
+        previous,
         role,
         postcondition,
         motion_policy(),
     )
+    nodes.append(interaction_node)
+    next_index += 1
+    if action_name in {"Slide", "OpenDoor"}:
+        return nodes
     retreat = _node(
         group_id,
-        3,
+        next_index,
         "MoveEndEffector",
         task_type,
         object_uid,
@@ -1382,9 +1396,11 @@ def _single_arm_interaction(
         {},
         motion_policy(),
     )
+    nodes.append(retreat)
+    next_index += 1
     home = _node(
         group_id,
-        4,
+        next_index,
         "MoveJoints",
         task_type,
         object_uid,
@@ -1400,7 +1416,8 @@ def _single_arm_interaction(
         {},
         motion_policy(),
     )
-    return [staging, interaction_node, retreat, home]
+    nodes.append(home)
+    return nodes
 
 
 def _node(

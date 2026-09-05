@@ -18,7 +18,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -255,6 +255,10 @@ def _effective_joint_limits(
     if joint_type != "prismatic":
         return limits
 
+    configured_limits = getattr(getattr(articulation, "cfg", None), "qpos_limits", None)
+    if configured_limits is not None:
+        return limits
+
     scale = torch.as_tensor(
         getattr(getattr(articulation, "cfg", None), "body_scale", (1.0, 1.0, 1.0)),
         dtype=limits.dtype,
@@ -333,107 +337,165 @@ def _scaled_link_geometry(
     return vertices * scale, triangles
 
 
+class _InitialInteractionGeometryProvider:
+    """Expose a scaled live USD snapshot through the Atomic Action protocol."""
+
+    def __init__(
+        self,
+        articulation: Any,
+        target_link_name: str,
+        *,
+        target_vertices: torch.Tensor,
+        target_triangles: torch.Tensor,
+        owning_link_vertices: torch.Tensor,
+        owning_link_triangles: torch.Tensor,
+    ) -> None:
+        physical_link_names = tuple(
+            str(link_name) for link_name in articulation.link_names
+        )
+        if target_link_name not in physical_link_names:
+            raise ValueError(f"Unknown articulation link {target_link_name!r}.")
+        self.device = torch.device(getattr(articulation, "device", "cpu"))
+        self.target_link_name = f"__gensim_interaction__:{target_link_name}"
+        if self.target_link_name in physical_link_names:
+            raise ValueError("Generated interaction link name collides with live USD.")
+        self.link_names = (*physical_link_names, self.target_link_name)
+        self.initial_qpos_joint_names = tuple(
+            str(joint_name) for joint_name in articulation.joint_names
+        )
+        qpos = torch.as_tensor(
+            articulation.get_qpos(),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        if qpos.ndim != 2 or qpos.shape[0] < 1:
+            raise ValueError("Generated articulation qpos must have shape (B, J).")
+        self.initial_qpos = qpos[0].clone()
+        self._articulation = articulation
+        self._physical_target_link_name = target_link_name
+        self._target_geometry = (
+            torch.as_tensor(
+                target_vertices,
+                dtype=torch.float32,
+                device=self.device,
+            ).clone(),
+            torch.as_tensor(
+                target_triangles,
+                dtype=torch.int64,
+                device=self.device,
+            ).clone(),
+        )
+        self._owning_link_geometry = (
+            torch.as_tensor(
+                owning_link_vertices,
+                dtype=torch.float32,
+                device=self.device,
+            ).clone(),
+            torch.as_tensor(
+                owning_link_triangles,
+                dtype=torch.int64,
+                device=self.device,
+            ).clone(),
+        )
+        self._link_poses = {
+            link_name: self._snapshot_link_pose(link_name)
+            for link_name in physical_link_names
+        }
+        self._link_poses[self.target_link_name] = self._link_poses[
+            target_link_name
+        ].clone()
+
+    def _snapshot_link_pose(self, link_name: str) -> torch.Tensor:
+        pose = torch.as_tensor(
+            self._articulation.get_link_pose(link_name, to_matrix=True),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        if pose.ndim == 3:
+            pose = pose[0]
+        if pose.shape != (4, 4) or not bool(torch.isfinite(pose).all().item()):
+            raise ValueError(
+                f"Articulation link {link_name!r} pose must be finite with "
+                "shape (4, 4)."
+            )
+        return pose.clone()
+
+    def compute_fk(
+        self,
+        qpos: torch.Tensor,
+        *,
+        link_names: Sequence[str],
+        qpos_joint_names: Sequence[str],
+    ) -> torch.Tensor:
+        """Return the captured reset snapshot for the explicitly named state."""
+        qpos = torch.as_tensor(qpos, dtype=torch.float32, device=self.device)
+        if qpos.ndim != 2 or qpos.shape[0] != 1:
+            raise ValueError("Initial interaction FK requires one qpos row.")
+        if tuple(qpos_joint_names) != self.initial_qpos_joint_names:
+            raise ValueError("Initial interaction joint names changed after reset.")
+        if not torch.allclose(qpos[0], self.initial_qpos, atol=1.0e-6, rtol=1.0e-6):
+            raise ValueError("Initial interaction qpos changed after snapshot capture.")
+        requested_links = tuple(str(link_name) for link_name in link_names)
+        if any(link_name not in self._link_poses for link_name in requested_links):
+            raise ValueError("Initial interaction FK requested an unknown link.")
+        return torch.stack(
+            [self._link_poses[link_name] for link_name in requested_links],
+            dim=0,
+        ).unsqueeze(0)
+
+    def get_link_vert_face(
+        self,
+        link_name: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return scaled physical geometry or the exact interaction submesh."""
+        if link_name == self.target_link_name:
+            return self._target_geometry
+        if link_name == self._physical_target_link_name:
+            return self._owning_link_geometry
+        return _scaled_link_geometry(self._articulation, link_name)
+
+    def get_parent_joint_chain(self, link_name: str) -> tuple[Any, ...]:
+        """Delegate the synthetic handle to its owning moving link."""
+        physical_link_name = (
+            self._physical_target_link_name
+            if link_name == self.target_link_name
+            else link_name
+        )
+        return tuple(self._articulation.get_parent_joint_chain(physical_link_name))
+
+
 def _sample_interaction_point_clouds(
     articulation: Any,
     target_link_name: str,
     *,
     target_vertices: torch.Tensor,
     target_triangles: torch.Tensor,
-    prismatic_joint_axis: torch.Tensor,
+    owning_link_vertices: torch.Tensor,
+    owning_link_triangles: torch.Tensor,
     articulation_point_count: int = 100_000,
     target_point_count: int = 5_000,
 ) -> dict[str, torch.Tensor]:
-    """Sample generated USD geometry in one interaction-owning link frame.
-
-    Generated handles are often meshes under a moving link rather than separate
-    kinematic links. This adapter preserves the tutorial geometry contract by
-    sampling the exact handle mesh as the target while transforming the complete
-    live articulation into the owning link frame.
-    """
-    if target_link_name not in getattr(articulation, "link_names", ()):
-        raise ValueError(f"Unknown articulation link {target_link_name!r}.")
-    for value, name in (
-        (articulation_point_count, "articulation_point_count"),
-        (target_point_count, "target_point_count"),
-    ):
-        if type(value) is not int or value <= 0:
-            raise ValueError(f"{name} must be a positive integer.")
-    device = getattr(articulation, "device", None)
-    target_vertices = torch.as_tensor(
-        target_vertices, dtype=torch.float32, device=device
-    )
-    target_triangles = torch.as_tensor(
-        target_triangles, dtype=torch.int64, device=device
-    )
-    prismatic_joint_axis = torch.as_tensor(
-        prismatic_joint_axis,
-        dtype=torch.float32,
-        device=device,
-    )
-    if (
-        prismatic_joint_axis.shape != (3,)
-        or not torch.isfinite(prismatic_joint_axis).all()
-        or torch.linalg.vector_norm(prismatic_joint_axis) <= 1.0e-6
-    ):
-        raise ValueError("Prismatic interaction axis must be finite and non-zero.")
-    target_pose = torch.as_tensor(
-        articulation.get_link_pose(target_link_name, to_matrix=True),
-        dtype=torch.float32,
-        device=device,
-    )
-    if target_pose.ndim == 3:
-        target_pose = target_pose[0]
-    if target_pose.shape != (4, 4) or not torch.isfinite(target_pose).all():
-        raise ValueError(
-            "Interaction target link pose must be finite with shape (4, 4)."
-        )
-    target_from_world = torch.linalg.inv(target_pose)
-
-    merged_vertices: list[torch.Tensor] = []
-    merged_triangles: list[torch.Tensor] = []
-    vertex_offset = 0
-    for link_name in articulation.link_names:
-        vertices, triangles = _scaled_link_geometry(articulation, str(link_name))
-        link_pose = torch.as_tensor(
-            articulation.get_link_pose(str(link_name), to_matrix=True),
-            dtype=torch.float32,
-            device=vertices.device,
-        )
-        if link_pose.ndim == 3:
-            link_pose = link_pose[0]
-        if link_pose.shape != (4, 4) or not torch.isfinite(link_pose).all():
-            raise ValueError(
-                f"Articulation link {link_name!r} pose must be finite with shape (4, 4)."
-            )
-        target_from_link = torch.matmul(target_from_world.to(link_pose), link_pose)
-        transformed = (
-            vertices @ target_from_link[:3, :3].transpose(0, 1)
-            + target_from_link[:3, 3]
-        )
-        merged_vertices.append(transformed)
-        if triangles.numel():
-            merged_triangles.append(triangles + vertex_offset)
-        vertex_offset += int(vertices.shape[0])
-    if not merged_vertices or not merged_triangles:
-        raise ValueError("Articulation has no triangle geometry for point sampling.")
-
-    from embodichain.lab.sim.atomic_actions.articulation_geometry import (
-        ArticulationAffordanceGeometry,
-        _sample_mesh_surface_points,
+    """Adapt a generated USD handle to the tutorial geometry contract."""
+    from embodichain.lab.sim.atomic_actions import (
+        sample_initial_articulation_geometry,
     )
 
-    return ArticulationAffordanceGeometry(
-        target_link_point_cloud=_sample_mesh_surface_points(
-            target_vertices,
-            target_triangles,
-            target_point_count,
-        ),
-        articulation_point_cloud=_sample_mesh_surface_points(
-            torch.cat(merged_vertices, dim=0),
-            torch.cat(merged_triangles, dim=0),
-            articulation_point_count,
-        ),
-        prismatic_joint_axis=prismatic_joint_axis,
+    provider = _InitialInteractionGeometryProvider(
+        articulation,
+        target_link_name,
+        target_vertices=target_vertices,
+        target_triangles=target_triangles,
+        owning_link_vertices=owning_link_vertices,
+        owning_link_triangles=owning_link_triangles,
+    )
+    return sample_initial_articulation_geometry(
+        provider,
+        provider.target_link_name,
+        initial_qpos=provider.initial_qpos,
+        initial_qpos_joint_names=provider.initial_qpos_joint_names,
+        body_scale=(1.0, 1.0, 1.0),
+        articulation_point_count=articulation_point_count,
+        target_point_count=target_point_count,
     ).to_object_geometry()
 
 
@@ -479,6 +541,7 @@ def _named_link_geometry(
     *,
     name_tokens: Iterable[str] = (),
     mesh_names: Iterable[str] = (),
+    excluded_mesh_names: Iterable[str] = (),
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Extract selected USD shape meshes in the owning articulation-link frame."""
     source = Path(str(getattr(getattr(articulation, "cfg", None), "fpath", "")))
@@ -500,20 +563,27 @@ def _named_link_geometry(
     if link_prim is None:
         return None
     exact_names = {str(name).strip() for name in mesh_names if str(name).strip()}
+    excluded_names = {
+        str(name).strip() for name in excluded_mesh_names if str(name).strip()
+    }
+    if exact_names & excluded_names:
+        raise ValueError("Selected and excluded USD mesh names must be disjoint.")
     tokens = tuple(str(token).casefold() for token in name_tokens)
     mesh_prims = []
     for prim in Usd.PrimRange(link_prim):
         if not prim.IsA(UsdGeom.Mesh):
             continue
+        if prim.GetName() in excluded_names:
+            continue
         if exact_names:
             if prim.GetName() in exact_names:
                 mesh_prims.append(prim)
-        elif any(token in prim.GetName().casefold() for token in tokens):
+        elif not tokens or any(token in prim.GetName().casefold() for token in tokens):
             mesh_prims.append(prim)
     if exact_names:
         if {str(prim.GetName()) for prim in mesh_prims} != exact_names:
             return None
-    else:
+    elif tokens:
         primary_mesh_prims = [
             prim
             for prim in mesh_prims

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
 from pathlib import Path
 import sys
 from types import ModuleType
@@ -59,6 +60,8 @@ from embodichain.gen_sim.action_engine.generation.generator import (
     generate_action_engine_config,
 )
 from embodichain.gen_sim.action_engine.generation.source_scene import (
+    _legacy_z_up_articulation_origin_correction,
+    _runtime_object,
     prepare_scene,
     resolve_gym_config_path,
     resolve_source_scene,
@@ -183,6 +186,90 @@ def _existing_v2_task_spec(task_id: str = "direct_task") -> dict[str, object]:
         "oracle": {},
         "metadata": {"role_bindings": {"object_01": "interact_can"}},
     }
+
+
+def test_legacy_z_up_articulation_origin_correction_recovers_bottom_origin(
+    tmp_path: Path,
+) -> None:
+    from pxr import Gf, Usd, UsdGeom, UsdPhysics
+
+    path = tmp_path / "legacy_drawer.usda"
+    stage = Usd.Stage.CreateNew(path.as_posix())
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+    root = UsdGeom.Xform.Define(stage, "/World/drawer")
+    UsdPhysics.ArticulationRootAPI.Apply(root.GetPrim())
+    UsdGeom.Xformable(root).AddTranslateOp(opSuffix="scene_engine_bottom_center").Set(
+        Gf.Vec3d(0.0, 0.0, 0.0)
+    )
+    cube = UsdGeom.Cube.Define(stage, "/World/drawer/body")
+    cube.CreateSizeAttr(2.0)
+    stage.SetDefaultPrim(root.GetPrim())
+    stage.GetRootLayer().Save()
+
+    correction = _legacy_z_up_articulation_origin_correction(
+        {"fpath": path.as_posix(), "body_scale": [0.5, 0.5, 0.5]}
+    )
+
+    assert correction == pytest.approx(0.5)
+
+
+def test_generated_articulation_uses_tutorial_passive_joint_contract(
+    tmp_path: Path,
+) -> None:
+    from pxr import Usd, UsdPhysics
+
+    path = tmp_path / "drawer.usda"
+    stage = Usd.Stage.CreateNew(path.as_posix())
+    root = stage.DefinePrim("/World/drawer", "Xform")
+    stage.SetDefaultPrim(root)
+    slide = UsdPhysics.PrismaticJoint.Define(stage, "/World/drawer/slide")
+    slide.CreateAxisAttr("Y")
+    slide.CreateLowerLimitAttr(-0.2)
+    slide.CreateUpperLimitAttr(0.0)
+    stage.GetRootLayer().Save()
+    door_path = tmp_path / "door.usda"
+    door_stage = Usd.Stage.CreateNew(door_path.as_posix())
+    door_root = door_stage.DefinePrim("/World/door", "Xform")
+    door_stage.SetDefaultPrim(door_root)
+    hinge = UsdPhysics.RevoluteJoint.Define(door_stage, "/World/door/hinge")
+    hinge.CreateLowerLimitAttr(-90.0)
+    hinge.CreateUpperLimitAttr(0.0)
+    door_stage.GetRootLayer().Save()
+    generated = _runtime_object(
+        {
+            "uid": "drawer",
+            "fpath": path.as_posix(),
+            "body_scale": [0.25, 0.25, 0.25],
+        },
+        role="articulation",
+    )
+    generated_door = _runtime_object(
+        {"uid": "door", "fpath": door_path.as_posix()},
+        role="articulation",
+    )
+    explicit = _runtime_object(
+        {
+            "uid": "door",
+            "fpath": "door.usdc",
+            "attrs": {"static_friction": 0.8, "dynamic_friction": 0.7},
+            "drive_pros": {"drive_type": "acceleration"},
+        },
+        role="articulation",
+    )
+
+    assert generated["drive_pros"] == {"drive_type": "none"}
+    assert generated["init_qpos"] == [0.0]
+    assert generated["qpos_limits"]["slide"] == pytest.approx([-0.05, 0.0])
+    assert generated_door["drive_pros"] == {"drive_type": "none"}
+    assert generated_door["init_qpos"] == [0.0]
+    assert generated_door["qpos_limits"]["hinge"] == pytest.approx(
+        [-math.pi / 2.0, 0.0]
+    )
+    assert generated["attrs"]["static_friction"] == pytest.approx(1.0)
+    assert generated["attrs"]["dynamic_friction"] == pytest.approx(1.0)
+    assert explicit["drive_pros"] == {"drive_type": "acceleration"}
+    assert explicit["attrs"]["static_friction"] == pytest.approx(0.8)
+    assert explicit["attrs"]["dynamic_friction"] == pytest.approx(0.7)
 
 
 def test_prepare_scene_normalizes_uid_paths_and_prompt2scene_transform(
@@ -353,6 +440,12 @@ def test_fast_gym_config_has_runnable_franka_contract(gym_export: Path) -> None:
     assert config["id"] == "ActionEngine-v1"
     assert config["robot"]["uid"] == "DualFrankaPanda"
     assert config["robot"]["init_pos"][2] == pytest.approx(0.35)
+    assert config["robot"]["drive_pros"]["max_effort"]["left_arm"] == pytest.approx(
+        1.0e5
+    )
+    assert config["robot"]["drive_pros"]["max_effort"]["right_arm"] == pytest.approx(
+        1.0e5
+    )
     assert config["sensor"][0]["uid"] == "cam_high"
     assert config["env"]["extensions"]["agent_robot_profile"] == "dual_franka"
     assert config["env"]["extensions"]["agent_static_obstacle_uids"] == ["table"]
@@ -1178,6 +1271,25 @@ def test_fast_gym_config_materializes_selected_ur10_ik_solver(
         assert solver["root_link_name"] == f"{arm.split('_')[0]}_base_link"
         if ik_solver == "pytorch":
             assert solver["num_samples"] == 30
+
+
+def test_franka_pytorch_solver_uses_the_canonical_sample_count(
+    gym_export: Path,
+) -> None:
+    config = build_fast_gym_config(
+        prepare_scene(gym_export),
+        task_name="franka_solver_profile_task",
+        task_description="Exercise the native Franka PyTorch solver profile.",
+        robot_profile="franka",
+        gripper_model="robotiq",
+        ik_solver="pytorch",
+        execution_program_hash="d" * 64,
+        max_episodes=1,
+        max_episode_steps=20,
+    )
+
+    for arm in ("left_arm", "right_arm"):
+        assert config["robot"]["solver_cfg"][arm]["num_samples"] == 30
 
 
 def test_fast_gym_config_rejects_analytic_ur_solver_for_franka(

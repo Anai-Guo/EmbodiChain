@@ -132,6 +132,32 @@ class ActionEngineEnv(EmbodiedEnv):
         self._capture_runtime_state()
         return observation, info
 
+    def _initialize_episode(
+        self,
+        env_ids: Sequence[int] | torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Restore generated USD joints after generic reset events have settled."""
+        super()._initialize_episode(env_ids, **kwargs)
+        self._restore_generated_usd_articulation_reset_state(env_ids)
+
+    def _restore_generated_usd_articulation_reset_state(
+        self,
+        env_ids: Sequence[int] | torch.Tensor | None,
+    ) -> None:
+        """Reapply configured initial qpos after reset-event physics updates."""
+        list_articulations = getattr(self.sim, "get_articulation_uid_list", None)
+        get_articulation = getattr(self.sim, "get_articulation", None)
+        if not callable(list_articulations) or not callable(get_articulation):
+            return
+        for uid in list_articulations():
+            articulation = get_articulation(str(uid))
+            if articulation is None:
+                continue
+            source = str(getattr(getattr(articulation, "cfg", None), "fpath", ""))
+            if source.lower().endswith((".usd", ".usda", ".usdc")):
+                articulation.reset(env_ids=env_ids)
+
     def _capture_runtime_state(self) -> None:
         """Capture reset-relative robot and object state used by symbolic bindings."""
         self.init_qpos = self.robot.get_qpos().clone()

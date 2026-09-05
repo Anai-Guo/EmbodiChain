@@ -19,20 +19,56 @@ from __future__ import annotations
 from dataclasses import dataclass
 from types import SimpleNamespace
 
+import torch
+
 from embodichain.gen_sim.action_engine.runtime.actions import AtomicActionAdapter
 from embodichain.gen_sim.action_engine.runtime.atomic_compat import (
+    _ActionEngineOpenDoor,
     ActionEngineMoveJoints,
     ActionEngineMoveJointsOptions,
     ExactTargetMoveHeldObject,
     ExactTargetMoveHeldObjectOptions,
+    _relax_horizontal_hinge_grasp_roll,
 )
 from embodichain.lab.sim.atomic_actions import (
     MoveHeldObject,
     MoveHeldObjectOptions,
     MoveJoints,
     MoveJointsOptions,
+    OpenDoor,
     StateDelta,
 )
+from embodichain.utils.math import axis_angle_to_rotation_matrix
+
+
+def test_open_door_adapter_relaxes_only_horizontal_hinge_wrist_roll() -> None:
+    link_pose = torch.eye(4).repeat(2, 1, 1)
+    grasp_pose = link_pose.clone()
+    rotation_axis = torch.tensor([1.0, 0.0, 0.0])
+    hinge_rotation = torch.tensor([torch.pi / 2.0, torch.pi / 2.0])
+    opened = torch.eye(4).repeat(2, 2, 1, 1)
+    opened[:, -1, :3, :3] = axis_angle_to_rotation_matrix(
+        rotation_axis.repeat(2, 1) * (torch.pi / 2.0)
+    )
+    link_pose[1, :3, :3] = axis_angle_to_rotation_matrix(
+        torch.tensor([[0.0, torch.pi / 2.0, 0.0]])
+    )[0]
+
+    result, relaxed = _relax_horizontal_hinge_grasp_roll(
+        link_pose,
+        grasp_pose,
+        rotation_axis,
+        hinge_rotation,
+        opened,
+    )
+
+    expected = axis_angle_to_rotation_matrix(
+        torch.tensor([[torch.pi / 8.0, 0.0, 0.0]])
+    )[0]
+    assert relaxed.tolist() == [True, False]
+    torch.testing.assert_close(result[0, -1, :3, :3], expected)
+    torch.testing.assert_close(result[1], opened[1])
+    assert _ActionEngineOpenDoor.binding_contract is OpenDoor.binding_contract
 
 
 def test_grounded_target_transport_uses_mainline_exact_target_contract() -> None:

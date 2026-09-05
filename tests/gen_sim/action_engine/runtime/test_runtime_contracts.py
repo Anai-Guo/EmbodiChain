@@ -544,7 +544,12 @@ def _pose(x: float, y: float, z: float) -> torch.Tensor:
 
 
 def _interaction_edge(program):
-    return program.edges[1]
+    return next(
+        edge
+        for edge in program.edges
+        if edge.actions[0]["atomic_action_class"]
+        in {"Slide", "OpenDoor", "Twist", "Press"}
+    )
 
 
 def test_press_grounding_adapts_top_surface_and_depth_to_mainline_contract() -> None:
@@ -702,7 +707,14 @@ def test_prismatic_grounding_uses_physics_scaled_runtime_limits() -> None:
     assert bool(ActionEngineEnv.is_object_pressed(env, "button")[0])
 
 
-def test_slide_execution_inserts_configured_grasp_settle_segment() -> None:
+@pytest.mark.parametrize(
+    ("action_class", "interaction_kind"),
+    (("Slide", "slide"), ("OpenDoor", "open_door")),
+)
+def test_articulation_execution_inserts_configured_grasp_settle_segment(
+    action_class: str,
+    interaction_kind: str,
+) -> None:
     task, _ = make_task_spec("E6")
     program = load_execution_program(
         instantiate_seed_graph(task, {"object_01": "drawer"})
@@ -716,7 +728,7 @@ def test_slide_execution_inserts_configured_grasp_settle_segment() -> None:
         .repeat(1, 1, env.robot.dof)
     )
     grounded = GroundedAction(
-        action_class="Slide",
+        action_class=action_class,
         arm="right_arm",
         control="arm",
         target=SlideGoal(
@@ -732,7 +744,10 @@ def test_slide_execution_inserts_configured_grasp_settle_segment() -> None:
             target_pose=_pose(0.0, 0.0, 0.7),
         ),
         cfg={},
-        motion_policy={"articulation_grasp_settle_steps": 2},
+        motion_policy={
+            "articulation_grasp_settle_steps": 2,
+            "direction": "pull",
+        },
         object_uid="drawer",
     )
     outcome = ActionOutcome(
@@ -753,17 +768,119 @@ def test_slide_execution_inserts_configured_grasp_settle_segment() -> None:
     extended = executor._with_articulation_grasp_settle(
         trajectory,
         outcomes={"left_arm": None, "right_arm": outcome},
-        action_class="Slide",
+        interaction_kind=interaction_kind,
     )
 
-    assert extended[0, :, 0].tolist() == [0.0, 1.0, 1.0, 1.0, 2.0, 3.0]
-    assert outcome.planner_trace["action_segments"] == {
+    expected_values = [0.0, 1.0, 1.0, 1.0, 2.0, 3.0]
+    expected_segments = {
         "approach": {"start": 0, "stop": 1},
         "close": {"start": 1, "stop": 2},
         "grasp_settle": {"start": 2, "stop": 4},
         "pull": {"start": 4, "stop": 5},
         "open": {"start": 5, "stop": 6},
     }
+    assert extended[0, :, 0].tolist() == expected_values
+    assert outcome.planner_trace["action_segments"] == expected_segments
+
+
+def test_articulation_cleanup_cannot_weaken_or_rebase_verifier_policy() -> None:
+    task, _ = make_task_spec("E7")
+    program = load_execution_program(
+        instantiate_seed_graph(task, {"object_01": "door"})
+    )
+    env = _FakeEnv(articulations={"door": _FakeArticulation("door", 0.0)})
+    executor = ProgramExecutor(program, env, record_runtime=False)
+    step = program.semantic_steps[0]
+    interaction = GroundedAction(
+        action_class="OpenDoor",
+        arm="left_arm",
+        control="arm",
+        target=None,
+        cfg={},
+        object_uid="door",
+        motion_policy={
+            "articulation_joint_name": "door_hinge",
+            "articulation_initial_qpos": torch.tensor([0.0]),
+            "articulation_target_qpos": torch.tensor([-1.9]),
+            "postcondition_tolerance": 0.03,
+        },
+    )
+    executor._remember_target(step, interaction)
+    executor._remember_target(
+        step,
+        replace(
+            interaction,
+            action_class="MoveJoints",
+            motion_policy={"postcondition_tolerance": 0.05},
+        ),
+    )
+    executor._remember_target(
+        step,
+        replace(
+            interaction,
+            motion_policy={
+                **interaction.motion_policy,
+                "articulation_initial_qpos": torch.tensor([-0.5]),
+            },
+        ),
+    )
+
+    policy = executor._policies[step.id]
+    assert policy["postcondition_tolerance"] == pytest.approx(0.03)
+    torch.testing.assert_close(
+        policy["articulation_initial_qpos"],
+        torch.tensor([0.0]),
+    )
+
+
+def test_open_door_holding_friction_applies_only_after_live_target_reached() -> None:
+    task, _ = make_task_spec("E7")
+    program = load_execution_program(
+        instantiate_seed_graph(task, {"object_01": "door"})
+    )
+    door = _FakeArticulation("door", -1.9)
+    calls: list[dict[str, Any]] = []
+    door.set_joint_drive = lambda **kwargs: calls.append(kwargs)
+    door.set_qpos = lambda *_args, **_kwargs: pytest.fail("must not write qpos")
+    env = _FakeEnv(articulations={"door": door})
+    executor = ProgramExecutor(program, env, record_runtime=False)
+    grounded = GroundedAction(
+        action_class="OpenDoor",
+        arm="left_arm",
+        control="arm",
+        target=None,
+        cfg={},
+        object_uid="door",
+        motion_policy={
+            "articulation_joint_name": "slide_joint",
+            "articulation_target_qpos": torch.tensor([-1.9]),
+            "postcondition_tolerance": 0.03,
+        },
+    )
+
+    trace = executor._hold_open_articulation_at_target(
+        grounded,
+        active=torch.tensor([True]),
+        friction=0.01,
+        waypoint_index=17,
+    )
+
+    assert trace is not None
+    assert trace["direct_qpos_write"] is False
+    assert trace["observed_qpos"] == pytest.approx([-1.9])
+    assert len(calls) == 1
+    torch.testing.assert_close(calls[0]["friction"], torch.tensor([[0.01]]))
+    door._qpos[0, 0] = -1.8
+    assert (
+        executor._hold_open_articulation_at_target(
+            grounded,
+            active=torch.tensor([True]),
+            friction=0.01,
+            waypoint_index=18,
+        )
+        is None
+    )
+    assert len(calls) == 1
 
 
 def test_press_grounding_supports_a_revolute_rocker_switch() -> None:
@@ -4628,6 +4745,15 @@ def test_generated_usd_slide_axis_points_from_handle_toward_parent(
     )
     mesh.CreateFaceVertexCountsAttr([3, 3])
     mesh.CreateFaceVertexIndicesAttr(articulation._triangles.flatten().tolist())
+    panel = UsdGeom.Mesh.Define(
+        stage,
+        "/World/item/rigid_bodies/drawer_link/shapes/drawer_front",
+    )
+    panel.CreatePointsAttr(
+        [tuple(float(value) for value in row) for row in articulation._vertices]
+    )
+    panel.CreateFaceVertexCountsAttr([3, 3])
+    panel.CreateFaceVertexIndicesAttr(articulation._triangles.flatten().tolist())
     stage.GetRootLayer().Save()
     articulation.cfg.fpath = path.as_posix()
     env = _FakeEnv(articulations={"drawer": articulation})
@@ -4658,6 +4784,8 @@ def test_generated_usd_slide_axis_points_from_handle_toward_parent(
         grounded.target.semantics.affordance.translation_axis,
         torch.tensor([-1.0, 0.0, 0.0]),
     )
+    assert grounded.cfg["translation_distance"] == pytest.approx(0.21)
+    assert grounded.cfg["articulation_target_qpos"].item() == pytest.approx(0.2)
 
 
 @pytest.mark.parametrize(
@@ -4726,10 +4854,10 @@ def test_articulation_grounding_uses_configured_interaction_link(
 
 
 @pytest.mark.parametrize("task_type", ("E6",))
-def test_articulation_staging_resolves_the_interaction_link_before_semantics(
+def test_articulation_interaction_resolves_the_link_before_root_semantics(
     task_type: str,
 ) -> None:
-    """Staging must not request ambiguous root-articulation semantics."""
+    """Self-contained interaction must not request ambiguous root semantics."""
     task, _ = make_task_spec(task_type)
     program = load_execution_program(
         instantiate_seed_graph(task, {"object_01": "panel"})
@@ -4757,7 +4885,7 @@ def test_articulation_staging_resolves_the_interaction_link_before_semantics(
         state=ExecutionState(last_qpos=env.robot.get_qpos()),
     )
 
-    assert isinstance(grounded.target, EndEffectorPoseGoal)
+    assert isinstance(grounded.target, SlideGoal)
 
 
 def test_named_link_geometry_extracts_only_matching_usd_shapes(tmp_path: Path) -> None:
@@ -4803,6 +4931,15 @@ def test_named_link_geometry_extracts_only_matching_usd_shapes(tmp_path: Path) -
     assert vertices.shape == (3, 3)
     assert triangles.tolist() == [[0, 1, 2]]
     assert vertices.max(dim=0).values.tolist() == pytest.approx([0.2, 0.2, 0.0])
+    obstacle_geometry = _named_link_geometry(
+        articulation,
+        drawer.GetPrim().GetName(),
+        excluded_mesh_names=("pull_handle",),
+    )
+    assert obstacle_geometry is not None
+    obstacle_vertices, obstacle_triangles = obstacle_geometry
+    assert obstacle_vertices.shape == (6, 3)
+    assert obstacle_triangles.tolist() == [[0, 1, 2], [3, 4, 5]]
     assert (
         _named_link_geometry(
             articulation,
@@ -4842,17 +4979,20 @@ def test_generated_usd_interaction_point_clouds_use_scaled_handle_geometry(
         "handle",
         target_vertices=target_vertices,
         target_triangles=articulation._triangles,
-        prismatic_joint_axis=torch.tensor([0.0, 1.0, 0.0]),
+        owning_link_vertices=articulation._vertices * 0.5,
+        owning_link_triangles=articulation._triangles,
         articulation_point_count=256,
         target_point_count=64,
     )
 
     assert set(geometry) == {
         "articulation_point_cloud",
+        "non_target_articulation_point_cloud",
         "target_link_point_cloud",
         "target_link_prismatic_joint_axis",
     }
     assert geometry["articulation_point_cloud"].shape == (256, 3)
+    assert geometry["non_target_articulation_point_cloud"].shape == (256, 3)
     assert geometry["target_link_point_cloud"].shape == (64, 3)
     assert geometry["target_link_point_cloud"].abs().max() <= 0.01 + 1.0e-6
 
@@ -4886,6 +5026,18 @@ def test_generated_usd_revolute_uses_authored_limits_and_wraps_qpos(
 
     assert limits[0].tolist() == pytest.approx([-2.6179939, 2.6179939])
     assert position.item() == pytest.approx(0.0, abs=1.0e-6)
+
+
+def test_generated_prismatic_configured_limits_are_not_scaled_twice() -> None:
+    articulation = _FakeArticulation("drawer", 0.0)
+    articulation._limits = torch.tensor([[[-0.05, 0.0]]])
+    articulation.cfg.fpath = "drawer.usdc"
+    articulation.cfg.body_scale = (0.25, 0.25, 0.25)
+    articulation.cfg.qpos_limits = {"slide_joint": [-0.05, 0.0]}
+
+    limits = _effective_joint_limits(articulation, 0, articulation._joint_info)
+
+    assert limits[0].tolist() == pytest.approx([-0.05, 0.0])
 
 
 @pytest.mark.parametrize(
@@ -4958,6 +5110,11 @@ def test_articulation_grounding_dispatches_revolute_door_to_open_door() -> None:
     assert grounded.target.open_fraction == pytest.approx(1.0)
     assert grounded.target.semantics.affordance.opening_direction == pytest.approx(-1.0)
     assert grounded.cfg["articulation_target_qpos"].item() == pytest.approx(-1.0)
+    torch.testing.assert_close(
+        grounded.motion_policy["articulation_hinge_axis_world"],
+        torch.tensor([[1.0, 0.0, 0.0]]),
+    )
+    assert grounded.motion_policy["articulation_retract_after_release"] is False
     snapshot = AtomicActionAdapter(env)._scene_snapshot(grounded, state)
     assert torch.allclose(
         snapshot.articulation_joints[("cabinet", "slide_joint")].position,

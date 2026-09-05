@@ -50,7 +50,7 @@ from embodichain.lab.sim.atomic_actions import (
 from embodichain.utils import logger as project_logger
 from embodichain.utils.logger import log_info, log_warning
 
-from .actions import AtomicActionAdapter
+from .actions import AtomicActionAdapter, _WaypointProgressGate
 from .articulation import _effective_joint_position, _scene_entity
 from .frames import DIRECTIONAL_RELATIONS, robot_frame_axes
 from .grounding import ActionGrounder, LiveArrangementPlan, LivePlacementPlan
@@ -3008,6 +3008,7 @@ class ProgramExecutor:
         planning_failed = torch.zeros_like(failed)
         action_class = str(edge.actions[0]["atomic_action_class"])
         capability = self.adapter.capabilities.get(action_class)
+        interaction_kind = capability.target_materializer
         for arm in outcomes:
             if not bool(masks[arm].any()):
                 continue
@@ -3058,9 +3059,69 @@ class ProgramExecutor:
         trajectory = self._with_articulation_grasp_settle(
             trajectory,
             outcomes=outcomes,
-            action_class=action_class,
+            interaction_kind=interaction_kind,
         )
         active = assigned & action_success & ~failed & ~planning_failed
+        progress_gate = self._open_door_progress_gate(
+            outcomes,
+            interaction_kind=interaction_kind,
+            active=active,
+        )
+        holding_waypoint: int | None = None
+        motion_waypoint: int | None = None
+        pregrasp_friction: float | None = None
+        motion_friction: float | None = None
+        holding_friction: float | None = None
+        friction_transitions: list[dict[str, Any]] = []
+        if interaction_kind == "open_door":
+            present = [outcome for outcome in outcomes.values() if outcome is not None]
+            if present:
+                segments = present[0].planner_trace.get("action_segments", {})
+                open_segment = (
+                    segments.get("open") if isinstance(segments, Mapping) else None
+                )
+                holding_segment = (
+                    segments.get("interaction_settle", open_segment)
+                    if isinstance(segments, Mapping)
+                    else None
+                )
+                grasp_segment = (
+                    segments.get("grasp_settle", segments.get("close"))
+                    if isinstance(segments, Mapping)
+                    else None
+                )
+
+                def friction_value(name: str) -> float | None:
+                    value = present[0].grounded.motion_policy.get(name)
+                    if value is None:
+                        return None
+                    if isinstance(value, bool) or not isinstance(value, (int, float)):
+                        raise TypeError(f"{name} must be a real number.")
+                    result = float(value)
+                    if not np.isfinite(result) or result < 0.0:
+                        raise ValueError(f"{name} must be finite and non-negative.")
+                    return result
+
+                pregrasp_friction = friction_value("articulation_pregrasp_friction")
+                motion_friction = friction_value("articulation_motion_friction")
+                holding_friction = friction_value("articulation_holding_friction")
+                if isinstance(grasp_segment, Mapping) and motion_friction is not None:
+                    motion_waypoint = int(grasp_segment["stop"]) - 1
+                if (
+                    isinstance(holding_segment, Mapping)
+                    and holding_friction is not None
+                ):
+                    holding_waypoint = int(holding_segment["stop"]) - 1
+        if pregrasp_friction is not None:
+            friction_transitions.append(
+                self._set_articulation_joint_friction(
+                    grounded_items[0],
+                    active=active,
+                    friction=pregrasp_friction,
+                    waypoint_index=-1,
+                    reason="pregrasp_latch",
+                )
+            )
         observation_points: dict[int, list[str]] = {}
         execution_observations: dict[str, dict[str, torch.Tensor]] = {}
         for outcome in outcomes.values():
@@ -3070,10 +3131,27 @@ class ProgramExecutor:
             observed_segments = set(
                 diagnostics.get("execution_observation_segments", ())
             )
-            if action_class == "Slide":
-                observed_segments.update({"close", "pull", "push"})
-            elif action_class == "OpenDoor":
-                observed_segments.update({"close", "open"})
+            if interaction_kind == "slide":
+                observed_segments.update(
+                    {
+                        "close",
+                        "grasp_settle",
+                        "pull",
+                        "push",
+                        "interaction_settle",
+                        "open",
+                    }
+                )
+            elif interaction_kind == "open_door":
+                observed_segments.update(
+                    {
+                        "close",
+                        "grasp_settle",
+                        "open",
+                        "interaction_settle",
+                        "release",
+                    }
+                )
             for name, segment in outcome.planner_trace.get(
                 "action_segments", {}
             ).items():
@@ -3088,16 +3166,59 @@ class ProgramExecutor:
                     step.object_uid,
                     grounded=grounded_items[0],
                 )
+            if (
+                motion_waypoint is not None
+                and waypoint_index == motion_waypoint
+                and motion_friction is not None
+            ):
+                friction_transitions.append(
+                    self._set_articulation_joint_friction(
+                        grounded_items[0],
+                        active=active,
+                        friction=motion_friction,
+                        waypoint_index=waypoint_index,
+                        reason="grasp_established",
+                    )
+                )
+            if (
+                holding_waypoint is not None
+                and waypoint_index == holding_waypoint
+                and holding_friction is not None
+            ):
+                holding_transition = self._hold_open_articulation_at_target(
+                    grounded_items[0],
+                    active=active,
+                    friction=holding_friction,
+                    waypoint_index=waypoint_index,
+                )
+                if holding_transition is not None:
+                    friction_transitions.append(holding_transition)
 
-        actions = (
-            self.adapter.execute_trajectory(
-                trajectory,
-                active=active,
-                waypoint_observer=observe_waypoint,
-            )
-            if observation_points
-            else self.adapter.execute_trajectory(trajectory, active=active)
+        execute_kwargs: dict[str, Any] = {"active": active}
+        if (
+            observation_points
+            or motion_waypoint is not None
+            or holding_waypoint is not None
+        ):
+            execute_kwargs["waypoint_observer"] = observe_waypoint
+        if progress_gate is not None:
+            execute_kwargs["waypoint_progress_gate"] = progress_gate
+        actions = self.adapter.execute_trajectory(
+            trajectory,
+            **execute_kwargs,
         )
+        if progress_gate is not None:
+            for outcome in outcomes.values():
+                if outcome is not None:
+                    outcome.planner_trace["articulation_progress_sync"] = (
+                        progress_gate.trace
+                    )
+        if friction_transitions:
+            for outcome in outcomes.values():
+                if outcome is not None:
+                    outcome.planner_trace["articulation_friction_transitions"] = (
+                        friction_transitions
+                    )
         if execution_observations:
             for outcome in outcomes.values():
                 if outcome is not None:
@@ -3332,10 +3453,10 @@ class ProgramExecutor:
         trajectory: torch.Tensor,
         *,
         outcomes: Mapping[str, ActionOutcome | None],
-        action_class: str,
+        interaction_kind: str,
     ) -> torch.Tensor:
         """Hold the planned close pose so physical arm and hand drives converge."""
-        if action_class != "Slide":
+        if interaction_kind not in {"slide", "open_door"}:
             return trajectory
         present = [outcome for outcome in outcomes.values() if outcome is not None]
         if not present:
@@ -3383,6 +3504,214 @@ class ProgramExecutor:
             outcome.planner_trace["action_segments"] = shifted
             outcome.planner_trace["articulation_grasp_settle_steps"] = settle_steps
         return extended
+
+    def _open_door_progress_gate(
+        self,
+        outcomes: Mapping[str, ActionOutcome | None],
+        *,
+        interaction_kind: str,
+        active: torch.Tensor,
+    ) -> _WaypointProgressGate | None:
+        """Synchronize the planned door arc with measured hinge progress."""
+        if interaction_kind != "open_door":
+            return None
+        present = [outcome for outcome in outcomes.values() if outcome is not None]
+        if not present:
+            return None
+        grounded = present[0].grounded
+        policy = grounded.motion_policy
+        enabled = policy.get("articulation_progress_sync_enabled", False)
+        if type(enabled) is not bool:
+            raise TypeError("articulation_progress_sync_enabled must be a bool.")
+        if not enabled:
+            return None
+        segments = present[0].planner_trace.get("action_segments", {})
+        open_segment = segments.get("open") if isinstance(segments, Mapping) else None
+        if not isinstance(open_segment, Mapping):
+            raise ValueError("OpenDoor progress sync requires an open segment.")
+        start = int(open_segment.get("start", -1))
+        stop = int(open_segment.get("stop", -1))
+        if start < 0 or stop - start < 2:
+            raise ValueError("OpenDoor progress sync requires at least two waypoints.")
+        maximum_repeats = policy.get(
+            "articulation_progress_sync_max_repeats",
+            50,
+        )
+        if type(maximum_repeats) is not int or maximum_repeats < 1:
+            raise ValueError(
+                "articulation_progress_sync_max_repeats must be a positive integer."
+            )
+        tolerance_value = policy.get("articulation_progress_sync_tolerance", 0.03)
+        if isinstance(tolerance_value, bool) or not isinstance(
+            tolerance_value,
+            (int, float),
+        ):
+            raise TypeError("articulation_progress_sync_tolerance must be a number.")
+        tolerance = float(tolerance_value)
+        if not np.isfinite(tolerance) or tolerance < 0.0:
+            raise ValueError(
+                "articulation_progress_sync_tolerance must be finite and non-negative."
+            )
+        joint_name = policy.get("articulation_joint_name")
+        if not isinstance(joint_name, str) or not joint_name:
+            raise ValueError("OpenDoor progress sync requires a joint name.")
+        articulation = self.env.sim.get_articulation(grounded.object_uid)
+        if articulation is None or joint_name not in articulation.joint_names:
+            raise ValueError("OpenDoor progress-sync articulation is unavailable.")
+        joint_id = articulation.joint_names.index(joint_name)
+        backend_entities = getattr(
+            articulation,
+            "_entities",
+            getattr(articulation, "entities", ()),
+        )
+        if not backend_entities:
+            raise ValueError("OpenDoor progress sync requires backend metadata.")
+        joint_info = backend_entities[0].get_joint_info(joint_name)
+
+        def qpos_vector(name: str) -> torch.Tensor:
+            value = policy.get(name)
+            if value is None:
+                raise ValueError(f"OpenDoor progress sync requires {name}.")
+            result = torch.as_tensor(
+                value,
+                dtype=torch.float32,
+                device=self.env.device,
+            ).reshape(-1)
+            if result.numel() == 1 and int(self.env.num_envs) > 1:
+                result = result.expand(int(self.env.num_envs)).clone()
+            if result.shape != (int(self.env.num_envs),):
+                raise ValueError(
+                    f"OpenDoor progress sync {name} has an invalid batch shape."
+                )
+            if not bool(torch.isfinite(result).all()):
+                raise ValueError(f"OpenDoor progress sync {name} must be finite.")
+            return result
+
+        initial = qpos_vector("articulation_initial_qpos")
+        target = qpos_vector("articulation_target_qpos")
+        direction = torch.sign(target - initial)
+        if bool((active & (direction == 0.0)).any()):
+            raise ValueError("OpenDoor progress sync requires non-zero target motion.")
+        trace: dict[str, Any] = {
+            "policy": "repeat_existing_waypoint_until_live_joint_progress",
+            "initial_qpos": initial.detach().cpu().tolist(),
+            "target_qpos": target.detach().cpu().tolist(),
+            "tolerance": tolerance,
+            "maximum_repeats": maximum_repeats,
+        }
+
+        def needs_repeat(waypoint_index: int) -> torch.Tensor:
+            fraction = float(waypoint_index - start + 1) / float(stop - start)
+            expected = initial + (target - initial) * fraction
+            observed = _effective_joint_position(
+                articulation,
+                joint_id,
+                joint_info,
+            ).to(device=self.env.device)
+            trace["last_observed_qpos"] = observed.detach().cpu().tolist()
+            trace["last_expected_qpos"] = expected.detach().cpu().tolist()
+            return active & (direction * (observed - expected) < -tolerance)
+
+        return _WaypointProgressGate(
+            start=start,
+            stop=stop,
+            maximum_repeats=maximum_repeats,
+            needs_repeat=needs_repeat,
+            trace=trace,
+        )
+
+    def _set_articulation_joint_friction(
+        self,
+        grounded: GroundedAction,
+        *,
+        active: torch.Tensor,
+        friction: float,
+        waypoint_index: int,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Apply one segment-boundary joint-friction transition."""
+        joint_name = grounded.motion_policy.get("articulation_joint_name")
+        if not isinstance(joint_name, str) or not joint_name:
+            raise ValueError("Articulation friction requires a grounded joint name.")
+        articulation = self.env.sim.get_articulation(grounded.object_uid)
+        if articulation is None or joint_name not in articulation.joint_names:
+            raise ValueError("Articulation friction target is unavailable.")
+        env_ids = torch.nonzero(active, as_tuple=False).flatten().tolist()
+        if env_ids:
+            joint_id = articulation.joint_names.index(joint_name)
+            articulation.set_joint_drive(
+                friction=torch.full(
+                    (len(env_ids), 1),
+                    friction,
+                    dtype=torch.float32,
+                    device=self.env.device,
+                ),
+                drive_type="none",
+                joint_ids=[joint_id],
+                env_ids=env_ids,
+            )
+        return {
+            "waypoint_index": waypoint_index,
+            "joint_name": joint_name,
+            "friction": friction,
+            "env_ids": env_ids,
+            "reason": reason,
+            "direct_qpos_write": False,
+        }
+
+    def _hold_open_articulation_at_target(
+        self,
+        grounded: GroundedAction,
+        *,
+        active: torch.Tensor,
+        friction: float,
+        waypoint_index: int,
+    ) -> dict[str, Any] | None:
+        """Latch only rows that physically reached the grounded door target."""
+        joint_name = grounded.motion_policy.get("articulation_joint_name")
+        target_value = grounded.motion_policy.get("articulation_target_qpos")
+        if not isinstance(joint_name, str) or target_value is None:
+            raise ValueError("OpenDoor holding requires a grounded joint target.")
+        articulation = self.env.sim.get_articulation(grounded.object_uid)
+        if articulation is None or joint_name not in articulation.joint_names:
+            raise ValueError("OpenDoor holding target articulation is unavailable.")
+        joint_id = articulation.joint_names.index(joint_name)
+        backend_entities = getattr(
+            articulation,
+            "_entities",
+            getattr(articulation, "entities", ()),
+        )
+        if not backend_entities:
+            raise ValueError("OpenDoor holding requires backend joint metadata.")
+        joint_info = backend_entities[0].get_joint_info(joint_name)
+        observed = _effective_joint_position(
+            articulation,
+            joint_id,
+            joint_info,
+        ).to(device=self.env.device)
+        target = torch.as_tensor(
+            target_value,
+            dtype=observed.dtype,
+            device=observed.device,
+        ).reshape(-1)
+        if target.numel() == 1 and observed.numel() > 1:
+            target = target.expand_as(observed)
+        if target.shape != observed.shape:
+            raise ValueError("OpenDoor holding target batch shape is invalid.")
+        tolerance = float(grounded.motion_policy.get("postcondition_tolerance", 0.03))
+        reached = active & (torch.abs(observed - target) <= tolerance)
+        if not bool(reached.any()):
+            return None
+        transition = self._set_articulation_joint_friction(
+            grounded,
+            active=reached,
+            friction=friction,
+            waypoint_index=waypoint_index,
+            reason="open_target_reached",
+        )
+        transition["observed_qpos"] = observed.detach().cpu().tolist()
+        transition["target_qpos"] = target.detach().cpu().tolist()
+        return transition
 
     def _plan_live_hold(
         self,
@@ -4586,9 +4915,21 @@ class ProgramExecutor:
         step: SemanticStep,
         grounded: GroundedAction,
     ) -> None:
+        existing = self._policies.get(step.id, {})
+        incoming = dict(grounded.motion_policy)
+        if (
+            step.postcondition.get("type") == "articulation_joint_near"
+            and "articulation_joint_name" in existing
+        ):
+            if "articulation_joint_name" in incoming:
+                # A retry keeps the entry state used to prove action-caused motion.
+                incoming.pop("articulation_initial_qpos", None)
+            else:
+                # Cleanup actions cannot weaken the interaction verifier contract.
+                incoming.pop("postcondition_tolerance", None)
         self._policies[step.id] = {
-            **self._policies.get(step.id, {}),
-            **grounded.motion_policy,
+            **existing,
+            **incoming,
         }
         target = grounded.target_object_pose
         if target is not None:

@@ -74,6 +74,7 @@ _RIGID_ATTRS = {
     if key not in {"max_convex_hull_num", "acd_method"}
 }
 _DEFAULT_BODY_SCALE = tuple(float(value) for value in _SCENE_DEFAULTS["body_scale"])
+_ARTICULATION_SUPPORT_CLEARANCE = 0.003
 
 
 @dataclass(frozen=True)
@@ -191,6 +192,19 @@ def prepare_scene(
         ),
         None,
     )
+    support_surface_z = (
+        source_table.get("support_surface_z")
+        if isinstance(source_table, Mapping)
+        else None
+    )
+    if isinstance(support_surface_z, bool) or not isinstance(
+        support_surface_z, (int, float)
+    ):
+        support_surface_z = None
+    elif not math.isfinite(float(support_surface_z)):
+        support_surface_z = None
+    else:
+        support_surface_z = float(support_surface_z)
     if source_scene_xy_translation is not None:
         if len(source_scene_xy_translation) != 2 or any(
             not math.isfinite(float(value)) for value in source_scene_xy_translation
@@ -216,6 +230,7 @@ def prepare_scene(
     runtime_sections: dict[str, list[dict[str, Any]]] = {
         section: [] for section in _SCENE_SECTIONS
     }
+    articulation_origin_corrections: dict[str, dict[str, Any]] = {}
     asset_hashes: dict[str, str] = {}
     for role, source_config in source_entries:
         source_uid = _require_uid(source_config, role=role)
@@ -231,6 +246,29 @@ def prepare_scene(
             requested=requested_scale,
         )
         _apply_world_z_rotation(normalized, rotation)
+        if role == "articulation" and resolved_source.is_prompt2scene:
+            source_z = float(normalized["init_pos"][2])
+            correction = _legacy_z_up_articulation_origin_correction(normalized)
+            if correction > 0.0:
+                support_lift = (
+                    max(
+                        0.0,
+                        support_surface_z + _ARTICULATION_SUPPORT_CLEARANCE - source_z,
+                    )
+                    if support_surface_z is not None
+                    else 0.0
+                )
+                normalized["init_pos"][2] = source_z + correction + support_lift
+                articulation_origin_corrections[normalized["uid"]] = {
+                    "policy": "legacy_scene_engine_z_up_support_floor_v2",
+                    "source_init_z": source_z,
+                    "runtime_init_z": float(normalized["init_pos"][2]),
+                    "origin_offset": correction,
+                    "support_surface_z": support_surface_z,
+                    "support_clearance": _ARTICULATION_SUPPORT_CLEARANCE,
+                    "support_lift": support_lift,
+                    "z_offset": correction + support_lift,
+                }
         shape = normalized.get("shape")
         if isinstance(shape, Mapping) and shape.get("fpath"):
             asset_hashes[normalized["uid"]] = _file_hash(Path(str(shape["fpath"])))
@@ -263,6 +301,7 @@ def prepare_scene(
         body_scale=tuple(requested_scale),
         asset_hashes=asset_hashes,
         source_scene_xy_translation=resolved_xy_translation,
+        articulation_origin_corrections=articulation_origin_corrections,
     )
 
 
@@ -742,6 +781,21 @@ def _runtime_object(config: Mapping[str, Any], *, role: str) -> dict[str, Any]:
         # path and pose normalization instead of guessing a reduced schema.
         result = deepcopy(dict(config))
         result.pop("description", None)
+        if "init_qpos" not in result:
+            joint_count = _generated_active_joint_count(result)
+            if joint_count:
+                result["init_qpos"] = [0.0] * joint_count
+        joint_limits = _generated_joint_limits(result)
+        if joint_limits:
+            result.setdefault("qpos_limits", joint_limits)
+        result.setdefault(
+            "drive_pros",
+            {"drive_type": "none"},
+        )
+        attrs = deepcopy(dict(result.get("attrs", {})))
+        attrs.setdefault("static_friction", 1.0)
+        attrs.setdefault("dynamic_friction", 1.0)
+        result["attrs"] = attrs
         return result
 
     result = {
@@ -812,6 +866,120 @@ def _estimate_mesh_top_z(config: Mapping[str, Any]) -> float | None:
         # Mesh bounds improve robot placement but are not needed to preserve the
         # exported scene. The robot builder has a conservative tabletop fallback.
         return None
+
+
+def _generated_active_joint_count(config: Mapping[str, Any]) -> int:
+    """Return the number of active revolute and prismatic joints in one USD."""
+    path = Path(str(config.get("fpath", "")))
+    if path.suffix.lower() not in {".usd", ".usda", ".usdc"} or not path.is_file():
+        return 0
+    try:
+        from pxr import Usd, UsdPhysics
+
+        stage = Usd.Stage.Open(path.as_posix())
+    except (ImportError, RuntimeError):
+        return 0
+    if stage is None:
+        return 0
+    return sum(
+        prim.IsA(UsdPhysics.PrismaticJoint) or prim.IsA(UsdPhysics.RevoluteJoint)
+        for prim in stage.Traverse()
+    )
+
+
+def _generated_joint_limits(config: Mapping[str, Any]) -> dict[str, list[float]]:
+    """Return generated USD active-joint limits in runtime SI/radian units."""
+    path = Path(str(config.get("fpath", "")))
+    if path.suffix.lower() not in {".usd", ".usda", ".usdc"} or not path.is_file():
+        return {}
+    try:
+        from pxr import Usd, UsdPhysics
+
+        stage = Usd.Stage.Open(path.as_posix())
+    except (ImportError, RuntimeError):
+        return {}
+    if stage is None:
+        return {}
+    scale = _vector3(config.get("body_scale", (1.0, 1.0, 1.0)))
+    axis_indices = {"X": 0, "Y": 1, "Z": 2}
+    result: dict[str, list[float]] = {}
+    for prim in stage.Traverse():
+        is_prismatic = prim.IsA(UsdPhysics.PrismaticJoint)
+        is_revolute = prim.IsA(UsdPhysics.RevoluteJoint)
+        if not is_prismatic and not is_revolute:
+            continue
+        lower = prim.GetAttribute("physics:lowerLimit").Get()
+        upper = prim.GetAttribute("physics:upperLimit").Get()
+        if lower is None or upper is None:
+            continue
+        lower = float(lower)
+        upper = float(upper)
+        if is_revolute:
+            lower = math.radians(lower)
+            upper = math.radians(upper)
+        else:
+            axis = str(prim.GetAttribute("physics:axis").Get() or "X").upper()
+            if axis not in axis_indices:
+                raise ValueError(
+                    f"Generated prismatic joint {prim.GetPath()} has unsupported "
+                    f"axis {axis!r}."
+                )
+            joint_scale = scale[axis_indices[axis]]
+            lower *= joint_scale
+            upper *= joint_scale
+        if not math.isfinite(lower) or not math.isfinite(upper) or lower >= upper:
+            raise ValueError(
+                f"Generated joint {prim.GetPath()} requires finite ordered limits."
+            )
+        authored_name = prim.GetAttribute("articraft:name").Get()
+        joint_name = str(authored_name or prim.GetName()).strip()
+        if not joint_name or joint_name in result:
+            raise ValueError(
+                f"Generated USD has an invalid or duplicate joint name {joint_name!r}."
+            )
+        result[joint_name] = [lower, upper]
+    return result
+
+
+def _legacy_z_up_articulation_origin_correction(
+    config: Mapping[str, Any],
+) -> float:
+    """Return the scaled bottom-origin correction authored by Scene Engine."""
+    path = Path(str(config.get("fpath", "")))
+    if path.suffix.lower() not in {".usd", ".usda", ".usdc"} or not path.is_file():
+        return 0.0
+    try:
+        from pxr import Usd, UsdGeom
+
+        stage = Usd.Stage.Open(path.as_posix())
+    except (ImportError, RuntimeError):
+        return 0.0
+    if stage is None or UsdGeom.GetStageUpAxis(stage) != UsdGeom.Tokens.z:
+        return 0.0
+    root = stage.GetDefaultPrim()
+    if not root or not root.IsValid():
+        return 0.0
+    if not any(
+        op.GetOpName() == "xformOp:translate:scene_engine_bottom_center"
+        for op in UsdGeom.Xformable(root).GetOrderedXformOps()
+    ):
+        return 0.0
+    bounds = (
+        UsdGeom.BBoxCache(
+            Usd.TimeCode.Default(),
+            [UsdGeom.Tokens.default_, UsdGeom.Tokens.render, UsdGeom.Tokens.proxy],
+        )
+        .ComputeLocalBound(root)
+        .ComputeAlignedBox()
+    )
+    if bounds.IsEmpty():
+        return 0.0
+    minimum_z = float(bounds.GetMin()[2])
+    if minimum_z >= -1.0e-6:
+        return 0.0
+    scale = _vector3(config.get("body_scale", (1.0, 1.0, 1.0)))
+    correction = -minimum_z * scale[2]
+    return correction if math.isfinite(correction) else 0.0
 
 
 def _vector3(value: Any) -> list[float]:

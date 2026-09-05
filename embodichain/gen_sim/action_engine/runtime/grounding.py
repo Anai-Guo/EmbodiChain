@@ -176,6 +176,19 @@ def _world_vertices(entity: Any, env: Any, env_id: int) -> torch.Tensor:
     return torch.cat(world_vertices, dim=0)
 
 
+def _table_surface_z(env: Any) -> torch.Tensor | None:
+    """Return the live tabletop height for every vectorized environment."""
+    table = _scene_entity(env.sim, "table")
+    if table is None:
+        return None
+    return torch.stack(
+        [
+            _world_vertices(table, env, env_id)[:, 2].max()
+            for env_id in range(int(env.num_envs))
+        ]
+    )
+
+
 @dataclass(frozen=True)
 class _Geometry:
     radius: torch.Tensor
@@ -2366,10 +2379,22 @@ class ActionGrounder:
                 "Batched Slide environments require one shared translation distance."
             )
         scoped_policy = dict(policy)
+        support_surface_z = _table_surface_z(self.env)
+        commanded_distance = float(distances[0])
+        if _is_usd_articulation(articulation):
+            overtravel = scoped_policy.get("articulation_contact_overtravel", 0.0)
+            if isinstance(overtravel, bool) or not isinstance(overtravel, (int, float)):
+                raise TypeError("articulation_contact_overtravel must be a number.")
+            overtravel = float(overtravel)
+            if not math.isfinite(overtravel) or overtravel < 0.0:
+                raise ValueError(
+                    "articulation_contact_overtravel must be finite and non-negative."
+                )
+            commanded_distance += overtravel
         scoped_policy.update(
             {
                 "direction": direction,
-                "translation_distance": float(distances[0]),
+                "translation_distance": commanded_distance,
                 "articulation_joint_name": joint_name,
                 "articulation_joint_id": joint_id,
                 "articulation_target_link_name": contact_link,
@@ -2377,6 +2402,7 @@ class ActionGrounder:
                 "articulation_initial_qpos": qpos,
                 "articulation_target_qpos": target_qpos,
                 "articulation_push_axis_world": push_world,
+                "interaction_support_surface_z": support_surface_z,
             }
         )
         left_base, right_base = arm_base_poses(self.env)
@@ -2398,12 +2424,27 @@ class ActionGrounder:
             cache_key = (step.object_uid, contact_link, mesh_name)
             sampled = self._interaction_geometry_cache.get(cache_key)
             if sampled is None:
+                owning_link_geometry = (
+                    None
+                    if mesh_name is None
+                    else _named_link_geometry(
+                        articulation,
+                        contact_link,
+                        excluded_mesh_names=(mesh_name,),
+                    )
+                )
+                if owning_link_geometry is None:
+                    raise ValueError(
+                        "Slide generated USD target requires non-handle owning-link "
+                        "geometry for neighborhood-axis inference."
+                    )
                 sampled = _sample_interaction_point_clouds(
                     articulation,
                     contact_link,
                     target_vertices=vertices,
                     target_triangles=triangles,
-                    prismatic_joint_axis=push_local[0],
+                    owning_link_vertices=owning_link_geometry[0],
+                    owning_link_triangles=owning_link_geometry[1],
                 )
                 self._interaction_geometry_cache[cache_key] = sampled
             geometry.update(sampled)
@@ -2555,6 +2596,12 @@ class ActionGrounder:
         if not torch.all(opening_direction == opening_direction[:1]):
             raise ValueError("Batched doors require one shared opening direction.")
         affordance.opening_direction = int(opening_direction[0].item())
+        log_info(
+            f"OpenDoor geometry {step.id}: joint={joint_name!r}, "
+            f"link={target_link!r}, axis={affordance.rotation_axis.tolist()}, "
+            f"origin={list(affordance.axis_origin)}, "
+            f"body_scale={list(getattr(articulation.cfg, 'body_scale', (1, 1, 1)))}."
+        )
         target_state = str(step.goal.get("target_state", ""))
         if target_state != "open":
             raise ValueError("OpenDoor grounding requires target_state open.")
@@ -2567,6 +2614,20 @@ class ActionGrounder:
             articulation.get_link_pose(target_link, to_matrix=True),
             self.env,
         )
+        hinge_axis_local = torch.as_tensor(
+            affordance.rotation_axis,
+            dtype=handle_pose.dtype,
+            device=handle_pose.device,
+        )
+        hinge_axis_world = torch.matmul(handle_pose[:, :3, :3], hinge_axis_local)
+        hinge_axis_world = hinge_axis_world / torch.linalg.vector_norm(
+            hinge_axis_world,
+            dim=1,
+            keepdim=True,
+        )
+        vertical_hinge = torch.abs(hinge_axis_world[:, 2]) > 0.25
+        if not torch.all(vertical_hinge == vertical_hinge[:1]):
+            raise ValueError("Batched doors require one shared hinge orientation.")
         semantics = ObjectSemantics(
             affordance=affordance,
             geometry={},
@@ -2574,6 +2635,7 @@ class ActionGrounder:
             label=f"{step.object_uid}:{target_link}",
         )
         scoped_policy = dict(policy)
+        support_surface_z = _table_surface_z(self.env)
         scoped_policy.setdefault("joint_position_tolerance", 1.0e-3)
         scoped_policy.update(
             {
@@ -2583,6 +2645,9 @@ class ActionGrounder:
                 "articulation_target_mesh_name": mesh_name,
                 "articulation_initial_qpos": qpos,
                 "articulation_target_qpos": target_qpos,
+                "articulation_hinge_axis_world": hinge_axis_world,
+                "articulation_retract_after_release": bool(vertical_hinge[0]),
+                "interaction_support_surface_z": support_surface_z,
             }
         )
         return (

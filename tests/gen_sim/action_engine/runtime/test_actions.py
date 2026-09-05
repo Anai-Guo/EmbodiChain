@@ -29,6 +29,7 @@ import torch
 from embodichain.gen_sim.action_engine.capabilities import HeldObjectHandOver
 from embodichain.gen_sim.action_engine.runtime import actions
 from embodichain.gen_sim.action_engine.runtime.atomic_compat import (
+    _ActionEngineOpenDoor,
     ActionEngineMoveJoints,
     ExactTargetMoveHeldObject,
 )
@@ -216,7 +217,7 @@ def test_adapter_registers_gen_sim_compat_actions(
     adapter = AtomicActionAdapter(_planner_env())
     monkeypatch.setattr(actions, "AtomicActionEngine", Engine)
     monkeypatch.setattr(adapter, "_generator", lambda: object())
-    monkeypatch.setattr(adapter, "_control_profiles", lambda: {})
+    monkeypatch.setattr(adapter, "_control_profiles", lambda **_kwargs: {})
     monkeypatch.setattr(adapter, "_grasp_pose_generators", lambda **_kwargs: {})
 
     engine = adapter._engine()
@@ -225,6 +226,7 @@ def test_adapter_registers_gen_sim_compat_actions(
     assert registered == [
         (ExactTargetMoveHeldObject, True),
         (ActionEngineMoveJoints, True),
+        (_ActionEngineOpenDoor, True),
         (HeldObjectHandOver, True),
     ]
 
@@ -987,7 +989,9 @@ def test_control_profiles_use_selected_gripper_joint_semantics(
         ),
     )
 
-    profiles = AtomicActionAdapter(env)._control_profiles()
+    adapter = AtomicActionAdapter(env)
+    profiles = adapter._control_profiles()
+    interaction_profiles = adapter._control_profiles(articulation_interaction=True)
 
     assert set(profiles) == {"physical_left_eef", "physical_right_eef"}
     for command_profile in profiles.values():
@@ -1005,6 +1009,122 @@ def test_control_profiles_use_selected_gripper_joint_semantics(
         torch.testing.assert_close(
             grasp_qpos[0], torch.tensor(selected.close_positions)
         )
+    for command_profile in interaction_profiles.values():
+        open_qpos = command_profile.commands["open"].resolve(
+            num_envs=1,
+            control_dof=hand_dof,
+            device="cpu",
+        )
+        torch.testing.assert_close(
+            open_qpos[0],
+            torch.tensor(selected.articulation_open_positions),
+        )
+
+
+def test_articulation_release_restores_the_fully_open_gripper_state() -> None:
+    adapter = object.__new__(AtomicActionAdapter)
+    adapter.device = torch.device("cpu")
+    adapter.env = SimpleNamespace(
+        open_state=torch.tensor([0.0, 0.0]),
+        robot=SimpleNamespace(get_joint_ids=lambda *, name: [1, 2]),
+    )
+    adapter._parts = lambda _arm: ("arm", "hand", 2)
+    positions = torch.tensor(
+        [[[9.0, 0.7, -0.7], [8.0, 0.7, -0.7], [7.0, 0.4, -0.4], [6.0, 0.4, -0.4]]]
+    )
+    plan = SimpleNamespace(segments=(SimpleNamespace(name="open", start=1, stop=3),))
+    grounded = GroundedAction(
+        action_class="Slide",
+        arm="left_arm",
+        control="arm",
+        target=None,
+        cfg={},
+    )
+
+    result = adapter._with_full_articulation_release(
+        positions,
+        plan=plan,
+        grounded=grounded,
+        capability=SimpleNamespace(target_materializer="slide"),
+    )
+
+    torch.testing.assert_close(result[0, 1, 1:], torch.tensor([0.7, -0.7]))
+    torch.testing.assert_close(result[0, 2, 1:], torch.tensor([0.0, 0.0]))
+    torch.testing.assert_close(result[0, 3], positions[0, 3])
+
+    door_plan = SimpleNamespace(
+        segments=(
+            SimpleNamespace(name="release", start=1, stop=3),
+            SimpleNamespace(name="retract", start=3, stop=4),
+        )
+    )
+    drop_down_door = replace(
+        grounded,
+        action_class="OpenDoor",
+        motion_policy={"articulation_retract_after_release": False},
+    )
+    door_result = adapter._with_full_articulation_release(
+        positions,
+        plan=door_plan,
+        grounded=drop_down_door,
+        capability=SimpleNamespace(target_materializer="open_door"),
+    )
+    assert door_result.shape == (1, 3, 3)
+    torch.testing.assert_close(door_result[0, -1, 1:], torch.tensor([0.0, 0.0]))
+
+    side_hinged_door = replace(
+        grounded,
+        action_class="OpenDoor",
+        motion_policy={"articulation_retract_after_release": True},
+    )
+    door_with_retract = adapter._with_full_articulation_release(
+        positions,
+        plan=door_plan,
+        grounded=side_hinged_door,
+        capability=SimpleNamespace(target_materializer="open_door"),
+    )
+    assert door_with_retract.shape == positions.shape
+
+
+def test_waypoint_progress_gate_repeats_existing_commands_without_qpos_writes() -> None:
+    class Env:
+        physics_dt = 0.01
+
+        def __init__(self) -> None:
+            self.robot = SimpleNamespace(
+                get_qpos=lambda: torch.zeros((1, 1), dtype=torch.float32)
+            )
+            self.step_count = 0
+
+        def step(self, _command: torch.Tensor) -> None:
+            self.step_count += 1
+
+    env = Env()
+    adapter = object.__new__(AtomicActionAdapter)
+    adapter.env = env
+    adapter.num_envs = 1
+    adapter._scene_time = 0.0
+    trace: dict[str, Any] = {}
+    gate = actions._WaypointProgressGate(
+        start=0,
+        stop=2,
+        maximum_repeats=5,
+        needs_repeat=lambda index: torch.tensor([index == 0 and env.step_count < 4]),
+        trace=trace,
+    )
+
+    commands = adapter.execute_trajectory(
+        torch.zeros((1, 3, 1), dtype=torch.float32),
+        active=torch.tensor([True]),
+        waypoint_progress_gate=gate,
+    )
+
+    assert len(commands) == 6
+    assert env.step_count == 6
+    assert trace["repeated_waypoints"] == [
+        {"waypoint_index": 0, "repeats": 3, "timed_out_env_ids": []}
+    ]
+    assert trace["direct_qpos_write"] is False
 
 
 def test_coordinated_grasp_generator_honors_ground_filter_policy() -> None:

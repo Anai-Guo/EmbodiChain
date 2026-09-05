@@ -85,6 +85,7 @@ class GripperProfile:
     asset_path: str
     assembly_name: str
     tcp_transform: _Transform
+    articulation_grasp_depth_offset: float
     left_control_joints: tuple[str, ...]
     right_control_joints: tuple[str, ...]
     left_state_joints: tuple[str, ...]
@@ -95,6 +96,7 @@ class GripperProfile:
     mimic_offsets: tuple[float, ...]
     simulated_joint_initial_positions: tuple[float, ...]
     open_positions: tuple[float, ...]
+    articulation_open_positions: tuple[float, ...]
     close_positions: tuple[float, ...]
     control_limits: tuple[tuple[float, float], ...]
     drive_stiffness: float
@@ -111,6 +113,7 @@ class GripperProfile:
             )
         if not (
             len(self.open_positions)
+            == len(self.articulation_open_positions)
             == len(self.close_positions)
             == len(self.control_limits)
             == control_count
@@ -120,6 +123,15 @@ class GripperProfile:
             )
         if not 0.0 < self.release_open_fraction_tolerance <= 1.0:
             raise ValueError("release_open_fraction_tolerance must be in (0, 1].")
+        if (
+            not 0.0
+            <= self.articulation_grasp_depth_offset
+            <= (0.5 * self.grasp_model.finger_length)
+        ):
+            raise ValueError(
+                "articulation_grasp_depth_offset must be non-negative and no "
+                "greater than half the gripper finger length."
+            )
         mimic_count = len(self.left_mimic_joints)
         if not (
             len(self.right_mimic_joints)
@@ -213,6 +225,7 @@ class GripperProfile:
                 for side in ("left", "right")
             },
             "open_positions": list(self.open_positions),
+            "articulation_open_positions": list(self.articulation_open_positions),
             "close_positions": list(self.close_positions),
             "control_limits": [list(limit) for limit in self.control_limits],
             "release_open_fraction_tolerance": (self.release_open_fraction_tolerance),
@@ -223,6 +236,7 @@ class GripperProfile:
                 "quaternion_order": "not_applicable",
                 "transform": [list(row) for row in self.tcp_transform],
             },
+            "articulation_grasp_depth_offset": self.articulation_grasp_depth_offset,
             "grasp_model": self.grasp_model.as_mapping(),
         }
 
@@ -242,6 +256,7 @@ _PGI_PROFILE = GripperProfile(
         (0.0, 0.0, 1.0, 0.121),
         (0.0, 0.0, 0.0, 1.0),
     ),
+    articulation_grasp_depth_offset=0.0,
     left_control_joints=("left_gripper_finger1_joint_1",),
     right_control_joints=("right_gripper_finger1_joint_1",),
     left_state_joints=("left_gripper_finger1_joint_1",),
@@ -252,6 +267,7 @@ _PGI_PROFILE = GripperProfile(
     mimic_offsets=(0.0,),
     simulated_joint_initial_positions=(0.0, 0.0),
     open_positions=(0.0,),
+    articulation_open_positions=(0.0,),
     close_positions=(0.04,),
     control_limits=((0.0, 0.04),),
     drive_stiffness=1.0e3,
@@ -281,6 +297,7 @@ _ROBOTIQ_PROFILE = GripperProfile(
         (0.0, 0.0, 1.0, 0.2),
         (0.0, 0.0, 0.0, 1.0),
     ),
+    articulation_grasp_depth_offset=0.025,
     left_control_joints=(
         "left_finger_joint",
         "left_inner_knuckle_joint",
@@ -317,6 +334,7 @@ _ROBOTIQ_PROFILE = GripperProfile(
     mimic_offsets=(0.0, 0.0, 0.0, 0.0, 0.0),
     simulated_joint_initial_positions=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
     open_positions=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+    articulation_open_positions=(0.4, -0.4, 0.4, -0.4, -0.4, 0.4),
     close_positions=(0.7, -0.7, 0.7, -0.7, -0.7, 0.7),
     control_limits=(
         (0.0, 0.7),
@@ -326,9 +344,9 @@ _ROBOTIQ_PROFILE = GripperProfile(
         (-0.8757, 0.8757),
         (-0.8757, 0.8757),
     ),
-    drive_stiffness=50.0,
-    drive_damping=5.0,
-    drive_max_effort=500.0,
+    drive_stiffness=1.0e3,
+    drive_damping=1.0e2,
+    drive_max_effort=1.0e3,
     release_open_fraction_tolerance=0.03,
     grasp_model=GraspModelSpec(
         model_id="robotiq_arg2f_140",
