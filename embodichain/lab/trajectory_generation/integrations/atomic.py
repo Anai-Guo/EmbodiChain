@@ -22,7 +22,7 @@ import math
 from typing import TYPE_CHECKING
 import torch
 
-from embodichain.lab.sim.motion.trajectory_augmentation import (
+from embodichain.lab.sim.motion.expansion import (
     TrajectoryPhase,
     TrajectoryTemplate,
 )

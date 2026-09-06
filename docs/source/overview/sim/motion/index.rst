@@ -23,18 +23,40 @@ public imports still use the normal ``lab`` and ``sim`` initialization path.
        parameterization.
    * - ``motion.workspace``
      - Offline reachability analysis, workspace caches, and runtime sampling.
-   * - ``motion.trajectory_augmentation``
+   * - ``motion.expansion``
      - Explicit qpos templates and candidates, constrained geometric and timing
        variation, measured coverage, and bounded generation accounting.
 
-The augmentation package currently provides the core contracts and operators.
-The :doc:`generation host layer </overview/trajectory_generation>` supplies
-full-batch initial-state preparation, restoration, qpos execution, and a
-synchronous episode sink. Its handwritten qpos runner collects explicitly free
-motion using measured collision/task evidence and persistence confirmations.
-Contact, held-object, and atomic-source collection remain outside this path. See the
-:doc:`augmentation API </api_reference/embodichain/embodichain.lab.sim.motion.trajectory_augmentation>`
-for the implemented boundaries.
+Trajectory augmentation provides the core contracts and operators. The
+:doc:`generation host layer </overview/trajectory_generation>` supplies
+full-batch restoration, qpos execution, measured validation and confirmed
+persistence for free motion and offline atomic PickUp sources. See the
+:doc:`augmentation API </api_reference/embodichain/embodichain.lab.sim.motion.expansion>`
+for the core boundaries.
+
+Migrating Existing Imports
+--------------------------
+
+The previous packages have moved without compatibility aliases. Update Python
+imports, string-based module references in configuration, and custom extensions:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Previous import
+     - Current import
+   * - ``embodichain.lab.sim.solvers``
+     - ``embodichain.lab.sim.motion.solvers``
+   * - ``embodichain.lab.sim.planners``
+     - ``embodichain.lab.sim.motion.planners``
+   * - ``embodichain.lab.sim.workspace``
+     - ``embodichain.lab.sim.motion.workspace``
+
+Their nested modules follow the same mapping. Solver ``class_type`` names such
+as ``URSolver`` still resolve through ``RobotCfg.from_dict()``. Existing tests
+and examples now live under ``tests/sim/motion/`` and ``examples/sim/motion/``.
+Warp kinematics kernels live under ``embodichain.compute.kinematics._warp``;
+``embodichain.utils.warp.kinematics`` retains compatibility exports.
 
 .. toctree::
    :maxdepth: 1

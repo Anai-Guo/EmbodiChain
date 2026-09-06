@@ -128,7 +128,7 @@ and the `$add-task-program` read-only deployment inspector.
 ## Atomic actions, motion planning, and IK
 
 **Paths:** `embodichain/lab/sim/atomic_actions/**`,
-`embodichain/lab/sim/motion/{planners,solvers,workspace,trajectory_augmentation}/**`,
+`embodichain/lab/sim/motion/{planners,solvers,workspace,expansion}/**`,
 and grasp utilities that feed plans.
 
 Check:

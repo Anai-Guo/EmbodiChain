@@ -21,7 +21,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from embodichain.lab.sim.motion.trajectory_augmentation import (
+from embodichain.lab.sim.motion.expansion import (
     SceneCase,
     ValidationCheck,
     ValidationResult,

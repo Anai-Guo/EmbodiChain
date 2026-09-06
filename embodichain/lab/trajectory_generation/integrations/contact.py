@@ -27,7 +27,7 @@ import numpy as np
 import torch
 
 from embodichain.utils import configclass
-from embodichain.lab.sim.motion.trajectory_augmentation import (
+from embodichain.lab.sim.motion.expansion import (
     CandidateTrajectoryBatch,
     ExpertEpisode,
     MotionSnapshot,
@@ -104,7 +104,7 @@ class PickUpContactProfile:
             raise ValueError(
                 "This PickUp profile requires two distinct gripping fingers"
             )
-        from embodichain.lab.sim.motion.trajectory_augmentation.contracts import _pose
+        from embodichain.lab.sim.motion.expansion.contracts import _pose
 
         _pose(torch.tensor(self.tcp_offset, dtype=torch.float64), "tcp_offset")
         for name in (

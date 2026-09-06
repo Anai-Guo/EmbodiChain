@@ -420,7 +420,7 @@ def test_real_cpu_robot_and_rigid_object_initial_state(
 
 
 def test_host_planning_snapshots_own_state_and_keep_physical_case_rows() -> None:
-    from embodichain.lab.sim.motion.trajectory_augmentation import (
+    from embodichain.lab.sim.motion.expansion import (
         SceneCase,
         ValidationCheck,
         ValidationResult,

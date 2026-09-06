@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from embodichain import __version__
-from embodichain.lab.sim.motion.trajectory_augmentation import (
+from embodichain.lab.sim.motion.expansion import (
     CandidateTrajectoryBatch,
     CommitReceipt,
     ExpertEpisode,

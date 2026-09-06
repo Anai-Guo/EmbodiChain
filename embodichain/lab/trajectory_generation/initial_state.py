@@ -24,7 +24,7 @@ import math
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
-from embodichain.lab.sim.motion.trajectory_augmentation import (
+from embodichain.lab.sim.motion.expansion import (
     MotionSnapshot,
     SceneCase,
     ValidationCheck,

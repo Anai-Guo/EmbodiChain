@@ -27,7 +27,7 @@ from tensordict import TensorDict
 
 from embodichain.lab.gym.envs.embodied_env import EmbodiedEnv
 from embodichain.lab.gym.utils.profiler import EnvProfiler
-from embodichain.lab.sim.motion.trajectory_augmentation import (
+from embodichain.lab.sim.motion.expansion import (
     CandidateIdentity,
     CandidateTrajectoryBatch,
     SceneCase,

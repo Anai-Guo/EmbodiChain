@@ -24,8 +24,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from embodichain.lab.sim.motion.planners import CollisionWorldInfo, MotionGenerator
-from embodichain.lab.sim.motion.trajectory_augmentation import (
+from embodichain.lab.sim.motion.motion_generator import MotionGenerator
+from embodichain.lab.sim.motion.planners import CollisionWorldInfo
+from embodichain.lab.sim.motion.expansion import (
     CandidateIdentity,
     CandidateTrajectoryBatch,
     MotionSnapshot,
@@ -45,7 +46,7 @@ def test_real_curobo_free_path_and_dynamic_obstacle_with_cpu_physics():
     pytest.importorskip("curobo")
     from embodichain.lab.sim import SimulationManager, SimulationManagerCfg
     from embodichain.lab.sim.cfg import RigidBodyAttributesCfg
-    from embodichain.lab.sim.motion.planners import MotionGenCfg
+    from embodichain.lab.sim.motion.motion_generator import MotionGenCfg
     from embodichain.lab.sim.motion.planners.curobo.curobo_planner import (
         CuroboPlannerCfg,
         CuroboWorldCfg,

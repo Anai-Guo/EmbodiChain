@@ -1,7 +1,7 @@
 # 固定场景专家轨迹扩增：实施计划
 
 - 状态：实施中；手写自由运动与离线原子 PickUp 的 direct-sim 采集闭环已落地，完整 Atomic Runtime/Gym/M1 仍待实现与验收。
-- 依据：[设计文档](fixed_scene_expert_trajectory_augmentation_design.md)，2026-09-05。
+- 依据：[设计文档](fixed_scene_expert_expansion_design.md)，2026-09-05。
 - 代码核对基线：`fb7228e2`。首批实现基于该版本，已运行 CPU 行为测试；尚未完成四组合真实仿真和性能验收。
 - 交付原则：先完成可验收、可持久化的四条执行路径，再优化吞吐，最后扩大运动覆盖。
 
@@ -9,7 +9,7 @@
 
 | 计划项 | 已实现 | 尚待实现与验收 |
 |---|---|---|
-| PR 1 | `lab.sim.motion.trajectory_augmentation`：qpos 值对象、nested 配置严格校验、GenerationSession、局部 RNG、候选与提交身份、条数/字节预算、实际关节几何去重与写入配额 | EEF 原始模板和宿主能力注册装配随实际适配器接入 |
+| PR 1 | `lab.sim.motion.expansion`：qpos 值对象、nested 配置严格校验、GenerationSession、局部 RNG、候选与提交身份、条数/字节预算、实际关节几何去重与写入配额 | EEF 原始模板和宿主能力注册装配随实际适配器接入 |
 | PR 2 的初态基础 | 全批初态复制、恢复、验证与独占 host；Gym 准备/重播种；UR5 自由运动 profile；新增四行 PickUp profile 和抓取结束后的整批循环恢复 | 任意接触 checkpoint、逐行恢复和复杂 settling 仍不支持；Gym PickUp 待验收 |
 | PR 4 的基础算子与自由段适配 | 显式自由段 `joint_residual`、retime 与阶段索引重映射、采样速度/加速度检查；`EEFPath / EnvRowMotionPlanner` 的真实 env_rows 分轮、显式 EEF 样本 IK、已解分支保留/FK 验证、自由 qpos 分段加密碰撞检查 | EEF via-point 因子生成、接触/持物/夹爪变化的完整碰撞语义与真实 backend 任务验收；离散路径检查不代表连续碰撞证明或物理成功 |
 | PR 5 的手写 qpos/free-motion 闭环 | `GenerationRunner / MotionLimitsProfile / QposRolloutExecutor` 连接 profile 身份、全批初态、sim/Gym 实际命令/观测冻结、规划与实测验收、Session 配额和 sink 确认；真实 UR5 direct-sim 正例 committed 1，Panda 锁定关节漂移负例 committed 0 | 手写 EEF/PickUp、真实 Gym 任务采集及多行/多 episode 任务验收；当前结果不代表 PR 5 全部原定验收或 M1 完成 |
@@ -21,7 +21,7 @@
 
 新增 API、测试和现有行为变更已同步对应文档及 agent context。下一步接入 Atomic Runtime 的候选消费与等价物理子步证据，再推进 Gym PickUp、via-point 因子和统一配置启动器；当前离线回放不扩大为完整原子运行时或 M1 四组合能力声明。
 
-模块归属 review 后，`solvers`、`planners`、`workspace` 与 `trajectory_augmentation` 统一归入 `embodichain.lab.sim.motion`。公共 API、测试、示例和文档使用新路径，不提供旧路径兼容包。`motion` 父包仅按需加载子包；扩增算法保持无直接 Gym/仿真 backend 依赖，但其公共导入不再承诺绕过 `lab/sim` 初始化。该调整不改变下述 M0/M1 验收要求或未完成状态。
+模块归属 review 后，`solvers`、`planners`、`workspace` 与 `expansion` 统一归入 `embodichain.lab.sim.motion`。公共 API、测试、示例和文档使用新路径，不提供旧路径兼容包。`motion` 父包仅按需加载子包；扩增算法保持无直接 Gym/仿真 backend 依赖，但其公共导入不再承诺绕过 `lab/sim` 初始化。该调整不改变下述 M0/M1 验收要求或未完成状态。
 
 首批验证记录：核心、原子动作与 Gym/Task Program 组合回归 `1006 passed, 1 skipped, 3 deselected`；补完前置写入容量预留和数值边界后，最终核心测试 `138 passed`。全仓 Black 检查通过，API 文档覆盖 `1718/1718`。Sphinx dummy 构建成功，本次新增模块无相关告警；其他模块仍有文档告警。这些是代码契约验证，不替代 M0/M1 的真实采集验收。
 
@@ -66,7 +66,7 @@ M1 的 PickUp 成功表示完成所声明的抓取任务，不表示已经实现
 
 | 已核对事实 | 实施影响与主要落点 |
 |---|---|
-| `lab/__init__.py` 会导入 sim/Gym 等子包 | 公共核心归属 `lab/sim/motion/trajectory_augmentation/`；验证算法无直接 Gym/backend 依赖，以及 motion 父包按需加载的边界 |
+| `lab/__init__.py` 会导入 sim/Gym 等子包 | 公共核心归属 `lab/sim/motion/expansion/`；验证算法无直接 Gym/backend 依赖，以及 motion 父包按需加载的边界 |
 | `configclass.validate()` 主要检查 `MISSING` | 配置加载还需显式校验未知字段、范围、单位、交叉约束和宿主能力；不修改全局 configclass 语义 |
 | [PickUp](../../embodichain/lab/sim/atomic_actions/primitives/pick_up.py) 提前筛掉 grasp 分支，预筛 IK 结果未直接用于后续轨迹 | 候选保留与已解关节目标传递需要新增接口；空 grasp 行也要覆盖 |
 | [BasePlanner](../../embodichain/lab/sim/motion/planners/base_planner.py) 批量校验绑定 `robot.num_instances` | 首版使用 `env_rows`；C 与 B 解耦由独立适配层完成，不能仅展平张量 |
@@ -88,7 +88,7 @@ embodichain/lab/sim/motion/
   planners/          # 路径、碰撞约束、时间参数化
   workspace/         # 离线可达性分析、缓存与运行时采样
 
-embodichain/lab/sim/motion/trajectory_augmentation/
+embodichain/lab/sim/motion/expansion/
   contracts.py       # case/snapshot/template/candidate/episode/receipt 与端口协议
   cfg.py             # 两类 @configclass；只持配置值及注册 ID
   operators.py       # 因子提议、自由段几何和时间变体
@@ -330,7 +330,7 @@ PR 1 合入后可并行推进宿主生命周期、sink 和规划验证三条线�
 
 | 验证层 | 建议落点及重点 |
 |---|---|
-| 纯张量核心 | 新增 `tests/sim/motion/trajectory_augmentation/`：schema、身份、RNG、去重、覆盖预留、预算和队列；独立检查 motion 懒加载与算法直接依赖边界 |
+| 纯张量核心 | 新增 `tests/sim/motion/expansion/`：schema、身份、RNG、去重、覆盖预留、预算和队列；独立检查 motion 懒加载与算法直接依赖边界 |
 | 初态准备 | [物理状态适配](../../tests/lab/trajectory_generation/test_sim_initial_state.py) 与 [宿主生命周期](../../tests/lab/trajectory_generation/test_initial_state_host.py)：独立快照、全批预检、固定条件漂移、恢复误差、失败和旧 epoch 拒绝 |
 | 规划/原子回归 | 扩展 [atomic_actions 测试](../../tests/sim/atomic_actions/)、[MotionGenerator](../../tests/sim/motion/planners/test_motion_generator_batched.py)、[BasePlanner](../../tests/sim/motion/planners/test_base_planner.py)、[graspkit](../../tests/toolkits/test_grasp_pose_generator.py) |
 | 宿主/记录回归 | 扩展 [Demo](../../tests/gym/envs/test_demo.py)、[trajectory_state](../../tests/gym/utils/test_trajectory_state.py)、[DatasetManager](../../tests/gym/envs/managers/test_dataset_manager.py)、[同步 recorder](../../tests/gym/envs/managers/test_dataset_functors.py)、[异步 recorder](../../tests/gym/envs/managers/test_async_dataset_functors.py) |

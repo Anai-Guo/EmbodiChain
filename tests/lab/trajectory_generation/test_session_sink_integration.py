@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from embodichain.lab.sim.motion.trajectory_augmentation import (
+from embodichain.lab.sim.motion.expansion import (
     CandidateTrajectoryBatch,
     ExpertEpisode,
     GenerationSession,

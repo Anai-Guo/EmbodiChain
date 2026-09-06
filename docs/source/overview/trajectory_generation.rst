@@ -9,7 +9,7 @@ candidate planning, physical execution, measured validation, and
 persistence of accepted episodes. It consumes a scene that the caller already
 created; it does not sample layouts.
 
-The :mod:`embodichain.lab.sim.motion.trajectory_augmentation` package provides
+The :mod:`embodichain.lab.sim.motion.expansion` package provides
 qpos candidates, constrained variation, coverage, and generation accounting.
 Two collection paths are available: free motion through the existing locked-joint
 planner, and a bounded CPU-physics PickUp integration with full-joint geometry

@@ -83,7 +83,7 @@ from embodichain.data import get_data_path
 from embodichain.data.constants import EMBODICHAIN_DEFAULT_DATA_ROOT
 
 if TYPE_CHECKING:
-    from embodichain.lab.sim.motion.trajectory_augmentation import ValidationResult
+    from embodichain.lab.sim.motion.expansion import ValidationResult
     from embodichain.lab.task_program import CompiledTaskProgram, TaskProgramCfg
     from embodichain.lab.task_program.integrations import (
         TaskProgramAdapterFactory,
@@ -613,7 +613,7 @@ class EmbodiedEnv(BaseEnv):
             TypeError: If callbacks are not callable or verification returns
                 something other than ``ValidationResult``.
         """
-        from embodichain.lab.sim.motion.trajectory_augmentation import ValidationResult
+        from embodichain.lab.sim.motion.expansion import ValidationResult
 
         self._require_generation_lease(owner)
         if getattr(self, "_generation_preparing", False):

@@ -295,6 +295,15 @@ embodichain.lab.gym.envs.embodied_env
    EmbodiedEnvCfg
    EmbodiedEnv
 
+embodichain.lab.task_program.integrations.simulation.handover
+-------------------------------------------------------------
+
+.. currentmodule:: embodichain.lab.task_program.integrations.simulation.handover
+
+.. autosummary::
+
+   ConfiguredHandOverPoseProvider
+
 embodichain.lab.gym.envs.managers.action_manager
 ------------------------------------------------
 
@@ -856,10 +865,10 @@ embodichain.lab.sim.motion.planners.curobo.curobo_yaml
    generate_curobo_robot_yaml
    generate_curobo_world_yaml
 
-embodichain.lab.sim.motion.planners.motion_generator
+embodichain.lab.sim.motion.motion_generator
 ----------------------------------------------------
 
-.. currentmodule:: embodichain.lab.sim.motion.planners.motion_generator
+.. currentmodule:: embodichain.lab.sim.motion.motion_generator
 
 .. autosummary::
 
@@ -1331,15 +1340,6 @@ embodichain.lab.sim.utility.render_utils
 .. autosummary::
 
    select_default_renderer
-
-embodichain.lab.task_program.integrations.simulation.handover
------------------------------------------------------------
-
-.. currentmodule:: embodichain.lab.task_program.integrations.simulation.handover
-
-.. autosummary::
-
-   ConfiguredHandOverPoseProvider
 
 embodichain.lab.task_program.semantics.calls
 ------------------------------------------------

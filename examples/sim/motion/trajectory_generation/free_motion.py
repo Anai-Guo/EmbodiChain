@@ -52,13 +52,9 @@ if str(_REPO_ROOT) not in sys.path:
 
 from embodichain.lab.sim import SimulationManager, SimulationManagerCfg
 from embodichain.lab.sim.cfg import RigidBodyAttributesCfg
-from embodichain.lab.sim.motion.planners import (
-    CuroboPlannerCfg,
-    CuroboWorldCfg,
-    MotionGenCfg,
-    MotionGenerator,
-)
-from embodichain.lab.sim.motion.trajectory_augmentation import (
+from embodichain.lab.sim.motion.motion_generator import MotionGenCfg, MotionGenerator
+from embodichain.lab.sim.motion.planners import CuroboPlannerCfg, CuroboWorldCfg
+from embodichain.lab.sim.motion.expansion import (
     CandidateTrajectoryBatch,
     SceneCase,
     TrajectoryGenerationJobCfg,

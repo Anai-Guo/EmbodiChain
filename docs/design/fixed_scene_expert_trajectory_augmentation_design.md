@@ -1,6 +1,6 @@
 # EmbodiChain：固定场景下的专家轨迹域扩增设计
 
-状态：设计与实施边界，更新于 2026-09-05。手写 qpos/free-motion 同步闭环已落地；完整配置、接触/持物与调度方案仍含待实现内容，当前边界见第 11 节及[实施计划](fixed_scene_expert_trajectory_augmentation_implementation_plan.md)。本文没有吞吐对比实测，不宣称某种模式在所有任务上最优。
+状态：设计与实施边界，更新于 2026-09-05。手写 qpos/free-motion 同步闭环已落地；完整配置、接触/持物与调度方案仍含待实现内容，当前边界见第 11 节及[实施计划](fixed_scene_expert_expansion_implementation_plan.md)。本文没有吞吐对比实测，不宣称某种模式在所有任务上最优。
 
 适用范围：原子技能、手写关节轨迹、EEF waypoint 和可信参数化工厂共享扩增能力，由 sim 或 Gym 调用。场景布局与物体初始位姿由宿主提供，不属于扩增变量。
 
@@ -43,7 +43,7 @@
 | 来源与规划适配 | 将原子或手写输入转为模板，调用 IK、MotionGenerator 与路径检查 | 注入服务；原子 binding/effect 不泄漏到公共核心 |
 | Runner 与宿主适配 | 执行槽管理、初态准备、命令、步进、观测、效果验证和数据提交 | 每个宿主只有一个物理步进所有者 |
 
-公共核心位于 `embodichain/lab/sim/motion/trajectory_augmentation/`，包含 `contracts.py`、`cfg.py`、`operators.py`、`coverage.py`、`session.py`，与 `motion/{solvers,planners,workspace}` 共属机器人运动能力域。已实现的 `initial_state.py`、`runner.py`、`execution.py`、`sinks.py` 和 `integrations/{sim,planning}.py` 位于 `embodichain/lab/trajectory_generation/`；Gym 生命周期接入现有 env，原子来源适配仍待实施。端口协议集中在 contracts，避免过早拆分。
+公共核心位于 `embodichain/lab/sim/motion/expansion/`，包含 `contracts.py`、`cfg.py`、`operators.py`、`coverage.py`、`session.py`，与 `motion/{solvers,planners,workspace}` 共属机器人运动能力域。已实现的 `initial_state.py`、`runner.py`、`execution.py`、`sinks.py` 和 `integrations/{sim,planning}.py` 位于 `embodichain/lab/trajectory_generation/`；Gym 生命周期接入现有 env，原子来源适配仍待实施。端口协议集中在 contracts，避免过早拆分。
 
 2026-09-05 根据模块归属 review，将原工具包方案调整为 `lab/sim/motion`：`motion` 父包按需加载四个子包，不在初始化时主动汇总全部求解器、规划器或分析器。当前 [lab 包初始化](../../embodichain/lab/__init__.py) 仍会加载仿真相关子包，因此不再承诺无需仿真依赖即可公共导入；纯算法不直接依赖 Gym，也不拥有 step/reset。sim/Gym 必须复用同一生成会话，不各自实现采样、预算和覆盖逻辑。求解器不反向依赖扩增会话；Gym 生命周期适配不进入 sim 运动核心。
 
@@ -123,7 +123,7 @@ C 为逻辑候选数，不等于物理环境数；N 可 padding，只有 valid_l
 ### 4.2 IK、几何与时间的关键约束
 
 1. **多解 IK**：解析枚举或多 seed 求解后按关节构型去重；每分支独立传播 pre-grasp → grasp → lift → downstream 的成功 seed。NaN/Inf、FK residual 越界均失败，失败 qpos 不污染后续阶段。
-2. **保持实际分支**：请求携带 `solved_joint_targets`、分支及连续性约束。现有 [EEF 插值路径](../../embodichain/lab/sim/motion/planners/motion_generator.py) 会再次做 IK；只传 pose 可能使多分支重新合并。无法强制保持时按最终结果重新识别、去重。
+2. **保持实际分支**：请求携带 `solved_joint_targets`、分支及连续性约束。现有 [EEF 插值路径](../../embodichain/lab/sim/motion/motion_generator.py) 会再次做 IK；只传 pose 可能使多分支重新合并。无法强制保持时按最终结果重新识别、去重。
 3. **低维几何变化**：自由段用少量 via points 或 `q(s)=q_ref(s)+Σ θ_j B_j(s)`，基函数保持端点及所需导数；避免逐帧独立噪声。接触段必须遵守 Cartesian/接触约束，不能只做关节直线插值。
 4. **显式时间参数化**：同一路径改变推进速度，再按 control_dt 生成变长命令；不能同时固定点数、周期又改变总时长。重新计算事件索引，检查速度、加速度及任务所需 jerk/力矩。未许可的工具与等待时长不自动缩放。
 
@@ -530,7 +530,7 @@ H(job_seed, source_id, source_revision, scene_case_id,
 
 ### 11.1 现有基础与待补模块
 
-以下记录当前实现与剩余设计范围。真实验证已包括初态恢复、Panda 动态障碍采样检查，以及普通重力下 UR5 自由运动的执行、实测验收、LeRobot 写入/读回。Panda 手指漂移负例被锁定关节模型检查拒绝。真实 Runner 验证为 B=1、direct-sim、20 个命令，不代表 PickUp、真实 Gym 采集或四组合 M1 已完成；详细命令和验证记录见[实施计划](fixed_scene_expert_trajectory_augmentation_implementation_plan.md)。
+以下记录当前实现与剩余设计范围。真实验证已包括初态恢复、Panda 动态障碍采样检查，以及普通重力下 UR5 自由运动的执行、实测验收、LeRobot 写入/读回。Panda 手指漂移负例被锁定关节模型检查拒绝。真实 Runner 验证为 B=1、direct-sim、20 个命令，不代表 PickUp、真实 Gym 采集或四组合 M1 已完成；详细命令和验证记录见[实施计划](fixed_scene_expert_expansion_implementation_plan.md)。
 
 | 模块 | 已有基础 | 仍需补齐 |
 |---|---|---|

@@ -59,7 +59,7 @@ from embodichain.lab.sim.atomic_actions import (
 )
 from embodichain.lab.sim.cfg import RigidBodyAttributesCfg
 from embodichain.lab.sim.material import VisualMaterialCfg
-from embodichain.lab.sim.motion.trajectory_augmentation import (
+from embodichain.lab.sim.motion.expansion import (
     TrajectoryPhase,
     TrajectoryTemplate,
     joint_residual,

@@ -8,7 +8,7 @@ scenes for repeated expert rollouts. It currently provides full-batch initial
 state capture, restoration, verification, exclusive host ownership, qpos rollout
 execution, a synchronous runner, and a LeRobot episode sink. Candidate operators
 and generation accounting live in
-:mod:`embodichain.lab.sim.motion.trajectory_augmentation`.
+:mod:`embodichain.lab.sim.motion.expansion`.
 The planning adapter converts explicit EEF samples and validates supported free
 qpos paths against the real environment batch.
 
