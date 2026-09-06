@@ -105,8 +105,12 @@ Convenience constructors:
 Helper: `PlanResult.is_all_success() -> bool` returns `True` only when every env succeeded.
 `PlanResult` rejects positions with missing, malformed, or inconsistent timing.
 A failed result may omit the trajectory entirely by leaving `positions=None`.
-When `MotionGenerator` resamples a fully timed result, it preserves each row's
-total duration and emits new explicit arrival intervals.
+`MotionGenerator` materializes missing velocities from the final positions and
+arrival intervals. When it resamples a timed result, it samples by time,
+preserves each row's duration, and recomputes velocities; acceleration samples
+are invalidated. Unchanged planner samples retain native derivatives. cuRobo
+maps native velocities/accelerations into simulator joint order and zero-pads
+short/failed rows, deriving only missing velocity segments.
 
 ### MoveType enum
 
@@ -159,9 +163,23 @@ total duration and emits new explicit arrival intervals.
 ## Shared trajectory computations
 
 `embodichain.compute.trajectory` owns pure interpolation, path resampling,
-and keyframe-based warping. `interpolate_with_distance` retains keyframes;
+time-domain differentiation/resampling, and keyframe-based warping. `interpolate_with_distance` retains keyframes;
 `resample_with_distance` treats interior points as optional path samples.
 MotionGenerator and atomic trajectory helpers import the compute API directly.
 `lab.sim.utility.action_utils` retains solver-dependent pose/IK adaptation and
 re-exports pure functions for compatibility. Warp implementations live in
 `compute/trajectory/_warp/`; tests belong to `tests/compute/test_trajectory.py`.
+
+`differentiate_positions(positions, dt)` uses nonuniform central differences
+and one-sided endpoints. Zero-time position changes are rejected; unchanged
+samples at repeated times are valid padding or junctions. `resample_in_time`
+preserves first-arrival offset and total duration. Neither helper guarantees
+motion limits or smooth rest-to-rest motion. Execution-specific stationary and
+terminal targets belong to [Atomic Skills](../atomic-actions/execution.md).
+
+`scripts/tutorials/sim/motion_generator.py` and the neural planner example
+replay timed trajectories on an explicit physics/control grid and recompute
+velocity references if playback retimes them. The cuRobo example teleports
+through path samples for visualization. The physical tracking comparison is
+`examples/sim/motion/trajectory_velocity_tracking.py`; its CSV/plot compares
+identical position references with zero versus derived target velocities.
