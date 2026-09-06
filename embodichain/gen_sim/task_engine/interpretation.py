@@ -934,7 +934,7 @@ def _structured_output_runnable(
 ) -> Any:
     if not hasattr(client, "with_structured_output"):
         return client
-    method = "json_mode" if _is_mimo_compatible(settings) else "json_schema"
+    method = "json_mode"
     try:
         return client.with_structured_output(schema, method=method)
     except (TypeError, ValueError):
