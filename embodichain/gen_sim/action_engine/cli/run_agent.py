@@ -87,12 +87,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write one static PNG for the valid grasp pair selected by E5.",
     )
     parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Base random seed; episode N uses seed + N.",
-    )
-    parser.add_argument(
         "--runtime-backend",
         choices=("independent",),
         default="independent",

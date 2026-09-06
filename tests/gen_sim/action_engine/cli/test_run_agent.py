@@ -40,6 +40,24 @@ from embodichain.gen_sim.action_engine.runtime import (
 )
 
 
+@pytest.mark.parametrize("seed", [None, 0, 17])
+def test_run_parser_uses_shared_launcher_seed(seed: int | None) -> None:
+    argv = [
+        "--task_name",
+        "seed_contract",
+        "--gym_config",
+        "gym.json",
+        "--agent_config",
+        "agent.json",
+    ]
+    if seed is not None:
+        argv.extend(["--seed", str(seed)])
+
+    args = run_agent_module.build_parser().parse_args(argv)
+
+    assert args.seed == seed
+
+
 class record_camera_data:
     def __init__(self) -> None:
         self.calls = []
