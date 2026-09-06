@@ -76,6 +76,8 @@ def test_task_semantic_core_does_not_import_scene_action_or_orchestration() -> N
 
 def test_task_engine_does_not_import_atomic_execution_layer() -> None:
     forbidden = "embodichain.lab.sim.atomic_actions"
+    execution_modules = {"engine", "execution", "runner", "simulation", "session"}
+    runtime_types = {"AtomicActionEngine", "ExecutionSession", "ExecutionRunner"}
     offenders: list[str] = []
     task_root = _GEN_SIM_ROOT / "task_engine"
     for path in task_root.rglob("*.py"):
@@ -87,13 +89,59 @@ def test_task_engine_does_not_import_atomic_execution_layer() -> None:
                 modules = [node.module or ""]
             else:
                 continue
-            if any(
-                module == forbidden or module.startswith(forbidden + ".")
+            atomic_imports = [
+                module
                 for module in modules
+                if module == forbidden or module.startswith(forbidden + ".")
+            ]
+            in_adapter = path.is_relative_to(task_root / "_task_program")
+            if atomic_imports and (
+                not in_adapter
+                or any(
+                    module.rsplit(".", 1)[-1] in execution_modules
+                    for module in atomic_imports
+                )
             ):
                 offenders.append(path.relative_to(task_root).as_posix())
                 break
+        # Goal types and factory annotations are allowed, private runtimes are not.
+        assert not any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in runtime_types
+            for node in ast.walk(tree)
+        ), path
     assert offenders == []
+
+
+def test_configured_pick_and_transport_lowerers_only_bind_targets() -> None:
+    services = _GEN_SIM_ROOT / "task_engine/_task_program/services.py"
+    source = services.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
+    for name in ("_PickLowerer", "_MoveHeldObjectLowerer"):
+        forbidden_calls = {
+            node.func.attr
+            for node in ast.walk(classes[name])
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr
+            in {"compute_ik", "compute_batch_ik", "plan", "generate", "step"}
+        }
+        assert forbidden_calls == set()
+    assert "simulation.pick_release_safe" not in source
+    assert "simulation.move_held_object_upright" not in source
+
+
+def test_gensim_task_recipes_do_not_solve_live_ik() -> None:
+    for path in (_GEN_SIM_ROOT / "task_engine").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        assert not any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"compute_ik", "compute_batch_ik"}
+            for node in ast.walk(tree)
+        ), path
 
 
 def test_default_task_runtime_has_no_legacy_physical_executor() -> None:

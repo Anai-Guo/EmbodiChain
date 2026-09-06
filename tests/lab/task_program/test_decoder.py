@@ -48,6 +48,20 @@ from embodichain.lab.task_program.language.schema import (
 )
 
 
+def test_relative_validator_rejects_unmigrated_local_kind() -> None:
+    data = _program_data()
+    data["program"]["body"]["validators"] = [
+        {
+            "kind": "object_relative_position",
+            "object": "cube",
+            "reference": "table",
+            "world_offset": [0.0, 0.0, 0.1],
+        }
+    ]
+    with pytest.raises(TaskProgramDecodeError, match="object_relative_position"):
+        decode_task_program(data)
+
+
 def _program_data() -> dict[str, object]:
     """Return the repeated-cube example as plain JSON values."""
     return {

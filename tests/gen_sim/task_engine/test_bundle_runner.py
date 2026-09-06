@@ -55,6 +55,34 @@ def test_exception_metadata_rejects_non_exception_values() -> None:
         _exception_metadata("failure")  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize(
+    "fingerprint",
+    [
+        {},
+        {"schema_version": "semantic_integration_fingerprint/v1"},
+        {
+            "schema_version": "semantic_integration_fingerprint/v2",
+            "adapter_contract": "gen_sim.task_program/2620929c/v2",
+        },
+        {
+            "schema_version": "semantic_integration_fingerprint/v2",
+            "adapter_contract": "unknown",
+        },
+    ],
+)
+def test_old_bundle_is_rejected_before_component_loading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fingerprint: dict
+) -> None:
+    def forbidden_load(*_args, **_kwargs):
+        raise AssertionError("Old contracts must fail before component loading.")
+
+    monkeypatch.setattr(_bundle_runner, "load_config", forbidden_load)
+    with pytest.raises(ValueError, match="regenerate"):
+        _bundle_runner._verify_integration_fingerprint(
+            tmp_path, tmp_path / "deployment.yaml", {}, fingerprint
+        )
+
+
 def test_execution_report_preserves_partial_row_success() -> None:
     """A normal partial result remains eligible for Task Engine any/at-least."""
     graph = {
@@ -106,6 +134,37 @@ def test_execution_report_masks_rows_after_global_failure() -> None:
     )
 
     assert [row["success"] for row in report["environments"]] == [False, False]
+
+
+@pytest.mark.parametrize("capture_fails", [False, True])
+def test_failed_attempt_captures_a_terminal_frame_before_flush(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capture_fails: bool
+) -> None:
+    from embodichain.lab.gym.envs.managers import record
+
+    calls = []
+
+    class Recorder:
+        def __call__(self, env, env_ids, **params):
+            calls.append(("capture", env, env_ids, params))
+            if capture_fails:
+                raise RuntimeError("camera fetch failed")
+
+        def save_and_clear(self):
+            calls.append(("flush",))
+
+    monkeypatch.setattr(record, "record_camera_data", Recorder)
+    params = {"name": "audience", "resolution": [640, 360]}
+    env = SimpleNamespace(
+        event_manager=SimpleNamespace(
+            _mode_functor_cfgs={
+                "interval": [SimpleNamespace(func=Recorder(), params=params)]
+            }
+        )
+    )
+    _bundle_runner._preserve_failed_execution_recording(env, tmp_path, num_envs=1)
+
+    assert calls == [("capture", env, None, params), ("flush",)]
 
 
 def test_module_entrypoint_flushes_protocol_before_fast_exit(

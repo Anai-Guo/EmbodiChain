@@ -14,20 +14,8 @@
 # limitations under the License.
 # ----------------------------------------------------------------------------
 
-schema_version: embodichain.task-engine-defaults/v1
+"""Task Engine-owned declarations and services for the shared Task Program runtime."""
 
-workflow:
-  max_parallel_workers: 2
-  max_scene_attempts: 2
-  max_action_attempts: 1
+from __future__ import annotations
 
-planning:
-  candidate_count: 3
-  planning_mode: offline
-  max_episodes: 1
-  max_episode_steps: 8000
-
-execution:
-  num_envs: 1
-  success_policy: any
-  min_successful_envs: 1
+__all__: list[str] = []

@@ -82,7 +82,9 @@ def execute_bundle(
     _verify_source(root)
     graph = validate_semantic_task_graph(_read_json(graph_path))
     fingerprint = _read_json(fingerprint_path)
-    _verify_integration_fingerprint(root, deployment_path, graph, fingerprint)
+    deployment = _verify_integration_fingerprint(
+        root, deployment_path, graph, fingerprint
+    )
     _verify_program_projection(program_path, graph)
 
     args = _runner_parser().parse_args(list(forwarded))
@@ -111,10 +113,30 @@ def execute_bundle(
 
         discover_task_packages()
         execute_init_hooks()
+        from ._task_program.assembly import register_deployment
+        from embodichain.lab.task_program.language import load_task_program
+
+        deployment_cfg = load_config(deployment_path)
+        register_deployment(
+            deployment,
+            environment_id=deployment_cfg["id"],
+            max_episode_steps=int(deployment_cfg["max_episode_steps"]),
+        )
+
+        def configure_environment(value: dict[str, Any]) -> None:
+            _configure_recording(value, output)
+            value.pop("task_program", None)
+
         env_cfg, gym_config, action_config = build_env_cfg_from_args(
             args,
-            gym_config_modifier=lambda value: _configure_recording(value, output),
+            gym_config_modifier=configure_environment,
         )
+        env_cfg.task_program = load_task_program(
+            program_path,
+            integration=deployment.selection,
+            validation_context=deployment.integration.registration.catalog,
+        )
+        deployment.integration.registration.catalog.preflight(env_cfg.task_program)
         env = gymnasium.make(id=gym_config["id"], cfg=env_cfg, **action_config)
         env.reset(seed=args.seed, options={"save_data": False})
         result = execute_demo_episode(env, episode_index=0, attempt_id=0)
@@ -298,7 +320,12 @@ def _preserve_failed_execution_recording(
         for configured_functors in mode_cfgs.values():
             for functor_cfg in configured_functors:
                 if isinstance(functor_cfg.func, record_camera_data):
-                    functor_cfg.func.save_and_clear()
+                    try:
+                        # A first-step failure can precede the recording interval.
+                        # Fetch the last rendered state without advancing physics.
+                        functor_cfg.func(target, env_ids=None, **functor_cfg.params)
+                    finally:
+                        functor_cfg.func.save_and_clear()
     except (AttributeError, TypeError, RuntimeError, OSError):
         # The trajectory is the required audit artifact.  Camera persistence is
         # best effort because custom environments may not expose this manager.
@@ -310,11 +337,18 @@ def _verify_integration_fingerprint(
     deployment_path: Path,
     graph: dict[str, Any],
     fingerprint: dict[str, Any],
-) -> None:
+) -> Any:
     """Recompose provider-free integration identity before simulation starts."""
-    from embodichain.lab.task_program.integrations._configured_composition import (
-        _load_configured_task_program_deployment,
-    )
+    from ._task_program.assembly import ADAPTER_CONTRACT, load_deployment
+
+    if (
+        fingerprint.get("schema_version") != "semantic_integration_fingerprint/v2"
+        or fingerprint.get("adapter_contract") != ADAPTER_CONTRACT
+    ):
+        raise ValueError(
+            "Incompatible GenSim bundle contract; regenerate the bundle against "
+            "the public 2620929c baseline."
+        )
 
     deployment_cfg = load_config(deployment_path)
     embodiment_cfg = load_config(bundle / "components/embodiment.yaml")
@@ -326,18 +360,23 @@ def _verify_integration_fingerprint(
         raise ValueError(
             "Configured deployment must declare task_program and skill_profile."
         )
-    composed = _load_configured_task_program_deployment(
+    composed = load_deployment(
         task_program=task_program,
         skill_profile=skill_profile,
         base_dir=bundle,
     )
+    if fingerprint.get("integration_id") != composed.integration_id:
+        raise ValueError(
+            "GenSim bundle integration identity does not match its declaration."
+        )
     expected = graph["integration_fingerprint"]
     actual = composed.integration.integration_fingerprint
     recorded = fingerprint.get("integration_fingerprint")
     if expected != recorded or expected != actual:
         raise ValueError(
             "Semantic integration fingerprint drifted before execution: "
-            f"graph={expected!r}, recorded={recorded!r}, actual={actual!r}."
+            f"graph={expected!r}, recorded={recorded!r}, actual={actual!r}. "
+            "Regenerate the GenSim bundle against the current baseline contract."
         )
     recorded_registration = fingerprint.get("registration_fingerprint")
     actual_registration = composed.integration.registration.fingerprint
@@ -346,6 +385,7 @@ def _verify_integration_fingerprint(
             "Semantic registration fingerprint drifted before execution: "
             f"recorded={recorded_registration!r}, actual={actual_registration!r}."
         )
+    return composed
 
 
 def _verify_program_projection(

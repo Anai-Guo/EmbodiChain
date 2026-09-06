@@ -827,6 +827,41 @@ def test_relative_place_uses_fresh_reference_pose_and_verified_grasp() -> None:
     assert lookahead[0].preserve_current_object_orientation
 
 
+def test_relative_place_rejects_unmigrated_local_service_kind() -> None:
+    """Do not retain a second factory contract for the same semantic call."""
+    with pytest.raises(ValueError, match="Unsupported.*relative_place"):
+        _decode_registered_lowerer({"kind": "relative_place"}, path="lowerer")
+
+
+def test_relative_place_rejects_call_owned_world_offset() -> None:
+    """Only the trusted integration may declare relative placement geometry."""
+    lowerer = _RelativePlaceLowerer(
+        (
+            _RelativePlaceRoute(
+                object_id="cube",
+                reference_entity_id="table",
+                relation="on",
+                world_displacement=(0.0, 0.0, 0.1),
+            ),
+        )
+    )
+    with pytest.raises(ValueError, match="arguments must contain only"):
+        lowerer.lower(
+            RegisteredSemanticCall(
+                call_id="simulation.place_relative",
+                arguments={
+                    "object": "cube",
+                    "reference": "table",
+                    "relation": "on",
+                    "world_offset": [0.0, 0.0, 0.1],
+                },
+            ),
+            context=None,  # type: ignore[arg-type]
+            bound=None,  # type: ignore[arg-type]
+            option_template=PlaceOptions(),
+        )
+
+
 def test_axis_align_and_relative_place_configs_use_closed_decoders() -> None:
     """Both generated extensions contribute typed options and descriptors."""
     axis_factory = _decode_registered_lowerer(
@@ -1503,3 +1538,51 @@ def test_examples_have_no_importable_task_environment_modules() -> None:
 
 
 __all__: list[str] = []
+
+
+def test_axis_align_lowerer_and_config_reuse_the_existing_atomic_skill() -> None:
+    """Configured E2 composition targets AxisAlign with a verified attachment."""
+    semantics = ObjectSemantics(
+        affordance=AxisAlignAffordance(internal_axis=torch.tensor([1.0, 0.0, 0.0])),
+        geometry={},
+        label="can",
+        entity_id="can",
+    )
+    lowerer = _AxisAlignLowerer((semantics,))
+    lowering = lowerer.lower(
+        RegisteredSemanticCall(
+            call_id="simulation.axis_align",
+            arguments={"object": "can"},
+            resources={"primary": "left"},
+        ),
+        context=None,  # type: ignore[arg-type]
+        bound=None,  # type: ignore[arg-type]
+        option_template=AxisAlignOptions(),
+    )
+    factory = _decode_registered_lowerer(
+        {"kind": "axis_align", "object_ids": ["can"]},
+        path="integration.runtime_services.registered_semantic_lowerers[0]",
+    )
+    options = _decode_action_options(
+        {
+            "kind": "axis_align",
+            "target_axis": [0.0, 0.0, 1.0],
+            "pre_grasp_distance": 0.12,
+        },
+        path="policy.action_options.simulation.axis_align",
+    )
+
+    assert type(lowering.goal) is AxisAlignGoal
+    assert lowering.goal.semantics is semantics
+    assert lowering.registered_effect is not None
+    assert lowering.registered_effect.effect_kind is SemanticEffectKind.ATTACH
+    assert factory.call_id == "simulation.axis_align"
+    assert type(options) is AxisAlignOptions
+    assert options.pre_grasp_distance == pytest.approx(0.12)
+    torch.testing.assert_close(options.target_axis, torch.tensor([0.0, 0.0, 1.0]))
+
+
+@pytest.mark.parametrize("kind", ["release_safe_pick", "move_held_object_upright"])
+def test_configured_services_reject_task_specific_e2_kinds(kind: str) -> None:
+    with pytest.raises(ValueError, match="Unsupported"):
+        _decode_registered_lowerer({"kind": kind, "routes": []}, path="lowerer")

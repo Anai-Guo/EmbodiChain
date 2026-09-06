@@ -18,8 +18,8 @@
 
 The source scene remains the authority for object geometry and initial poses.
 Generation only makes asset paths absolute, gives runtime objects stable UIDs,
-applies one explicit world-frame rotation, and adds conservative physics values
-needed by manipulation tasks.
+applies one explicit world-frame rotation, and fills missing physics values
+without overwriting explicitly authored physical properties.
 """
 
 from __future__ import annotations
@@ -624,7 +624,7 @@ def _planner_object(
         raw_initial_state = {}
     raw_affordances = config.get("affordances", config.get("capabilities", []))
     affordances = (
-        [str(value) for value in raw_affordances]
+        [deepcopy(value) for value in raw_affordances]
         if isinstance(raw_affordances, Sequence)
         and not isinstance(raw_affordances, (str, bytes))
         else []
@@ -670,11 +670,12 @@ def _runtime_object(config: Mapping[str, Any], *, role: str) -> dict[str, Any]:
     result.setdefault("body_scale", [1.0, 1.0, 1.0])
     source_attrs = dict(config.get("attrs", {}))
     if role == "background":
-        result["attrs"] = {**source_attrs, **_BACKGROUND_ATTRS}
+        result["attrs"] = {**_BACKGROUND_ATTRS, **source_attrs}
         result["body_type"] = "kinematic"
         result["max_convex_hull_num"] = int(_BACKGROUND_POLICY["max_convex_hull_num"])
     else:
-        result["attrs"] = {**source_attrs, **_RIGID_ATTRS}
+        # Imported physical properties are authoritative; defaults only fill gaps.
+        result["attrs"] = {**_RIGID_ATTRS, **source_attrs}
         result["body_type"] = "dynamic"
         hull_limit = int(_RIGID_POLICY["max_convex_hull_num"])
         max_hulls = max(

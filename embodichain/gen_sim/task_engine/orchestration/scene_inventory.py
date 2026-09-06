@@ -233,7 +233,15 @@ def _scene_entity(raw: Mapping[str, Any]) -> SceneEntity:
     raw_affordances = raw.get("affordances", raw.get("capabilities", ()))
     affordances = (
         frozenset(
-            str(item).strip().lower() for item in raw_affordances if str(item).strip()
+            value
+            for item in raw_affordances
+            if (
+                value := (
+                    str(item.get("type", item.get("name", ""))).strip().lower()
+                    if isinstance(item, Mapping)
+                    else str(item).strip().lower()
+                )
+            )
         )
         if isinstance(raw_affordances, Sequence)
         and not isinstance(raw_affordances, (str, bytes))
