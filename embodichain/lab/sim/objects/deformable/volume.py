@@ -14,23 +14,20 @@
 # limitations under the License.
 # ----------------------------------------------------------------------------
 
-"""DexSim volume-deformable object implementation."""
+"""Newton volume-deformable object implementation."""
 
 from __future__ import annotations
 
-from functools import cached_property
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Sequence
 
 import numpy as np
 import torch
-import warp as wp
-from dexsim.scene import Scene, SpawnedSoftBodyParticleSet
-from scipy.spatial import ConvexHull, QhullError
-
-from embodichain.utils import logger
 
 from .base import DeformableObject
 from .data import _ParticleSetData
+
+if TYPE_CHECKING:
+    from dexsim.scene import Scene, SpawnedSoftBodyParticleSet
 
 __all__ = [
     "SoftBodyData",
@@ -41,98 +38,51 @@ __all__ = [
 
 
 class VolumeDeformableData(_ParticleSetData):
-    """DexSim soft-body buffers exposed through the common nodal contract."""
+    """Newton soft-body particles exposed through the legacy volume API."""
 
-    def __init__(
-        self,
-        entities: Sequence[SpawnedSoftBodyParticleSet],
-        scene: Scene,
-        device: torch.device,
-    ) -> None:
-        super().__init__(entities, scene, device)
-        self.n_sim_vertices = self.num_nodes
-        collision_counts = tuple(entity.collision_particle_count for entity in entities)
-        if len(set(collision_counts)) != 1:
-            raise ValueError(
-                "A volume-deformable batch requires each SpawnedSoftBodyParticleSet "
-                f"to have the same collision-node count, got {collision_counts!r}."
-            )
-        self.n_collision_vertices = collision_counts[0]
-        self._rest_collision_vertices = self._fetch_collision_positions(rest=True)
-        self._collision_position = torch.empty_like(self._rest_collision_vertices)
+    @property
+    def particle_sets(self) -> list[SpawnedSoftBodyParticleSet]:
+        """Return the typed DexSim soft-body particle handles."""
+        return self.entities
 
-    def _fetch_collision_positions(self, *, rest: bool) -> torch.Tensor:
-        """Fetch collision nodes exposed by typed Spawn soft-body handles."""
-        getter = (
-            SpawnedSoftBodyParticleSet.get_rest_positions
-            if rest
-            else SpawnedSoftBodyParticleSet.get_collision_positions
-        )
-        values = [
-            wp.to_torch(getter(entity)).to(
-                dtype=torch.float32,
-                device=self.device,
-            )
-            for entity in self.entities
-        ]
-        return torch.stack(values, dim=0)
+    @property
+    def n_collision_vertices(self) -> int:
+        """Return the Newton collision-particle count per instance."""
+        return self.n_nodes
+
+    @property
+    def n_sim_vertices(self) -> int:
+        """Return the Newton simulation-particle count per instance."""
+        return self.n_nodes
 
     @property
     def rest_collision_vertices(self) -> torch.Tensor:
-        """Return rest collision vertices in simulation world frame."""
-        return self._rest_collision_vertices.clone()
+        """Return particle positions captured when Spawn was bound."""
+        return self.default_nodal_state_w[..., :3]
 
     @property
     def rest_sim_vertices(self) -> torch.Tensor:
-        """Return rest simulation vertices in simulation world frame."""
+        """Return particle positions captured when Spawn was bound."""
         return self.default_nodal_state_w[..., :3]
 
     @property
     def collision_position(self) -> torch.Tensor:
-        """Return current collision vertices in simulation world frame."""
-        self._collision_position.copy_(self._fetch_collision_positions(rest=False))
-        return self._collision_position.clone()
+        """Return current Newton collision-particle positions."""
+        return self.nodal_pos_w
 
     @property
     def sim_vertex_position(self) -> torch.Tensor:
-        """Return current simulation vertices in simulation world frame."""
+        """Return current Newton simulation-particle positions."""
         return self.nodal_pos_w
 
     @property
     def sim_vertex_velocity(self) -> torch.Tensor:
-        """Return current simulation-vertex velocities."""
+        """Return current Newton simulation-particle velocities."""
         return self.nodal_vel_w
-
-    @cached_property
-    def collision_surface_triangles(self) -> torch.Tensor:
-        """Return a stable convex-hull topology over collision vertices."""
-        vertices = self.rest_collision_vertices[0].detach().cpu().numpy()
-        if vertices.shape[0] < 4:
-            logger.log_warning(
-                "Volume-deformable collision geometry has fewer than four "
-                "vertices; its visualization surface will be empty."
-            )
-            triangles = np.empty((0, 3), dtype=np.int32)
-        else:
-            try:
-                triangles = np.asarray(ConvexHull(vertices).simplices, dtype=np.int32)
-            except QhullError as error:
-                try:
-                    triangles = np.asarray(
-                        ConvexHull(vertices, qhull_options="QJ").simplices,
-                        dtype=np.int32,
-                    )
-                except QhullError:
-                    logger.log_warning(
-                        "Unable to build a volume-deformable visualization "
-                        f"surface from collision vertices: {error!r}"
-                    )
-                    triangles = np.empty((0, 3), dtype=np.int32)
-        return torch.as_tensor(triangles, dtype=torch.int32, device=self.device)
 
 
 class VolumeDeformableObject(DeformableObject):
-    """A batch of DexSim volume deformables backed by ``SoftBody``."""
+    """A batch of Newton volumetric soft-body particle sets."""
 
     deformable_type = "volume"
     spawn_kind = "soft_object"
@@ -140,61 +90,68 @@ class VolumeDeformableObject(DeformableObject):
 
     def _create_data(
         self,
-        entities: Sequence[Any],
+        entities: Sequence[SpawnedSoftBodyParticleSet],
         scene: Scene,
         device: torch.device,
     ) -> VolumeDeformableData:
         return VolumeDeformableData(entities, scene, device)
 
+    def _initialize_topology(
+        self,
+        entities: Sequence[SpawnedSoftBodyParticleSet],
+    ) -> None:
+        super()._initialize_topology(entities)
+        triangles = [
+            np.asarray(entity.get_surface_triangles(), dtype=np.int32).reshape(-1, 3)
+            for entity in entities
+        ]
+        triangle_counts = {len(item) for item in triangles}
+        if len(triangle_counts) != 1:
+            raise ValueError(
+                "All instances of one soft body must share surface triangle "
+                f"count, got {sorted(triangle_counts)}."
+            )
+        self._collision_surface_triangles = torch.as_tensor(
+            np.stack(triangles),
+            dtype=torch.int32,
+            device=self.device,
+        ).clone()
+
     @property
     def body_data(self) -> VolumeDeformableData | None:
-        """Compatibility view of the DexSim soft-body data."""
+        """Compatibility view of the Newton soft-body particle data."""
         return self._data
 
     def get_rest_collision_vertices(self) -> torch.Tensor:
-        """Return rest collision vertices."""
+        """Return particle positions captured when Spawn was bound."""
         self._require_data()
         return self.body_data.rest_collision_vertices
 
     def get_rest_sim_vertices(self) -> torch.Tensor:
-        """Return rest simulation vertices."""
+        """Return particle positions captured when Spawn was bound."""
         self._require_data()
         return self.body_data.rest_sim_vertices
 
     def get_current_collision_vertices(self) -> torch.Tensor:
-        """Return current collision vertices."""
+        """Return current Newton collision-particle positions."""
         self._require_data()
         return self.body_data.collision_position
 
     def get_current_sim_vertices(self) -> torch.Tensor:
-        """Return current simulation vertices."""
+        """Return current Newton simulation-particle positions."""
         return self.get_current_nodal_position()
 
     def get_current_sim_vertex_velocities(self) -> torch.Tensor:
-        """Return current simulation-vertex velocities."""
+        """Return current Newton simulation-particle velocities."""
         return self.get_current_nodal_velocity()
-
-    def get_surface_vertices(self) -> torch.Tensor:
-        """Return the live collision surface used for visualization."""
-        return self.get_current_collision_vertices()
 
     def get_collision_surface_triangles(
         self, env_ids: Sequence[int] | None = None
     ) -> torch.Tensor:
-        """Return convex-hull triangles over collision vertices."""
-        self._require_data()
+        """Return the tetrahedral surface topology for selected instances."""
         ids = self._resolve_env_ids(env_ids)
-        return (
-            self.body_data.collision_surface_triangles.unsqueeze(0)
-            .expand(len(ids), -1, -1)
-            .clone()
-        )
-
-    def get_surface_triangles(
-        self, env_ids: Sequence[int] | None = None
-    ) -> torch.Tensor:
-        """Return the volume deformable's collision-surface topology."""
-        return self.get_collision_surface_triangles(env_ids=env_ids)
+        index = torch.as_tensor(ids, dtype=torch.long, device=self.device)
+        return self._collision_surface_triangles.index_select(0, index).clone()
 
 
 # Compatibility names retained for existing environments and tutorials.

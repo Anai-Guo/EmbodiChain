@@ -285,9 +285,9 @@ class GravitySettler:
                 body_scale=tuple(
                     self._three_floats(body_info["y_up_scale"], field_name="scale")
                 ),
-                  attrs=self._rigid_body_attrs(physics),
-                  body_type=body_type,
-              )
+                attrs=self._rigid_body_attrs(physics),
+                body_type=body_type,
+            )
         )
 
     @staticmethod

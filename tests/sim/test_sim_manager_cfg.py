@@ -435,6 +435,18 @@ def test_newton_physics_cfg_accepts_explicit_auto_solver_mapping() -> None:
 
 
 @pytest.mark.no_sim
+def test_newton_physics_cfg_accepts_mjvbd_solver_alias() -> None:
+    from dexsim.engine.newton_physics import MJVBDSolverCfg
+
+    cfg = NewtonPhysicsCfg(solver_cfg={"class_type": "MJVBDSolverCfg"})
+
+    dexsim_cfg = cfg.to_dexsim_cfg(gpu_id=0)
+
+    assert isinstance(dexsim_cfg.solver_cfg, MJVBDSolverCfg)
+    assert dexsim_cfg.solver_cfg.solver_type == "mjvbd"
+
+
+@pytest.mark.no_sim
 def test_newton_physics_cfg_directly_accepts_dexsim_solver_cfg_object() -> None:
     from dexsim.engine.newton_physics import XPBDSolverCfg
 

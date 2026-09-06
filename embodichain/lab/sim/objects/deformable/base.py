@@ -14,14 +14,15 @@
 # limitations under the License.
 # ----------------------------------------------------------------------------
 
-"""Common facade for volume and surface deformable objects."""
+"""Common Newton facade for volume and surface deformable objects."""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from copy import deepcopy
-from typing import Any, ClassVar, Literal, Sequence
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Sequence
 
+import numpy as np
 import torch
 from dexsim.scene import Scene
 
@@ -37,18 +38,20 @@ from embodichain.lab.sim.material import (
 from embodichain.utils import logger
 from embodichain.utils.math import matrix_from_euler, xyz_quat_to_4x4_matrix
 
-from .data import DeformableObjectData
+from .data import DeformableObjectData, _ParticleSetData
+
+if TYPE_CHECKING:
+    from dexsim.scene import Scene, SpawnedParticleSet
 
 __all__ = ["DeformableObject"]
 
 
 class DeformableObject(BatchEntity, ABC):
-    """Common facade for a batch of deformable assets.
+    """Common facade over a batch of Newton particle-set deformables.
 
-    The public nodal and surface contracts are backend-neutral. The concrete
-    implementations in this package currently bind them to DexSim soft-body
-    and cloth buffers. Newton support can be added as a separate implementation
-    without changing manager or visualization consumers.
+    Volume and surface objects retain EmbodiChain's public nodal contract, but
+    their runtime ownership is exclusively DexSim Spawn's Newton scene. The
+    Default backend and direct native soft/cloth body buffers are unsupported.
     """
 
     deformable_type: ClassVar[Literal["volume", "surface"]]
@@ -121,24 +124,112 @@ class DeformableObject(BatchEntity, ABC):
     @abstractmethod
     def _create_data(
         self,
-        entities: Sequence[Any],
+        entities: Sequence[SpawnedParticleSet],
         scene: Scene,
         device: torch.device,
-    ) -> DeformableObjectData:
-        """Create the concrete backend data view."""
+    ) -> _ParticleSetData:
+        """Create the topology-specific particle data view."""
 
-    def _initialize_topology(self, entities: Sequence[Any]) -> None:
-        """Initialize implementation-specific surface topology."""
-        del entities
+    def _initialize_topology(self, entities: Sequence[SpawnedParticleSet]) -> None:
+        """Capture per-instance render topology with a stable batch shape."""
+        vertex_counts = tuple(
+            np.asarray(entity.get_render_vertices(), dtype=np.float32)
+            .reshape(-1, 3)
+            .shape[0]
+            for entity in entities
+        )
+        if len(set(vertex_counts)) != 1:
+            raise RuntimeError(
+                "Replicated Newton deformable render meshes must share one "
+                "vertex count, but DexSim materialized counts "
+                f"{vertex_counts}. This indicates a render-clone topology "
+                "mismatch; use a compatible source mesh or one environment "
+                "until the DexSim clone path is corrected."
+            )
+        triangles = [
+            np.asarray(entity.get_render_triangles(), dtype=np.int32).reshape(-1, 3)
+            for entity in entities
+        ]
+        triangle_counts = {len(item) for item in triangles}
+        if len(triangle_counts) != 1:
+            raise ValueError(
+                "All instances of one deformable asset must share render "
+                f"triangle count, got {sorted(triangle_counts)}."
+            )
+        for instance, (instance_triangles, vertex_count) in enumerate(
+            zip(triangles, vertex_counts, strict=True)
+        ):
+            if instance_triangles.size and (
+                int(instance_triangles.min()) < 0
+                or int(instance_triangles.max()) >= vertex_count
+            ):
+                raise ValueError(
+                    "Deformable render topology contains an out-of-range "
+                    f"vertex index for instance {instance}."
+                )
+        self._surface_triangles = torch.as_tensor(
+            np.stack(triangles),
+            dtype=torch.int32,
+            device=self.device,
+        ).clone()
+
+    @staticmethod
+    def _resolve_arena_offsets(
+        scene: Scene,
+        entities: Sequence[SpawnedParticleSet],
+    ) -> torch.Tensor:
+        if not scene.arenas:
+            offsets = np.zeros((len(entities), 3), dtype=np.float32)
+        else:
+            arena_indices = [
+                scene.arenas.index(entity.arena_name) for entity in entities
+            ]
+            offsets = scene.arenas.root_offsets[arena_indices]
+        return torch.as_tensor(offsets, dtype=torch.float32)
+
+    def _configured_initial_pose(self) -> torch.Tensor:
+        if self.cfg.init_local_pose is not None:
+            pose = torch.as_tensor(
+                self.cfg.init_local_pose,
+                dtype=torch.float32,
+                device=self.device,
+            ).reshape(4, 4)
+            return pose.clone()
+
+        pose = torch.eye(4, dtype=torch.float32, device=self.device)
+        pose[:3, 3] = torch.as_tensor(
+            self.cfg.init_pos,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        rotation = (
+            torch.as_tensor(
+                self.cfg.init_rot,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            * torch.pi
+            / 180.0
+        )
+        pose[:3, :3] = matrix_from_euler(rotation.unsqueeze(0), "XYZ")[0]
+        return pose
+
+    def _capture_local_rest_positions(self) -> torch.Tensor:
+        self._require_data()
+        initial_pose = self._configured_initial_pose()
+        initial_positions = self.data.default_nodal_state_w[..., :3]
+        arena_offsets = self._arena_offsets.to(self.device).unsqueeze(1)
+        translated = initial_positions - initial_pose[:3, 3] - arena_offsets
+        return translated @ initial_pose[:3, :3]
 
     @property
     def is_spawn_bound(self) -> bool:
-        """Whether this facade is bound to one finalized Spawn result."""
+        """Whether this facade is bound to one finalized Spawn scene."""
         return self._spawn_result is not None
 
     @property
     def is_declared(self) -> bool:
-        """Whether this facade is waiting for its Spawn result binding."""
+        """Whether this facade is waiting for its Spawn scene binding."""
         return self._world is None
 
     @property
@@ -178,11 +269,19 @@ class DeformableObject(BatchEntity, ABC):
                 "SimulationManager.prepare()."
             )
 
+        if result.backend != "newton":
+            raise NotImplementedError(
+                "EmbodiChain deformable objects require the Newton backend; "
+                "the Default backend is no longer supported."
+            )
+
         cfg = deepcopy(self.cfg)
         self._spawn_result = result
         self._world = result.world
         self._all_indices = list(range(len(entities)))
+        self._arena_offsets = self._resolve_arena_offsets(result, entities)
         self._data = self._create_data(entities, result, self.device)
+        self._local_rest_positions = self._capture_local_rest_positions()
         self._initialize_topology(entities)
         self._visual_material = [None] * len(entities)
         self.is_shared_visual_material = False
@@ -214,7 +313,14 @@ class DeformableObject(BatchEntity, ABC):
         try:
             if self.cfg.shape.compute_uv:
                 for entity in entities:
-                    entity.compute_uv_mapping()
+                    render_body = entity.get_render_body()
+                    project_uv = getattr(render_body, "set_projective_uv", None)
+                    if project_uv is None:
+                        raise NotImplementedError(
+                            "compute_uv requires a deformable render body with "
+                            "set_projective_uv()."
+                        )
+                    project_uv(np.asarray(self.cfg.shape.project_direction))
             self._initialize_spawn_bound(result, entities)
         except Exception:
             self.__dict__.clear()
@@ -291,6 +397,16 @@ class DeformableObject(BatchEntity, ABC):
         """Return registered material wrappers for selected environments."""
         return [self._visual_material[i] for i in self._resolve_env_ids(env_ids)]
 
+    def set_collision_filter(
+        self, filter_data: torch.Tensor, env_ids: Sequence[int] | None = None
+    ) -> None:
+        """Reject legacy per-body filtering absent from Newton particle sets."""
+        del filter_data, env_ids
+        raise NotImplementedError(
+            "Newton deformable collision filtering is scene/solver-owned; "
+            "per-object Default collision-filter data is unsupported."
+        )
+
     def _resolve_env_ids(self, env_ids: Sequence[int] | None) -> list[int]:
         if env_ids is None:
             return list(self._all_indices)
@@ -308,12 +424,7 @@ class DeformableObject(BatchEntity, ABC):
     def set_local_pose(
         self, pose: torch.Tensor, env_ids: Sequence[int] | None = None
     ) -> None:
-        """Set simulation-node pose by transforming the default node buffers.
-
-        Volume-deformable collision vertices are synchronized by DexSim on the
-        next physics update after this particle-batch write.
-        """
-        self._require_data()
+        """Set a deformable pose by transforming its captured rest particles."""
         local_env_ids = self._resolve_env_ids(env_ids)
         if len(local_env_ids) != len(pose):
             raise ValueError(
@@ -326,76 +437,38 @@ class DeformableObject(BatchEntity, ABC):
             pose4x4 = pose
         else:
             raise ValueError(
-                f"Invalid pose shape {pose.shape}. Expected (N, 7) or (N, 4, 4)."
+                f"Invalid pose shape {tuple(pose.shape)}. Expected (N, 7) or "
+                "(N, 4, 4)."
             )
-
         self._apply_local_pose(
             pose4x4.to(device=self.device, dtype=torch.float32),
             local_env_ids,
-            torch.as_tensor(
-                self._spawn_result.arenas.root_offsets,
-                dtype=torch.float32,
-                device=self.device,
-            ),
         )
 
     def _apply_local_pose(
         self,
         pose: torch.Tensor,
         env_ids: Sequence[int],
-        arena_offsets: torch.Tensor,
     ) -> None:
-        """Apply rest-node transforms through the Spawn particle-set batch."""
+        """Apply rest-particle transforms through the Spawn particle batch."""
         self._require_data()
         if not env_ids:
             return
-
-        env_index = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
-        default_positions = self.data.default_nodal_state_w[..., :3]
-        positions = self.data.nodal_pos_w
-        velocities = self.data.nodal_vel_w
-        initial_pose = self._build_cfg_init_pose(1)[0]
-        initial_rotation = initial_pose[:3, :3]
-        initial_translation = initial_pose[:3, 3] + arena_offsets[env_index]
-        rest_positions_local = (
-            default_positions[env_index] - initial_translation.unsqueeze(1)
-        ) @ initial_rotation
-        target_rotation = pose[:, :3, :3]
-        target_translation = pose[:, :3, 3] + arena_offsets[env_index]
-        positions[env_index] = rest_positions_local @ target_rotation.transpose(
-            -1, -2
-        ) + target_translation.unsqueeze(1)
-        velocities[env_index] = 0.0
-        self.data.apply_nodal_state_w(positions, velocities)
-
-    def _build_cfg_init_pose(self, num_instances: int) -> torch.Tensor:
-        """Build configured initial local poses as homogeneous matrices."""
-        if self.cfg.init_local_pose is not None:
-            return (
-                torch.as_tensor(
-                    self.cfg.init_local_pose,
-                    dtype=torch.float32,
-                    device=self.device,
-                )
-                .reshape(1, 4, 4)
-                .repeat(num_instances, 1, 1)
-            )
-        pos = torch.as_tensor(
-            self.cfg.init_pos, dtype=torch.float32, device=self.device
-        ).repeat(num_instances, 1)
-        rot = (
-            torch.as_tensor(self.cfg.init_rot, dtype=torch.float32, device=self.device)
-            * torch.pi
-            / 180.0
-        ).repeat(num_instances, 1)
-        pose = (
-            torch.eye(4, dtype=torch.float32, device=self.device)
-            .unsqueeze(0)
-            .repeat(num_instances, 1, 1)
+        index = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
+        local_positions = self._local_rest_positions.index_select(0, index)
+        rotations = pose[:, :3, :3]
+        translations = pose[:, :3, 3].unsqueeze(1)
+        arena_offsets = self._arena_offsets.to(self.device).index_select(0, index)
+        positions = (
+            torch.bmm(local_positions, rotations.transpose(1, 2))
+            + translations
+            + arena_offsets.unsqueeze(1)
         )
-        pose[:, :3, 3] = pos
-        pose[:, :3, :3] = matrix_from_euler(rot, "XYZ")
-        return pose
+        self._data._apply_nodal_state(
+            positions,
+            torch.zeros_like(positions),
+            env_ids,
+        )
 
     def get_local_pose(self, to_matrix: bool = False) -> torch.Tensor:
         """Reject root-pose reads because deformables have no rigid root pose."""
@@ -405,22 +478,22 @@ class DeformableObject(BatchEntity, ABC):
         )
 
     def get_current_nodal_position(self) -> torch.Tensor:
-        """Return current simulation-node positions in world frame."""
+        """Return current simulation-particle positions in world frame."""
         self._require_data()
         return self.data.nodal_pos_w
 
     def get_current_nodal_velocity(self) -> torch.Tensor:
-        """Return current simulation-node velocities in world frame."""
+        """Return current simulation-particle velocities in world frame."""
         self._require_data()
         return self.data.nodal_vel_w
 
     def get_current_nodal_state(self) -> torch.Tensor:
-        """Return current simulation-node state ``[position, velocity]``."""
+        """Return current nodal state ``[position, velocity]``."""
         self._require_data()
         return self.data.nodal_state_w
 
     def get_default_nodal_state(self) -> torch.Tensor:
-        """Return default simulation-node state ``[position, velocity]``."""
+        """Return the nodal state captured when Spawn was bound."""
         self._require_data()
         return self.data.default_nodal_state_w
 
@@ -430,28 +503,57 @@ class DeformableObject(BatchEntity, ABC):
                 f"{type(self).__name__} data is unavailable before Spawn finalization."
             )
 
-    @abstractmethod
     def get_surface_vertices(self) -> torch.Tensor:
-        """Return visualization/collision surface vertices in world frame."""
+        """Return live render-surface vertices in world frame."""
+        vertices_per_instance: list[torch.Tensor] = []
+        render_pose = self._configured_initial_pose()
+        render_rotation = render_pose[:3, :3]
+        render_translation = render_pose[:3, 3]
+        arena_offsets = self._arena_offsets.to(self.device)
+        for env_idx, entity in enumerate(self._entities):
+            vertices_warp = entity.get_render_vertices_warp()
+            if vertices_warp is None:
+                vertices = torch.as_tensor(
+                    entity.get_render_vertices(),
+                    dtype=torch.float32,
+                    device=self.device,
+                ).reshape(-1, 3)
+            else:
+                import warp as wp
 
-    @abstractmethod
+                vertices = wp.to_torch(vertices_warp).reshape(-1, 3).to(self.device)
+            vertices_per_instance.append(
+                vertices @ render_rotation.T
+                + render_translation
+                + arena_offsets[env_idx]
+            )
+
+        vertex_counts = {len(vertices) for vertices in vertices_per_instance}
+        if len(vertex_counts) != 1:
+            raise ValueError(
+                "All instances of one deformable asset must share render vertex count."
+            )
+        return torch.stack(vertices_per_instance).clone()
+
     def get_surface_triangles(
         self, env_ids: Sequence[int] | None = None
     ) -> torch.Tensor:
-        """Return surface triangle indices for selected environments."""
+        """Return render-surface triangle indices for selected environments."""
+        ids = self._resolve_env_ids(env_ids)
+        index = torch.as_tensor(ids, dtype=torch.long, device=self.device)
+        return self._surface_triangles.index_select(0, index).clone()
 
     def get_triangles(self, env_ids: Sequence[int] | None = None) -> torch.Tensor:
         """Compatibility alias for :meth:`get_surface_triangles`."""
         return self.get_surface_triangles(env_ids=env_ids)
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
-        """Restore initial pose, zero nodal velocity, and source materials."""
+        """Restore the configured pose, zero velocity, and source materials."""
         local_env_ids = self._resolve_env_ids(env_ids)
         self.restore_visual_material(env_ids=local_env_ids)
-        self.set_local_pose(
-            self._build_cfg_init_pose(len(local_env_ids)),
-            env_ids=local_env_ids,
-        )
+        initial_pose = self._configured_initial_pose()
+        pose = initial_pose.unsqueeze(0).repeat(len(local_env_ids), 1, 1)
+        self.set_local_pose(pose, env_ids=local_env_ids)
 
     def destroy(self) -> None:
-        """Release no native resources; the finalized Spawn scene owns them."""
+        """Leave particle lifetime ownership with the finalized Spawn scene."""

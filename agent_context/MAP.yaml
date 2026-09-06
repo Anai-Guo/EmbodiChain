@@ -39,10 +39,29 @@ topics:
       - arena
       - physics step
       - sim update
+      - runtime control
+      - kinematic joint trajectory
+      - register_kinematic_joint_trajectory
+      - kinematic nodal trajectory
+      - register_kinematic_nodal_trajectory
+      - KinematicJointTrajectoryControl
+      - contact material schedule
+      - register_contact_material_schedule
+      - particle contact material schedule
+      - register_particle_contact_material_schedule
       - scene object
       - asset registry
       - explicit physics stepping
       - GPU physics
+      - deformable
+      - particle set
+      - Newton soft body
+      - Newton cloth
+      - array-backed mesh
+      - stable node indices
+      - tetrahedral particle order
+      - independent visual mesh
+      - visual binding mode
       - simulation lifecycle
       - CameraCfg.extrinsics.parent
       - parented camera
@@ -77,10 +96,12 @@ topics:
     source_of_truth:
       - embodichain/lab/sim/__init__.py
       - embodichain/lab/sim/sim_manager.py
+      - embodichain/lab/sim/_runtime_controls.py
       - embodichain/lab/sim/cfg/
       - embodichain/lab/sim/physics/
       - embodichain/lab/sim/common.py
       - embodichain/lab/sim/material.py
+      - embodichain/lab/sim/shapes.py
       - embodichain/lab/sim/profiler.py
       - embodichain/lab/sim/spawn/descriptors.py
       - embodichain/lab/sim/spawn/scene.py
@@ -413,6 +434,9 @@ topics:
       - deformable
       - soft body
       - cloth
+      - Newton deformable
+      - particle set
+      - render topology
       - quaternion
       - xyzw
       - gizmo
@@ -673,6 +697,7 @@ topics:
     title: Differentiable Environment (APG)
     aliases:
       - differentiable env
+      - DifferentiableEnv
       - apg
       - analytic policy gradient
       - differentiable rl
@@ -687,7 +712,7 @@ topics:
       - warp tape
       - requires_grad
       - semi_implicit
-      - DifferentiableEmbodiedEnv
+      - DifferentiableEnv
       - NewtonStepFunc
       - quaternion
       - xyzw
@@ -695,6 +720,7 @@ topics:
       - topics/differentiable-env/differentiable-env.md
     source_of_truth:
       - embodichain/lab/gym/envs/differentiable_env.py
+      - embodichain/lab/sim/cfg/simulation.py
       - embodichain/lab/sim/diff/
       - embodichain_tasks/embodichain_tasks/special/franka_reach_apg.py
     related_topics:

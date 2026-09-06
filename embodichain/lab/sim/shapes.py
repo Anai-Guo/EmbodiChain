@@ -20,7 +20,9 @@ import math
 import warnings
 from dataclasses import MISSING
 from numbers import Integral
-from typing import Any, Dict, List, Literal, TYPE_CHECKING
+from typing import Any, Dict, List, Literal, Sequence, TYPE_CHECKING
+
+import numpy as np
 
 from embodichain.utils import configclass, is_configclass, logger
 
@@ -400,8 +402,27 @@ class MeshCfg(ShapeCfg):
 
     shape_type: str = "Mesh"
 
-    fpath: str = MISSING
-    """File path to the shape mesh file."""
+    fpath: str | None = None
+    """File path to the shape mesh file.
+
+    Provide either this path or both :attr:`vertices` and :attr:`triangles`.
+    """
+
+    vertices: Sequence[Sequence[float]] | np.ndarray | None = None
+    """Optional array-backed mesh vertices with shape ``(N, 3)``.
+
+    Array-backed meshes preserve vertex order, which is useful when per-node
+    deformable flags or kinematic trajectories refer to stable node indices.
+    """
+
+    triangles: Sequence[Sequence[int]] | np.ndarray | None = None
+    """Optional array-backed triangle indices with shape ``(M, 3)``."""
+
+    normals: Sequence[Sequence[float]] | np.ndarray | None = None
+    """Optional per-vertex normals with shape ``(N, 3)``."""
+
+    uv_coords: Sequence[Sequence[float]] | np.ndarray | None = None
+    """Optional per-vertex texture coordinates with shape ``(N, 2)``."""
 
     load_option: LoadOption = LoadOption()
     """Options for loading and processing the shape."""

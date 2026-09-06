@@ -22,6 +22,22 @@ decoding and compiling the constrained Task Program schema surface.
    compile_mllm_task_program
    decode_mllm_task_program
 
+embodichain.data.assets.demo_assets
+-----------------------------------
+
+Downloadable bundles used by standalone manipulation and deformable-body
+demos. Each class resolves one versioned archive into the configured
+EmbodiChain data cache.
+
+.. currentmodule:: embodichain.data.assets.demo_assets
+
+.. autosummary::
+
+   CoordinatedPlacementAndPickment
+   DeformableDemoData
+   MultiW1Data
+   ScoopIceNewEnv
+
 embodichain.data.assets.planner_assets
 --------------------------------------
 
@@ -832,15 +848,14 @@ embodichain.lab.sim.atomic_actions.transports
 embodichain.lab.sim.diff
 ------------------------
 
-Public differentiable-stepping bridge from manager-owned Newton trajectories
-and Warp tapes into PyTorch autograd.
+Public bridge from task-defined Newton kinematics and Warp tapes into PyTorch
+autograd. It does not advance the Newton dynamics solver.
 
 .. currentmodule:: embodichain.lab.sim.diff
 
 .. autosummary::
 
    NewtonStepFunc
-   differentiable_step
    tape_context
 
 embodichain.lab.sim.diff.bridge
@@ -851,7 +866,6 @@ embodichain.lab.sim.diff.bridge
 .. autosummary::
 
    NewtonStepFunc
-   differentiable_step
    tape_context
 
 embodichain.lab.sim.diff.runtime

@@ -204,7 +204,7 @@ class DefaultCollisionPropertiesCfg(CollisionPropertiesCfg):
 
 @configclass
 class NewtonCollisionPropertiesCfg(CollisionPropertiesCfg):
-    """Newton-native contact-envelope properties.
+    """Newton-native contact-envelope and particle-contact properties.
 
     Mesh construction belongs to ``MeshCfg.collision``; filtering, visual, and
     semantic-site policies are deliberately not part of rigid-body physics.
@@ -213,6 +213,13 @@ class NewtonCollisionPropertiesCfg(CollisionPropertiesCfg):
 
     See `Newton Shape Configuration
     <https://newton-physics.github.io/newton/latest/concepts/collisions.html#shape-configuration>`_.
+    """
+
+    has_particle_collision: bool | None = None
+    """Whether Newton particles collide with this shape.
+
+    ``None`` preserves the source/backend value. This controls deformable
+    contact participation; scene-level collision isolation remains scene-owned.
     """
 
     contact_offset: float | None = None

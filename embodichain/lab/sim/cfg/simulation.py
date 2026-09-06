@@ -433,6 +433,7 @@ class NewtonPhysicsCfg(PhysicsBackendCfg):
         from dexsim.engine.newton_physics import (
             AutoSolverCfg,
             FeatherstoneSolverCfg,
+            MJVBDSolverCfg,
             MJWarpSolverCfg,
             NewtonCfg,
             NewtonCollisionPipelineCfg as DexsimNewtonCollisionPipelineCfg,
@@ -453,6 +454,7 @@ class NewtonPhysicsCfg(PhysicsBackendCfg):
         solver_cfg_map: dict[str, type] = {
             "auto": AutoSolverCfg,
             "mujoco_warp": MJWarpSolverCfg,
+            "mjvbd": MJVBDSolverCfg,
             "xpbd": XPBDSolverCfg,
             "semi_implicit": SemiImplicitSolverCfg,
             "featherstone": FeatherstoneSolverCfg,
@@ -525,6 +527,11 @@ def _normalize_newton_solver_type(solver_type: str) -> str:
         "mujocowarp": "mujoco_warp",
         "mujocowarpsolver": "mujoco_warp",
         "mujocowarpsolvercfg": "mujoco_warp",
+        "mjvbd": "mjvbd",
+        "mjvbdsolver": "mjvbd",
+        "mjvbdsolvercfg": "mjvbd",
+        "mjvbd_solver": "mjvbd",
+        "mjvbd_solver_cfg": "mjvbd",
         "xpbdsolver": "xpbd",
         "xpbdsolvercfg": "xpbd",
         "xpbd": "xpbd",
@@ -542,7 +549,7 @@ def _normalize_newton_solver_type(solver_type: str) -> str:
     if key not in aliases:
         logger.log_error(
             f"Unsupported Newton solver type '{solver_type}'. "
-            "Expected one of 'auto', 'mjwarp', 'xpbd', 'semi_implicit', "
+            "Expected one of 'auto', 'mjwarp', 'mjvbd', 'xpbd', 'semi_implicit', "
             "'featherstone', or 'vbd'."
         )
     return aliases[key]

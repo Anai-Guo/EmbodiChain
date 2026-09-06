@@ -14,15 +14,17 @@
 # limitations under the License.
 # ----------------------------------------------------------------------------
 
-"""Backend-neutral data contract for deformable simulation objects."""
+"""Nodal data contract and Newton particle-set state adapter."""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
 import torch
-from dexsim.scene import Scene, SpawnedParticleSet
+
+if TYPE_CHECKING:
+    from dexsim.scene import Scene, SpawnedParticleSet
 
 __all__ = ["DeformableObjectData"]
 
@@ -30,9 +32,8 @@ __all__ = ["DeformableObjectData"]
 class DeformableObjectData(ABC):
     """Common nodal-state view for volume and surface deformables.
 
-    Positions and velocities use the simulation world frame. Concrete
-    backends own how the buffers are fetched; consumers can rely on a stable
-    ``(num_instances, num_nodes, 3)`` contract.
+    Positions and velocities use the simulation world frame. Consumers can
+    rely on a stable ``(num_instances, num_nodes, 3)`` contract.
     """
 
     @property
@@ -49,14 +50,6 @@ class DeformableObjectData(ABC):
     @abstractmethod
     def default_nodal_state_w(self) -> torch.Tensor:
         """Return default nodal state ``[position, velocity]`` in world frame."""
-
-    @abstractmethod
-    def apply_nodal_state_w(
-        self,
-        positions: torch.Tensor,
-        velocities: torch.Tensor,
-    ) -> None:
-        """Write simulation-node positions and velocities in world frame."""
 
     @property
     def nodal_state_w(self) -> torch.Tensor:
@@ -75,7 +68,7 @@ class DeformableObjectData(ABC):
 
 
 class _ParticleSetData(DeformableObjectData):
-    """Packed DexSim particle-set state behind the common nodal contract."""
+    """Packed state adapter over DexSim 0.5 particle-set handles."""
 
     def __init__(
         self,
@@ -83,70 +76,115 @@ class _ParticleSetData(DeformableObjectData):
         scene: Scene,
         device: torch.device,
     ) -> None:
-        if not isinstance(scene, Scene):
-            raise TypeError("Particle-set data requires a finalized DexSim Scene.")
-        if not entities:
-            raise ValueError("Particle-set data requires at least one Spawn handle.")
+        self.entities = list(entities)
+        if not self.entities:
+            raise ValueError("A deformable particle-set batch cannot be empty.")
 
-        self.entities = tuple(entities)
         self.scene = scene
         self.device = device
         self.num_instances = len(self.entities)
-        self.particle_batch = scene.create_particle_set_batch(list(self.entities))
-        particle_counts = self.particle_batch.particle_counts
+        particle_counts = tuple(int(entity.particle_count) for entity in self.entities)
+        if any(count <= 0 for count in particle_counts):
+            raise ValueError("Deformable particle sets must contain particles.")
         if len(set(particle_counts)) != 1:
             raise ValueError(
-                "A deformable batch requires each SpawnedParticleSet to have "
-                f"the same node count, got {particle_counts!r}."
+                "All instances of one deformable asset must have the same "
+                f"particle count, got {particle_counts}."
             )
 
-        self.num_nodes = particle_counts[0]
-        self._nodal_position = torch.empty(
-            (self.num_instances, self.num_nodes, 3),
+        self.n_nodes = particle_counts[0]
+        self.batch = scene.create_particle_set_batch(self.entities)
+        self._position_buffer = torch.empty(
+            (self.num_instances, self.n_nodes, 3),
             dtype=torch.float32,
             device=self.device,
         )
-        self._nodal_velocity = torch.empty_like(self._nodal_position)
-        self.particle_batch.fetch_particle_positions(
-            self._nodal_position.reshape(-1, 3)
-        )
+        self._velocity_buffer = torch.empty_like(self._position_buffer)
+        default_positions = self.nodal_pos_w
+        default_velocities = self.nodal_vel_w
         self._default_nodal_state_w = torch.cat(
-            (self._nodal_position, torch.zeros_like(self._nodal_position)),
+            (default_positions, default_velocities),
             dim=-1,
         )
 
+    @staticmethod
+    def _check_batch_status(status: int | None, operation: str) -> None:
+        if status is not None and int(status) < 0:
+            raise RuntimeError(
+                f"DexSim particle batch failed to {operation}: status {status}."
+            )
+
     @property
     def nodal_pos_w(self) -> torch.Tensor:
-        """Return current simulation-node positions in world frame."""
-        self.particle_batch.fetch_particle_positions(
-            self._nodal_position.reshape(-1, 3)
+        """Return current Newton particle positions in world frame."""
+        status = self.batch.fetch_particle_positions(
+            self._position_buffer.reshape(-1, 3)
         )
-        return self._nodal_position.clone()
+        self._check_batch_status(status, "fetch positions")
+        return self._position_buffer.clone()
 
     @property
     def nodal_vel_w(self) -> torch.Tensor:
-        """Return current simulation-node velocities in world frame."""
-        self.particle_batch.fetch_particle_velocities(
-            self._nodal_velocity.reshape(-1, 3)
+        """Return current Newton particle velocities in world frame."""
+        status = self.batch.fetch_particle_velocities(
+            self._velocity_buffer.reshape(-1, 3)
         )
-        return self._nodal_velocity.clone()
+        self._check_batch_status(status, "fetch velocities")
+        return self._velocity_buffer.clone()
 
     @property
     def default_nodal_state_w(self) -> torch.Tensor:
-        """Return the state captured immediately after Spawn materialization."""
+        """Return the particle state captured when Spawn was bound."""
         return self._default_nodal_state_w.clone()
 
-    def apply_nodal_state_w(
+    def _apply_nodal_state(
         self,
         positions: torch.Tensor,
         velocities: torch.Tensor,
+        env_ids: Sequence[int],
     ) -> None:
-        """Write a complete, uniformly-shaped particle-set batch state."""
-        expected_shape = (self.num_instances, self.num_nodes, 3)
-        for name, value in (("positions", positions), ("velocities", velocities)):
-            if tuple(value.shape) != expected_shape:
-                raise ValueError(
-                    f"Expected {name} shape {expected_shape}, got {tuple(value.shape)}."
-                )
-        self.particle_batch.apply_particle_positions(positions.reshape(-1, 3))
-        self.particle_batch.apply_particle_velocities(velocities.reshape(-1, 3))
+        """Apply packed state to selected particle-set instances."""
+        env_ids = [int(env_id) for env_id in env_ids]
+        if not env_ids:
+            return
+        if len(set(env_ids)) != len(env_ids):
+            raise ValueError(f"env_ids must not contain duplicates, got {env_ids}.")
+
+        expected_shape = (len(env_ids), self.n_nodes, 3)
+        if tuple(positions.shape) != expected_shape:
+            raise ValueError(
+                f"positions must have shape {expected_shape}, got "
+                f"{tuple(positions.shape)}."
+            )
+        if tuple(velocities.shape) != expected_shape:
+            raise ValueError(
+                f"velocities must have shape {expected_shape}, got "
+                f"{tuple(velocities.shape)}."
+            )
+
+        if env_ids == list(range(self.num_instances)):
+            batch = self.batch
+        else:
+            batch = self.scene.create_particle_set_batch(
+                [self.entities[env_id] for env_id in env_ids]
+            )
+        packed_positions = (
+            positions.to(
+                device=self.device,
+                dtype=torch.float32,
+            )
+            .contiguous()
+            .reshape(-1, 3)
+        )
+        packed_velocities = (
+            velocities.to(
+                device=self.device,
+                dtype=torch.float32,
+            )
+            .contiguous()
+            .reshape(-1, 3)
+        )
+        position_status = batch.apply_particle_positions(packed_positions)
+        self._check_batch_status(position_status, "apply positions")
+        velocity_status = batch.apply_particle_velocities(packed_velocities)
+        self._check_batch_status(velocity_status, "apply velocities")

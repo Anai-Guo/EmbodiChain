@@ -233,10 +233,10 @@ def _add_objects(
                 # Keep every preview body static: exported poses are already the
                 # final gravity-settled poses and should not be simulated again.
                 body_type="static",
-                  init_pos=tuple(init_pos),
-                  init_rot=tuple(init_rot),
-                  body_scale=tuple(body_scale),
-              )
+                init_pos=tuple(init_pos),
+                init_rot=tuple(init_rot),
+                body_scale=tuple(body_scale),
+            )
         )
         print(f"[{label}] {uid}: pos={init_pos} rot={init_rot} scale={body_scale}")
 
