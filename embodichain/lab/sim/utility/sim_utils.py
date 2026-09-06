@@ -43,8 +43,8 @@ from embodichain.lab.sim.cfg import (
     LinkPhysicsOverrideCfg,
     RigidBodyPhysicsCfg,
     RigidObjectCfg,
-    SoftObjectCfg,
-    ClothObjectCfg,
+    VolumeDeformableObjectCfg,
+    SurfaceDeformableObjectCfg,
 )
 from embodichain.utils.string import resolve_matching_names
 from embodichain.lab.sim.shapes import CubeCfg, MeshCfg, MeshCollisionCfg, SphereCfg
@@ -754,25 +754,3 @@ def load_mesh_objects_from_cfg(
         List[MeshObject]: List of loaded mesh objects.
     """
     return spawn_rigid_object_entities(cfg, env_list, cache_dir=cache_dir)
-
-
-def load_soft_object_from_cfg(
-    cfg: SoftObjectCfg, env_list: List[Arena]
-) -> List[MeshObject]:
-    """Reject the removed direct-native soft-body construction path."""
-    del cfg, env_list
-    raise NotImplementedError(
-        "Direct soft-body loading was removed. Configure Newton and call "
-        "SimulationManager.add_soft_object() before prepare()."
-    )
-
-
-def load_cloth_object_from_cfg(
-    cfg: ClothObjectCfg, env_list: List[Arena]
-) -> List[MeshObject]:
-    """Reject the removed direct-native cloth construction path."""
-    del cfg, env_list
-    raise NotImplementedError(
-        "Direct cloth loading was removed. Configure Newton and call "
-        "SimulationManager.add_cloth_object() before prepare()."
-    )

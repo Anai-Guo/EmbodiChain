@@ -11,7 +11,7 @@ derives from :class:`~embodichain.lab.sim.common.BatchEntity` and pairs a
 runtime class with a ``*Data`` buffer and a ``*Cfg`` config. The hierarchy
 covers lights (``Light``), rigid bodies (``RigidObject`` and grouped
 ``RigidObjectGroup``), articulated chains (``Articulation``) and their robot
-specialization (``Robot``), deformables (``SoftObject``, ``ClothObject``),
+specialization (``Robot``), deformables (``VolumeDeformableObject``, ``SurfaceDeformableObject``),
 interactive ``Gizmo`` handles, and ``RigidConstraint`` attachments between
 bodies.
 
@@ -31,12 +31,6 @@ bodies.
     ArticulationJointKinematics
     ArticulationData
     ArticulationCfg
-    SoftObject
-    SoftBodyData
-    SoftObjectCfg
-    ClothObject
-    ClothBodyData
-    ClothObjectCfg
     Robot
     RobotCfg
     RobotWorkspaceCfg
@@ -117,42 +111,6 @@ Articulation
     :show-inheritance:
 
 .. autoclass:: ArticulationCfg
-    :members:
-    :inherited-members:
-    :show-inheritance:
-    :exclude-members: __init__, copy, replace, to_dict, validate
-
-Soft Object
------------
-
-.. autoclass:: SoftObject
-    :members:
-    :inherited-members:
-    :show-inheritance:
-
-.. autoclass:: SoftBodyData
-    :members:
-    :show-inheritance:
-
-.. autoclass:: SoftObjectCfg
-    :members:
-    :inherited-members:
-    :show-inheritance:
-    :exclude-members: __init__, copy, replace, to_dict, validate
-
-Cloth Object
-------------
-
-.. autoclass:: ClothObject
-    :members:
-    :inherited-members:
-    :show-inheritance:
-
-.. autoclass:: ClothBodyData
-    :members:
-    :show-inheritance:
-
-.. autoclass:: ClothObjectCfg
     :members:
     :inherited-members:
     :show-inheritance:
@@ -282,23 +240,29 @@ Backend implementation import paths
 Unified Deformable Objects
 --------------------------
 
-The deformable package provides a backend-neutral nodal-state contract and
-canonical surface/volume names. ``Cloth*`` and ``Soft*`` remain compatibility
-aliases for existing environments and tutorials.
+Surface and volume objects share one concrete ``DeformableObjectData`` backed
+by DexSim Newton particle batches. After ``sim.prepare()``, prefer ``obj.data``
+for state reads: ``n_nodes`` gives the particle count without fetching state,
+``nodal_pos_w`` and ``nodal_vel_w`` return world-frame tensors of shape
+``(num_instances, n_nodes, 3)``, and ``nodal_state_w`` concatenates the two.
+State reads return independent snapshots. ``default_nodal_state_w`` retains
+the state captured at Spawn binding; ``root_pos_w`` is the mean node position,
+not a mass-weighted center of mass.
+
+Use ``obj.deformable_type`` to distinguish physical topology. Read simulation
+nodes through ``data``. Render vertices and triangles are available through
+``get_surface_vertices()`` and ``get_surface_triangles()``; volume objects also
+expose tetrahedral boundary triangles through ``get_collision_surface_triangles()``.
+Use ``SimulationManager.add_deformable_object()`` and ``get_deformable_object()``
+to manage both topologies.
 
 .. currentmodule:: embodichain.lab.sim.objects.deformable
 
 .. autosummary::
 
-    ClothBodyData
-    ClothObject
     DeformableObject
     DeformableObjectData
-    SoftBodyData
-    SoftObject
-    SurfaceDeformableData
     SurfaceDeformableObject
-    VolumeDeformableData
     VolumeDeformableObject
 
 .. autoclass:: DeformableObject
@@ -308,15 +272,7 @@ aliases for existing environments and tutorials.
 .. autoclass:: DeformableObjectData
     :members:
 
-.. autoclass:: SurfaceDeformableData
-    :members:
-    :show-inheritance:
-
 .. autoclass:: SurfaceDeformableObject
-    :members:
-    :show-inheritance:
-
-.. autoclass:: VolumeDeformableData
     :members:
     :show-inheritance:
 
@@ -343,16 +299,10 @@ Deformable implementation import paths
 
 .. autosummary::
 
-    ClothBodyData
-    ClothObject
-    SurfaceDeformableData
     SurfaceDeformableObject
 
 .. currentmodule:: embodichain.lab.sim.objects.deformable.volume
 
 .. autosummary::
 
-    SoftBodyData
-    SoftObject
-    VolumeDeformableData
     VolumeDeformableObject

@@ -35,11 +35,11 @@ The first step is to configure the simulation environment. This is done using th
 Adding a soft body to the scene
 -------------------------------
 
-With the simulation context created, we can add a soft (deformable) object. This tutorial demonstrates adding a soft-body cow mesh to the scene using the :meth:`SimulationManager.add_soft_object` method. The object's geometry and physical parameters are defined through configuration objects:
+With the simulation context created, we can add a soft (deformable) object. This tutorial demonstrates adding a soft-body cow mesh to the scene using the :meth:`SimulationManager.add_deformable_object` method. The object's geometry and physical parameters are defined through configuration objects:
 
 - :class:`cfg.MeshCfg` for the mesh shape (``cow.obj``)
-- :class:`cfg.SoftbodyVoxelAttributesCfg` for voxelization and simulation mesh resolution
-- :class:`cfg.SoftbodyPhysicalAttributesCfg` for material properties (Young's modulus, Poisson's ratio, density, frictions, solver iterations)
+- :class:`cfg.VolumeDeformableMeshingCfg` for voxelization and simulation mesh resolution
+- :class:`cfg.VolumeDeformablePhysicsCfg` for ``attrs`` (``youngs``, ``poissons``, volume density, and ``surface_props``)
 
 .. literalinclude:: ../../../scripts/tutorials/sim/create_softbody.py
    :language: python

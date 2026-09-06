@@ -74,8 +74,6 @@ from embodichain.lab.sim.objects import (
     DeformableObject,
     SurfaceDeformableObject,
     VolumeDeformableObject,
-    SoftObject,
-    ClothObject,
     Articulation,
     Robot,
     Light,
@@ -105,8 +103,6 @@ from embodichain.lab.sim.cfg import (
     DeformableObjectCfg,
     SurfaceDeformableObjectCfg,
     VolumeDeformableObjectCfg,
-    SoftObjectCfg,
-    ClothObjectCfg,
     RigidObjectGroupCfg,
     ArticulationCfg,
     ArticulationRootPropertiesCfg,
@@ -2443,18 +2439,6 @@ class SimulationManager:
         self.notify_visualization_topology_changed()
         return deformable
 
-    def add_soft_object(self, cfg: SoftObjectCfg) -> SoftObject:
-        """Compatibility wrapper for adding a volume deformable."""
-        deformable = self.add_deformable_object(cfg)
-        assert isinstance(deformable, VolumeDeformableObject)
-        return deformable
-
-    def add_cloth_object(self, cfg: ClothObjectCfg) -> ClothObject:
-        """Compatibility wrapper for adding a surface deformable."""
-        deformable = self.add_deformable_object(cfg)
-        assert isinstance(deformable, SurfaceDeformableObject)
-        return deformable
-
     def get_rigid_object(self, uid: str) -> RigidObject | None:
         """Get a rigid object by its unique ID.
 
@@ -2475,22 +2459,6 @@ class SimulationManager:
             logger.log_warning(f"Deformable object {uid} not found.")
             return None
         return self._deformable_objects[uid]
-
-    def get_soft_object(self, uid: str) -> SoftObject | None:
-        """Get a volume deformable through the legacy soft-object API."""
-        deformable = self._deformable_objects.get(uid)
-        if not isinstance(deformable, VolumeDeformableObject):
-            logger.log_warning(f"Soft object {uid} not found.")
-            return None
-        return deformable
-
-    def get_cloth_object(self, uid: str) -> ClothObject | None:
-        """Get a surface deformable through the legacy cloth-object API."""
-        deformable = self._deformable_objects.get(uid)
-        if not isinstance(deformable, SurfaceDeformableObject):
-            logger.log_warning(f"Cloth object {uid} not found.")
-            return None
-        return deformable
 
     def get_rigid_object_uid_list(self) -> List[str]:
         """Get current rigid body uid list
@@ -2680,22 +2648,6 @@ class SimulationManager:
     def get_deformable_object_uid_list(self) -> List[str]:
         """Return all deformable object UIDs in declaration order."""
         return list(self._deformable_objects.keys())
-
-    def get_soft_object_uid_list(self) -> List[str]:
-        """Return volume-deformable UIDs through the legacy soft API."""
-        return [
-            uid
-            for uid, asset in self._deformable_objects.items()
-            if asset.deformable_type == "volume"
-        ]
-
-    def get_cloth_object_uid_list(self) -> List[str]:
-        """Return surface-deformable UIDs through the legacy cloth API."""
-        return [
-            uid
-            for uid, asset in self._deformable_objects.items()
-            if asset.deformable_type == "surface"
-        ]
 
     def remove_rigid_constraint(
         self,

@@ -25,17 +25,18 @@ import numpy as np
 from embodichain.lab.gym.utils.gym_utils import add_env_launcher_args_to_parser
 from embodichain.lab.sim import SimulationManager, SimulationManagerCfg
 from embodichain.lab.sim.cfg import (
-    ClothObjectCfg,
-    ClothPhysicalAttributesCfg,
+    SurfaceElementPropertiesCfg,
+    SurfaceDeformableObjectCfg,
+    SurfaceDeformablePhysicsCfg,
     LightCfg,
     NewtonPhysicsCfg,
     RenderCfg,
-    SoftObjectCfg,
-    SoftbodyPhysicalAttributesCfg,
-    SoftbodyVoxelAttributesCfg,
+    VolumeDeformableObjectCfg,
+    VolumeDeformablePhysicsCfg,
+    VolumeDeformableMeshingCfg,
 )
 from embodichain.lab.sim.material import VisualMaterialCfg
-from embodichain.lab.sim.objects import ClothObject, SoftObject
+from embodichain.lab.sim.objects import SurfaceDeformableObject, VolumeDeformableObject
 from embodichain.lab.sim.shapes import MeshCfg
 from embodichain.lab.visualization import visualization_cfg_from_args
 from embodichain.utils import logger
@@ -268,7 +269,7 @@ def create_cloth_grid_mesh(
     )
 
 
-def create_soft_body(sim: SimulationManager) -> SoftObject:
+def create_soft_body(sim: SimulationManager) -> VolumeDeformableObject:
     """Declare the falling soft box with the reference material parameters.
 
     Args:
@@ -278,8 +279,8 @@ def create_soft_body(sim: SimulationManager) -> SoftObject:
         The declared volume-deformable facade.
     """
     vertices, triangles = create_box_surface_mesh(SOFT_BODY_SIZE)
-    return sim.add_soft_object(
-        SoftObjectCfg(
+    return sim.add_deformable_object(
+        VolumeDeformableObjectCfg(
             uid="falling_soft_body",
             shape=MeshCfg(
                 vertices=vertices,
@@ -291,10 +292,10 @@ def create_soft_body(sim: SimulationManager) -> SoftObject:
                 ),
             ),
             init_pos=SOFT_BODY_POSITION,
-            voxel_attr=SoftbodyVoxelAttributesCfg(
+            meshing=VolumeDeformableMeshingCfg(
                 simulation_mesh_resolution=10,
             ),
-            physical_attr=SoftbodyPhysicalAttributesCfg(
+            attrs=VolumeDeformablePhysicsCfg(
                 # This converts exactly to k_mu=8e3 and k_lambda=8e3.
                 youngs=2.0e4,
                 poissons=0.25,
@@ -305,7 +306,7 @@ def create_soft_body(sim: SimulationManager) -> SoftObject:
     )
 
 
-def create_cloth(sim: SimulationManager) -> ClothObject:
+def create_cloth(sim: SimulationManager) -> SurfaceDeformableObject:
     """Declare the cloth sheet with both X edges fixed.
 
     Args:
@@ -317,8 +318,8 @@ def create_cloth(sim: SimulationManager) -> ClothObject:
     vertices, triangles, fixed_indices = create_cloth_grid_mesh()
     particle_flags = np.ones(len(vertices), dtype=np.int32)
     particle_flags[fixed_indices] = 0
-    return sim.add_cloth_object(
-        ClothObjectCfg(
+    return sim.add_deformable_object(
+        SurfaceDeformableObjectCfg(
             uid="cloth_sheet",
             shape=MeshCfg(
                 vertices=vertices,
@@ -332,13 +333,15 @@ def create_cloth(sim: SimulationManager) -> ClothObject:
             init_pos=CLOTH_POSITION,
             particle_radius=0.05,
             particle_flags=particle_flags,
-            physical_attr=ClothPhysicalAttributesCfg(
+            attrs=SurfaceDeformablePhysicsCfg(
                 density=5.0e-4,
-                tri_ke=1.0e5,
-                tri_ka=1.0e5,
-                tri_kd=1.0e-5,
-                edge_ke=0.01,
-                edge_kd=1.0e-2,
+                surface_props=SurfaceElementPropertiesCfg(
+                    tri_ke=1.0e5,
+                    tri_ka=1.0e5,
+                    tri_kd=1.0e-5,
+                    edge_ke=0.01,
+                    edge_kd=1.0e-2,
+                ),
             ),
         )
     )
@@ -361,8 +364,8 @@ def configure_window_camera(sim: SimulationManager) -> None:
 
 def run_simulation(
     sim: SimulationManager,
-    soft_body: SoftObject,
-    cloth: ClothObject,
+    soft_body: VolumeDeformableObject,
+    cloth: SurfaceDeformableObject,
     iterations: int,
 ) -> None:
     """Advance the coupled scene for a finite number of frames.
@@ -375,23 +378,19 @@ def run_simulation(
     """
     logger.log_info(f"Running soft body to cloth for {iterations} frames at {FPS} Hz.")
     logger.log_info(
-        f"Soft body: {soft_body.get_default_nodal_state().shape[1]} particles, "
+        f"Soft body: {soft_body.data.n_nodes} particles, "
         f"{soft_body.get_surface_triangles().shape[1]} surface triangles."
     )
     logger.log_info(
-        f"Cloth: {cloth.get_default_nodal_state().shape[1]} particles, "
+        f"Cloth: {cloth.data.n_nodes} particles, "
         f"{cloth.get_surface_triangles().shape[1]} triangles."
     )
 
     for frame in range(iterations):
         sim.update(step=1)
         if frame % 50 == 0 or frame + 1 == iterations:
-            soft_height = float(
-                soft_body.get_current_nodal_position()[..., 2].mean().item()
-            )
-            cloth_height = float(
-                cloth.get_current_nodal_position()[..., 2].mean().item()
-            )
+            soft_height = float(soft_body.data.root_pos_w[:, 2].mean().item())
+            cloth_height = float(cloth.data.root_pos_w[:, 2].mean().item())
             logger.log_info(
                 f"Frame {frame + 1}/{iterations}, "
                 f"sim_time={(frame + 1) / FPS:.2f}s, "

@@ -24,11 +24,16 @@ import torch
 
 from embodichain.lab.sim.material import VisualMaterialInst
 from embodichain.lab.sim.objects.articulation import Articulation
-from embodichain.lab.sim.objects.cloth_object import ClothObject
+from embodichain.lab.sim.objects.deformable import SurfaceDeformableObject
 from embodichain.lab.sim.objects.rigid_object import RigidObject
-from embodichain.lab.sim.objects.soft_object import SoftObject
+from embodichain.lab.sim.objects.deformable import VolumeDeformableObject
 
-_ASSET_TYPES = (RigidObject, Articulation, SoftObject, ClothObject)
+_ASSET_TYPES = (
+    RigidObject,
+    Articulation,
+    VolumeDeformableObject,
+    SurfaceDeformableObject,
+)
 _LINK_NAME = "link"
 
 

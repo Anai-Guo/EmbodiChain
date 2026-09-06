@@ -47,10 +47,11 @@ from dexsim.spawn import (
 )
 
 from embodichain.lab.sim.cfg import (
+    SurfaceElementPropertiesCfg,
     ArticulationCfg,
     ArticulationRootPropertiesCfg,
-    ClothObjectCfg,
-    ClothPhysicalAttributesCfg,
+    SurfaceDeformableObjectCfg,
+    SurfaceDeformablePhysicsCfg,
     CollisionPropertiesCfg,
     DefaultCollisionPropertiesCfg,
     DefaultRigidBodyPropertiesCfg,
@@ -65,18 +66,18 @@ from embodichain.lab.sim.cfg import (
     RigidBodyPhysicsCfg,
     RigidObjectCfg,
     RobotCfg,
-    SoftbodyPhysicalAttributesCfg,
-    SoftbodyVoxelAttributesCfg,
-    SoftObjectCfg,
+    VolumeDeformablePhysicsCfg,
+    VolumeDeformableMeshingCfg,
+    VolumeDeformableObjectCfg,
 )
 from embodichain.lab.sim.shapes import CubeCfg, LoadOption, MeshCfg
 from embodichain.lab.sim.objects import Articulation
 from embodichain.lab.sim.spawn.descriptors import (
     articulation_desc_from_cfg,
-    cloth_desc_from_cfg,
+    surface_deformable_desc_from_cfg,
     configure_articulation_desc,
     rigid_desc_from_cfg,
-    soft_desc_from_cfg,
+    volume_deformable_desc_from_cfg,
 )
 from embodichain.lab.sim.spawn.usd import (
     articulation_desc_from_usd,
@@ -92,13 +93,13 @@ DEFORMABLE_MESH_PATH = "/assets/deformable.obj"
 def test_soft_descriptor_uses_newton_particle_schema() -> None:
     youngs = 1.0e5
     poissons = 0.4
-    cfg = SoftObjectCfg(
+    cfg = VolumeDeformableObjectCfg(
         uid="soft",
         shape=MeshCfg(fpath=DEFORMABLE_MESH_PATH),
         particle_radius=0.02,
         particle_flags=0,
         validate_mesh=True,
-        voxel_attr=SoftbodyVoxelAttributesCfg(
+        meshing=VolumeDeformableMeshingCfg(
             triangle_remesh_resolution=12,
             triangle_simplify_target=40,
             simulation_mesh_resolution=16,
@@ -107,17 +108,19 @@ def test_soft_descriptor_uses_newton_particle_schema() -> None:
             voxel_surface_dist_ratio=0.3,
             embedding_impl="dexsim_exact_cpu",
         ),
-        physical_attr=SoftbodyPhysicalAttributesCfg(
+        attrs=VolumeDeformablePhysicsCfg(
             youngs=youngs,
             poissons=poissons,
             density=75.0,
             elasticity_damping=0.2,
-            surface_tri_ke=1.0,
-            surface_edge_ke=2.0,
+            surface_props=SurfaceElementPropertiesCfg(
+                tri_ke=1.0,
+                edge_ke=2.0,
+            ),
         ),
     )
 
-    descriptor, materials = soft_desc_from_cfg(cfg, per_env=False)
+    descriptor, materials = volume_deformable_desc_from_cfg(cfg, per_env=False)
 
     assert isinstance(descriptor, SoftBodyDesc)
     assert descriptor.mesh.file_path == DEFORMABLE_MESH_PATH
@@ -145,26 +148,28 @@ def test_soft_descriptor_uses_newton_particle_schema() -> None:
 
 
 def test_cloth_descriptor_uses_newton_particle_schema() -> None:
-    cfg = ClothObjectCfg(
+    cfg = SurfaceDeformableObjectCfg(
         uid="cloth",
         shape=MeshCfg(fpath=DEFORMABLE_MESH_PATH),
         particle_radius=0.01,
         particle_flags=np.asarray([0, 1, 0], dtype=np.int32),
         validate_mesh=True,
-        physical_attr=ClothPhysicalAttributesCfg(
+        attrs=SurfaceDeformablePhysicsCfg(
             density=2.5,
-            tri_ke=100.0,
-            tri_ka=90.0,
-            tri_kd=5.0,
-            edge_ke=20.0,
-            edge_kd=2.0,
+            surface_props=SurfaceElementPropertiesCfg(
+                tri_ke=100.0,
+                tri_ka=90.0,
+                tri_kd=5.0,
+                edge_ke=20.0,
+                edge_kd=2.0,
+            ),
             add_springs=True,
             spring_ke=30.0,
             spring_kd=3.0,
         ),
     )
 
-    descriptor, materials = cloth_desc_from_cfg(cfg, per_env=False)
+    descriptor, materials = surface_deformable_desc_from_cfg(cfg, per_env=False)
 
     assert isinstance(descriptor, ClothDesc)
     assert descriptor.mesh.file_path == DEFORMABLE_MESH_PATH
@@ -195,7 +200,7 @@ def test_cloth_descriptor_preserves_array_mesh_vertex_order() -> None:
         [[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]],
         dtype=np.float32,
     )
-    cfg = ClothObjectCfg(
+    cfg = SurfaceDeformableObjectCfg(
         uid="cloth",
         shape=MeshCfg(
             vertices=vertices,
@@ -206,7 +211,7 @@ def test_cloth_descriptor_preserves_array_mesh_vertex_order() -> None:
     )
 
     cfg.validate()
-    descriptor, _ = cloth_desc_from_cfg(cfg)
+    descriptor, _ = surface_deformable_desc_from_cfg(cfg)
 
     assert descriptor.mesh.file_path is None
     np.testing.assert_array_equal(descriptor.mesh.vertices, vertices)
@@ -217,7 +222,7 @@ def test_cloth_descriptor_preserves_array_mesh_vertex_order() -> None:
 
 def test_cloth_descriptor_supports_independent_visual_mesh() -> None:
     visual_mesh_path = "/assets/deformable_visual.obj"
-    cfg = ClothObjectCfg(
+    cfg = SurfaceDeformableObjectCfg(
         uid="cloth",
         shape=MeshCfg(
             vertices=np.asarray(
@@ -230,7 +235,7 @@ def test_cloth_descriptor_supports_independent_visual_mesh() -> None:
         visual_binding_mode="nearest_vertex",
     )
 
-    descriptor, materials = cloth_desc_from_cfg(cfg)
+    descriptor, materials = surface_deformable_desc_from_cfg(cfg)
 
     assert descriptor.mesh.file_path is None
     assert descriptor.visual_mesh is not None
@@ -240,18 +245,18 @@ def test_cloth_descriptor_supports_independent_visual_mesh() -> None:
 
 
 def test_cloth_descriptor_rejects_unknown_visual_binding_mode() -> None:
-    cfg = ClothObjectCfg(
+    cfg = SurfaceDeformableObjectCfg(
         uid="cloth",
         shape=MeshCfg(fpath=DEFORMABLE_MESH_PATH),
         visual_binding_mode="unsupported",
     )
 
     with pytest.raises(ValueError, match="visual_binding_mode"):
-        cloth_desc_from_cfg(cfg)
+        surface_deformable_desc_from_cfg(cfg)
 
 
 def test_cloth_descriptor_rejects_multiple_mesh_sources() -> None:
-    cfg = ClothObjectCfg(
+    cfg = SurfaceDeformableObjectCfg(
         uid="cloth",
         shape=MeshCfg(
             fpath=DEFORMABLE_MESH_PATH,
@@ -261,40 +266,40 @@ def test_cloth_descriptor_rejects_multiple_mesh_sources() -> None:
     )
 
     with pytest.raises(ValueError, match="either fpath or vertices/triangles"):
-        cloth_desc_from_cfg(cfg)
+        surface_deformable_desc_from_cfg(cfg)
 
 
 def test_cloth_descriptor_rejects_missing_mesh_source_after_config_validation() -> None:
-    cfg = ClothObjectCfg(uid="cloth", shape=MeshCfg())
+    cfg = SurfaceDeformableObjectCfg(uid="cloth", shape=MeshCfg())
 
     cfg.validate()
     with pytest.raises(ValueError, match="non-empty fpath or vertices/triangles"):
-        cloth_desc_from_cfg(cfg)
+        surface_deformable_desc_from_cfg(cfg)
 
 
 def test_soft_descriptor_rejects_invalid_poisson_ratio() -> None:
-    cfg = SoftObjectCfg(
+    cfg = VolumeDeformableObjectCfg(
         uid="soft",
         shape=MeshCfg(fpath=DEFORMABLE_MESH_PATH),
-        physical_attr=SoftbodyPhysicalAttributesCfg(poissons=0.5),
+        attrs=VolumeDeformablePhysicsCfg(poissons=0.5),
     )
 
     with pytest.raises(ValueError, match="poissons"):
-        soft_desc_from_cfg(cfg)
+        volume_deformable_desc_from_cfg(cfg)
 
 
 @pytest.mark.parametrize("particle_radius", [0.0, float("nan")])
 def test_cloth_descriptor_rejects_invalid_particle_radius(
     particle_radius: float,
 ) -> None:
-    cfg = ClothObjectCfg(
+    cfg = SurfaceDeformableObjectCfg(
         uid="cloth",
         shape=MeshCfg(fpath=DEFORMABLE_MESH_PATH),
         particle_radius=particle_radius,
     )
 
     with pytest.raises(ValueError, match="particle_radius"):
-        cloth_desc_from_cfg(cfg)
+        surface_deformable_desc_from_cfg(cfg)
 
 
 @pytest.mark.parametrize(
@@ -311,14 +316,14 @@ def test_cloth_descriptor_rejects_invalid_particle_radius(
 def test_cloth_descriptor_rejects_invalid_particle_flags(
     particle_flags: object,
 ) -> None:
-    cfg = ClothObjectCfg(
+    cfg = SurfaceDeformableObjectCfg(
         uid="cloth",
         shape=MeshCfg(fpath=DEFORMABLE_MESH_PATH),
         particle_flags=particle_flags,
     )
 
     with pytest.raises((TypeError, ValueError), match="particle_flags"):
-        cloth_desc_from_cfg(cfg)
+        surface_deformable_desc_from_cfg(cfg)
 
 
 def _resolved_articulation_desc() -> ArticulationDesc:

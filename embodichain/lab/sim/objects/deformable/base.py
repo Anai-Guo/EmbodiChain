@@ -18,9 +18,9 @@
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from copy import deepcopy
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, Sequence
+from typing import TYPE_CHECKING, Any, Literal, Sequence
 
 import numpy as np
 import torch
@@ -38,15 +38,15 @@ from embodichain.lab.sim.material import (
 from embodichain.utils import logger
 from embodichain.utils.math import matrix_from_euler, xyz_quat_to_4x4_matrix
 
-from .data import DeformableObjectData, _ParticleSetData
+from .data import DeformableObjectData
 
 if TYPE_CHECKING:
-    from dexsim.scene import Scene, SpawnedParticleSet
+    from dexsim.scene import SpawnedParticleSet
 
 __all__ = ["DeformableObject"]
 
 
-class DeformableObject(BatchEntity, ABC):
+class DeformableObject(BatchEntity):
     """Common facade over a batch of Newton particle-set deformables.
 
     Volume and surface objects retain EmbodiChain's public nodal contract, but
@@ -54,9 +54,10 @@ class DeformableObject(BatchEntity, ABC):
     Default backend and direct native soft/cloth body buffers are unsupported.
     """
 
-    deformable_type: ClassVar[Literal["volume", "surface"]]
-    spawn_kind: ClassVar[str]
-    display_name: ClassVar[str]
+    @property
+    @abstractmethod
+    def deformable_type(self) -> Literal["volume", "surface"]:
+        """Physical topology supplied by the concrete object class."""
 
     def __init__(
         self,
@@ -120,15 +121,6 @@ class DeformableObject(BatchEntity, ABC):
                 "SpawnScene before it can be used."
             )
         return self._declared_num_instances
-
-    @abstractmethod
-    def _create_data(
-        self,
-        entities: Sequence[SpawnedParticleSet],
-        scene: Scene,
-        device: torch.device,
-    ) -> _ParticleSetData:
-        """Create the topology-specific particle data view."""
 
     def _initialize_topology(self, entities: Sequence[SpawnedParticleSet]) -> None:
         """Capture per-instance render topology with a stable batch shape."""
@@ -280,7 +272,7 @@ class DeformableObject(BatchEntity, ABC):
         self._world = result.world
         self._all_indices = list(range(len(entities)))
         self._arena_offsets = self._resolve_arena_offsets(result, entities)
-        self._data = self._create_data(entities, result, self.device)
+        self._data = DeformableObjectData(entities, result, self.device)
         self._local_rest_positions = self._capture_local_rest_positions()
         self._initialize_topology(entities)
         self._visual_material = [None] * len(entities)
@@ -331,7 +323,7 @@ class DeformableObject(BatchEntity, ABC):
         if self.is_declared:
             return (
                 f"{self.__class__}: declared {self.num_instances} Spawn "
-                f"{self.display_name} objects | uid: {self.uid} | "
+                f"{self.deformable_type} deformable objects | uid: {self.uid} | "
                 f"device: {self.device}"
             )
         return super().__str__()
@@ -396,16 +388,6 @@ class DeformableObject(BatchEntity, ABC):
     ) -> list[VisualMaterialInst | None]:
         """Return registered material wrappers for selected environments."""
         return [self._visual_material[i] for i in self._resolve_env_ids(env_ids)]
-
-    def set_collision_filter(
-        self, filter_data: torch.Tensor, env_ids: Sequence[int] | None = None
-    ) -> None:
-        """Reject legacy per-body filtering absent from Newton particle sets."""
-        del filter_data, env_ids
-        raise NotImplementedError(
-            "Newton deformable collision filtering is scene/solver-owned; "
-            "per-object Default collision-filter data is unsupported."
-        )
 
     def _resolve_env_ids(self, env_ids: Sequence[int] | None) -> list[int]:
         if env_ids is None:
@@ -477,26 +459,6 @@ class DeformableObject(BatchEntity, ABC):
             f"Getting local pose for {type(self).__name__} is not supported."
         )
 
-    def get_current_nodal_position(self) -> torch.Tensor:
-        """Return current simulation-particle positions in world frame."""
-        self._require_data()
-        return self.data.nodal_pos_w
-
-    def get_current_nodal_velocity(self) -> torch.Tensor:
-        """Return current simulation-particle velocities in world frame."""
-        self._require_data()
-        return self.data.nodal_vel_w
-
-    def get_current_nodal_state(self) -> torch.Tensor:
-        """Return current nodal state ``[position, velocity]``."""
-        self._require_data()
-        return self.data.nodal_state_w
-
-    def get_default_nodal_state(self) -> torch.Tensor:
-        """Return the nodal state captured when Spawn was bound."""
-        self._require_data()
-        return self.data.default_nodal_state_w
-
     def _require_data(self) -> None:
         if self.data is None:
             raise RuntimeError(
@@ -542,10 +504,6 @@ class DeformableObject(BatchEntity, ABC):
         ids = self._resolve_env_ids(env_ids)
         index = torch.as_tensor(ids, dtype=torch.long, device=self.device)
         return self._surface_triangles.index_select(0, index).clone()
-
-    def get_triangles(self, env_ids: Sequence[int] | None = None) -> torch.Tensor:
-        """Compatibility alias for :meth:`get_surface_triangles`."""
-        return self.get_surface_triangles(env_ids=env_ids)
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         """Restore the configured pose, zero velocity, and source materials."""

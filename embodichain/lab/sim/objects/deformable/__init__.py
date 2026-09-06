@@ -21,27 +21,15 @@ from __future__ import annotations
 from .base import DeformableObject
 from .data import DeformableObjectData
 from .surface import (
-    ClothBodyData,
-    ClothObject,
-    SurfaceDeformableData,
     SurfaceDeformableObject,
 )
 from .volume import (
-    SoftBodyData,
-    SoftObject,
-    VolumeDeformableData,
     VolumeDeformableObject,
 )
 
 __all__ = [
-    "ClothBodyData",
-    "ClothObject",
     "DeformableObject",
     "DeformableObjectData",
-    "SoftBodyData",
-    "SoftObject",
-    "SurfaceDeformableData",
     "SurfaceDeformableObject",
-    "VolumeDeformableData",
     "VolumeDeformableObject",
 ]

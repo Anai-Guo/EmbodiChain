@@ -171,16 +171,6 @@ class PhysicsBackend(ABC):
         return False
 
     @property
-    def supports_soft_bodies(self) -> bool:
-        """Compatibility alias for volume-deformable support."""
-        return self.supports_volume_deformables
-
-    @property
-    def supports_cloth(self) -> bool:
-        """Compatibility alias for surface-deformable support."""
-        return self.supports_surface_deformables
-
-    @property
     def supports_rigid_object_group(self) -> bool:
         """Whether this backend supports rigid object groups."""
         return False

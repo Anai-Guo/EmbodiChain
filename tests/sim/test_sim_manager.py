@@ -29,7 +29,7 @@ import torch
 
 import embodichain.lab.sim.sim_manager as sim_manager_module
 from embodichain.lab.sim.cfg import (
-    ClothObjectCfg,
+    SurfaceDeformableObjectCfg,
     DefaultPhysicsCfg,
     MarkerCfg,
     RobotCfg,
@@ -318,7 +318,7 @@ def _make_runtime_control_sim_manager(
     sim._rigid_objects = {"table": object()}
     sim._deformable_objects = {
         "cloth": SimpleNamespace(
-            cfg=ClothObjectCfg(uid="cloth", particle_flags=[0, 1, 0])
+            cfg=SurfaceDeformableObjectCfg(uid="cloth", particle_flags=[0, 1, 0])
         )
     }
     spawn_scene = MagicMock()

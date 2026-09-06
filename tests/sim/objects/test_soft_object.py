@@ -21,15 +21,15 @@ from dexsim.utility.path import get_resources_data_path
 from embodichain.lab.sim import SimulationManager, SimulationManagerCfg
 from embodichain.lab.sim.cfg import (
     NewtonPhysicsCfg,
-    SoftbodyVoxelAttributesCfg,
-    SoftbodyPhysicalAttributesCfg,
+    VolumeDeformableMeshingCfg,
+    VolumeDeformablePhysicsCfg,
 )
 from embodichain.lab.sim.shapes import MeshCfg
 from embodichain.lab.sim.objects import (
     DeformableObject,
-    SoftObject,
-    SoftObjectCfg,
+    DeformableObjectData,
     VolumeDeformableObject,
+    VolumeDeformableObjectCfg,
 )
 import pytest
 import torch
@@ -63,17 +63,17 @@ class BaseSoftObjectTest:
         self.num_envs = 1
 
         # add softbody to the scene
-        self.cow: SoftObject = self.sim.add_soft_object(
-            cfg=SoftObjectCfg(
+        self.cow: VolumeDeformableObject = self.sim.add_deformable_object(
+            cfg=VolumeDeformableObjectCfg(
                 uid="cow",
                 shape=MeshCfg(
                     fpath=get_resources_data_path("Model", "cow", "cow.obj"),
                 ),
                 init_pos=[0.0, 0.0, 3.0],
-                voxel_attr=SoftbodyVoxelAttributesCfg(
+                meshing=VolumeDeformableMeshingCfg(
                     simulation_mesh_resolution=8,
                 ),
-                physical_attr=SoftbodyPhysicalAttributesCfg(
+                attrs=VolumeDeformablePhysicsCfg(
                     youngs=1e6,
                     poissons=0.45,
                     density=100,
@@ -92,7 +92,7 @@ class BaseSoftObjectTest:
 
     def test_get_deformable_mesh_geometry(self):
         """Test current collision vertices and matching surface triangles."""
-        vertices = self.cow.get_current_collision_vertices()
+        vertices = self.cow.data.nodal_pos_w
         triangles = self.cow.get_collision_surface_triangles(env_ids=[0])
 
         assert vertices.ndim == 3 and vertices.shape[0] == self.sim.num_envs
@@ -101,7 +101,7 @@ class BaseSoftObjectTest:
 
     def test_set_local_pose_updates_selected_particle_batch(self):
         """Setting one instance pose writes only its packed simulation nodes."""
-        before = self.cow.get_current_sim_vertices()
+        before = self.cow.data.nodal_pos_w
         translation = torch.tensor([0.5, 0.0, 0.0], device=self.cow.device)
         pose = torch.eye(
             4,
@@ -118,7 +118,7 @@ class BaseSoftObjectTest:
         )
 
         self.cow.set_local_pose(pose, env_ids=[0])
-        after = self.cow.get_current_sim_vertices()
+        after = self.cow.data.nodal_pos_w
 
         torch.testing.assert_close(after[0], before[0] + translation)
         torch.testing.assert_close(after[1:], before[1:])
@@ -128,13 +128,13 @@ class BaseSoftObjectTest:
         assert isinstance(self.cow, VolumeDeformableObject)
         assert self.cow.deformable_type == "volume"
         assert self.sim.get_deformable_object("cow") is self.cow
-        assert self.sim.get_soft_object("cow") is self.cow
         assert self.sim.get_deformable_object_uid_list() == ["cow"]
 
-        positions = self.cow.get_current_nodal_position()
-        velocities = self.cow.get_current_nodal_velocity()
-        state = self.cow.get_current_nodal_state()
-        default_state = self.cow.get_default_nodal_state()
+        assert type(self.cow.data) is DeformableObjectData
+        positions = self.cow.data.nodal_pos_w
+        velocities = self.cow.data.nodal_vel_w
+        state = self.cow.data.nodal_state_w
+        default_state = self.cow.data.default_nodal_state_w
         assert positions.shape[-1] == 3
         assert velocities.shape == positions.shape
         assert state.shape == (*positions.shape[:-1], 6)

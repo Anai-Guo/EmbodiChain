@@ -30,11 +30,11 @@ from embodichain.lab.sim.cfg import (
     NewtonCollisionPipelineCfg,
     NewtonPhysicsCfg,
     RenderCfg,
-    SoftObjectCfg,
-    SoftbodyPhysicalAttributesCfg,
-    SoftbodyVoxelAttributesCfg,
+    VolumeDeformableObjectCfg,
+    VolumeDeformablePhysicsCfg,
+    VolumeDeformableMeshingCfg,
 )
-from embodichain.lab.sim.objects import Robot, SoftObject
+from embodichain.lab.sim.objects import Robot, VolumeDeformableObject
 from embodichain.lab.sim.robots import URRobotCfg
 from embodichain.lab.sim.shapes import MeshCfg
 from embodichain.lab.sim.utility.action_utils import interpolate_with_nums
@@ -159,10 +159,10 @@ def create_robot(sim: SimulationManager) -> Robot:
     return robot
 
 
-def create_soft_cow(sim: SimulationManager) -> SoftObject:
+def create_soft_cow(sim: SimulationManager) -> VolumeDeformableObject:
     """Add the tetrahedral soft cow used by the pressing task."""
-    return sim.add_soft_object(
-        cfg=SoftObjectCfg(
+    return sim.add_deformable_object(
+        cfg=VolumeDeformableObjectCfg(
             uid="cow",
             shape=MeshCfg(
                 fpath=get_resources_data_path("Model", "cow", "cow2.obj"),
@@ -170,12 +170,12 @@ def create_soft_cow(sim: SimulationManager) -> SoftObject:
             init_rot=[0.0, 90.0, 0.0],
             init_pos=COW_POSITION,
             particle_radius=0.005,
-            voxel_attr=SoftbodyVoxelAttributesCfg(
+            meshing=VolumeDeformableMeshingCfg(
                 triangle_remesh_resolution=24,
                 simulation_mesh_resolution=16,
                 voxel_num_relaxation_iters=5,
             ),
-            physical_attr=SoftbodyPhysicalAttributesCfg(
+            attrs=VolumeDeformablePhysicsCfg(
                 youngs=5.0e3,
                 poissons=0.45,
                 density=100.0,

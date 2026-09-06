@@ -33,18 +33,19 @@ from embodichain.lab.sim import SimulationManager, SimulationManagerCfg
 from embodichain.lab.gym.utils.gym_utils import add_env_launcher_args_to_parser
 from embodichain.lab.visualization import visualization_cfg_from_args
 from embodichain.lab.sim.cfg import (
+    SurfaceElementPropertiesCfg,
     MassPropertiesCfg,
     NewtonCollisionPipelineCfg,
     NewtonPhysicsCfg,
     RenderCfg,
-    ClothObjectCfg,
-    ClothPhysicalAttributesCfg,
+    SurfaceDeformableObjectCfg,
+    SurfaceDeformablePhysicsCfg,
     RigidBodyMaterialCfg,
     RigidBodyPhysicsCfg,
     RigidObjectCfg,
 )
 from embodichain.lab.sim.shapes import MeshCfg, CubeCfg
-from embodichain.lab.sim.objects import ClothObject
+from embodichain.lab.sim.objects import SurfaceDeformableObject
 
 
 def create_2d_grid_mesh(
@@ -142,8 +143,8 @@ def main() -> None:
     cloth_save_path = os.path.join(tempfile.gettempdir(), "cloth_mesh.ply")
     o3d.io.write_triangle_mesh(cloth_save_path, cloth_mesh)
     # add cloth to the scene
-    cloth = sim.add_cloth_object(
-        cfg=ClothObjectCfg(
+    cloth = sim.add_deformable_object(
+        cfg=SurfaceDeformableObjectCfg(
             uid="cloth",
             shape=MeshCfg(fpath=cloth_save_path),
             init_pos=[0.5, 0.0, 0.8],
@@ -151,13 +152,15 @@ def main() -> None:
             # The grid spacing is 0.025 m, so avoid Newton's much larger
             # 0.1 m default particle radius for this small cloth mesh.
             particle_radius=0.01,
-            physical_attr=ClothPhysicalAttributesCfg(
+            attrs=SurfaceDeformablePhysicsCfg(
                 density=0.02,
-                tri_ke=2.0e3,
-                tri_ka=2.0e3,
-                tri_kd=0.1,
-                edge_ke=2.0,
-                edge_kd=0.1,
+                surface_props=SurfaceElementPropertiesCfg(
+                    tri_ke=2.0e3,
+                    tri_ka=2.0e3,
+                    tri_kd=0.1,
+                    edge_ke=2.0,
+                    edge_kd=0.1,
+                ),
             ),
         )
     )
@@ -194,7 +197,7 @@ def main() -> None:
     run_simulation(sim, cloth)
 
 
-def run_simulation(sim: SimulationManager, cloth: ClothObject) -> None:
+def run_simulation(sim: SimulationManager, cloth: SurfaceDeformableObject) -> None:
     """Run the simulation loop.
 
     Args:

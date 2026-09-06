@@ -29,21 +29,13 @@ from .rigid_object_group import (
     RigidObjectGroupCfg,
 )
 from .deformable import (
-    ClothBodyData,
-    ClothObject,
     DeformableObject,
     DeformableObjectData,
-    SoftBodyData,
-    SoftObject,
-    SurfaceDeformableData,
     SurfaceDeformableObject,
-    VolumeDeformableData,
     VolumeDeformableObject,
 )
 from ..cfg import (
-    ClothObjectCfg,
     DeformableObjectCfg,
-    SoftObjectCfg,
     SurfaceDeformableObjectCfg,
     VolumeDeformableObjectCfg,
 )

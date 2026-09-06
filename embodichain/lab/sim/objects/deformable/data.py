@@ -14,11 +14,10 @@
 # limitations under the License.
 # ----------------------------------------------------------------------------
 
-"""Nodal data contract and Newton particle-set state adapter."""
+"""Shared nodal data for Newton volume and surface particle sets."""
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Sequence
 
 import torch
@@ -29,46 +28,18 @@ if TYPE_CHECKING:
 __all__ = ["DeformableObjectData"]
 
 
-class DeformableObjectData(ABC):
+class DeformableObjectData:
     """Common nodal-state view for volume and surface deformables.
 
     Positions and velocities use the simulation world frame. Consumers can
-    rely on a stable ``(num_instances, num_nodes, 3)`` contract.
+    rely on a stable ``(num_instances, n_nodes, 3)`` contract. State properties
+    return independent snapshots; the default state is captured at Spawn binding.
+
+    Args:
+        entities: Replicated particle sets with equal node counts.
+        scene: Finalized DexSim scene that owns the particle sets.
+        device: Device used for state tensors and batch transfers.
     """
-
-    @property
-    @abstractmethod
-    def nodal_pos_w(self) -> torch.Tensor:
-        """Return current simulation-node positions in world frame."""
-
-    @property
-    @abstractmethod
-    def nodal_vel_w(self) -> torch.Tensor:
-        """Return current simulation-node velocities in world frame."""
-
-    @property
-    @abstractmethod
-    def default_nodal_state_w(self) -> torch.Tensor:
-        """Return default nodal state ``[position, velocity]`` in world frame."""
-
-    @property
-    def nodal_state_w(self) -> torch.Tensor:
-        """Return current nodal state ``[position, velocity]`` in world frame."""
-        return torch.cat((self.nodal_pos_w, self.nodal_vel_w), dim=-1)
-
-    @property
-    def root_pos_w(self) -> torch.Tensor:
-        """Return the mean nodal position for each deformable instance."""
-        return self.nodal_pos_w.mean(dim=1)
-
-    @property
-    def root_vel_w(self) -> torch.Tensor:
-        """Return the mean nodal velocity for each deformable instance."""
-        return self.nodal_vel_w.mean(dim=1)
-
-
-class _ParticleSetData(DeformableObjectData):
-    """Packed state adapter over DexSim 0.5 particle-set handles."""
 
     def __init__(
         self,
@@ -136,6 +107,21 @@ class _ParticleSetData(DeformableObjectData):
     def default_nodal_state_w(self) -> torch.Tensor:
         """Return the particle state captured when Spawn was bound."""
         return self._default_nodal_state_w.clone()
+
+    @property
+    def nodal_state_w(self) -> torch.Tensor:
+        """Return current nodal state ``[position, velocity]`` in world frame."""
+        return torch.cat((self.nodal_pos_w, self.nodal_vel_w), dim=-1)
+
+    @property
+    def root_pos_w(self) -> torch.Tensor:
+        """Return the mean nodal position for each deformable instance."""
+        return self.nodal_pos_w.mean(dim=1)
+
+    @property
+    def root_vel_w(self) -> torch.Tensor:
+        """Return the mean nodal velocity for each deformable instance."""
+        return self.nodal_vel_w.mean(dim=1)
 
     def _apply_nodal_state(
         self,

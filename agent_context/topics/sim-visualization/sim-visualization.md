@@ -208,8 +208,8 @@ Deformable vertices are stored relative to the corresponding arena node.
 | `RigidObjectGroup` | One node and pose per constituent object |
 | `Robot` | One mesh node per non-empty link |
 | `Articulation` | One mesh node per non-empty link |
-| Volume `DeformableObject` (`SoftObject`) | Live Newton render-surface vertices and triangles |
-| Surface `DeformableObject` (`ClothObject`) | Live Newton render-surface vertices and triangles |
+| `VolumeDeformableObject` | Live Newton render-surface vertices and triangles |
+| `SurfaceDeformableObject` | Live Newton render-surface vertices and triangles |
 | `Camera` | Frustum plus optional low-frequency RGB preview |
 | Default ground | 1000 m × 1000 m XY grid, 1 m cells, 10 m sections |
 | `SceneOverlays` | Frames, targets, trajectories, and point clouds |

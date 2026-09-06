@@ -18,7 +18,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import MISSING
+from typing import Any
 from typing import Literal, Sequence
 
 import numpy as np
@@ -32,7 +34,7 @@ __all__: list[str] = []
 
 
 @configclass
-class SoftbodyVoxelAttributesCfg:
+class VolumeDeformableMeshingCfg:
     """Newton tetrahedralization and render-volume binding parameters."""
 
     triangle_remesh_resolution: int = 8
@@ -58,73 +60,84 @@ class SoftbodyVoxelAttributesCfg:
 
 
 @configclass
-class SoftbodyPhysicalAttributesCfg:
-    """Newton volumetric and optional surface-element material parameters."""
+class SurfaceElementPropertiesCfg:
+    """Newton surface triangle, bending, and aerodynamic properties.
+
+    ``None`` preserves Newton's cloth defaults; volume objects resolve it to
+    zero, matching their disabled-by-default surface forces.
+    """
+
+    tri_ke: float | None = None
+    """Triangle elastic stiffness."""
+
+    tri_ka: float | None = None
+    """Triangle area stiffness."""
+
+    tri_kd: float | None = None
+    """Triangle damping."""
+
+    tri_drag: float | None = None
+    """Aerodynamic drag coefficient."""
+
+    tri_lift: float | None = None
+    """Aerodynamic lift coefficient."""
+
+    edge_ke: float | None = None
+    """Bending-edge stiffness."""
+
+    edge_kd: float | None = None
+    """Bending-edge damping."""
+
+
+_SURFACE_FIELDS = (
+    "tri_ke",
+    "tri_ka",
+    "tri_kd",
+    "tri_drag",
+    "tri_lift",
+    "edge_ke",
+    "edge_kd",
+)
+
+
+@configclass
+class VolumeDeformablePhysicsCfg:
+    """Volume density, elasticity, and optional Newton surface constraints."""
 
     youngs: float = 1e6
-    """Young's modulus (higher = stiffer)."""
+    """Young's modulus [Pa]; higher values make the volume stiffer."""
 
     poissons: float = 0.45
-    """Poisson's ratio (higher = closer to incompressible)."""
+    """Poisson's ratio; values approaching 0.5 resist volume change."""
 
     elasticity_damping: float = 0.0
     """Volumetric damping coefficient forwarded as Newton ``k_damp``."""
 
     density: float = 1000.0
-    """Volume density in kg/m³."""
+    """Volume density [kg/m³]."""
 
-    surface_tri_ke: float = 0.0
-    """Surface triangle elastic stiffness."""
-
-    surface_tri_ka: float = 0.0
-    """Surface triangle area stiffness."""
-
-    surface_tri_kd: float = 0.0
-    """Surface triangle damping."""
-
-    surface_tri_drag: float = 0.0
-    """Surface aerodynamic drag coefficient."""
-
-    surface_tri_lift: float = 0.0
-    """Surface aerodynamic lift coefficient."""
+    surface_props: SurfaceElementPropertiesCfg = SurfaceElementPropertiesCfg(
+        **dict.fromkeys(_SURFACE_FIELDS, 0.0)
+    )
+    """Optional surface forces; all coefficients default to zero."""
 
     add_surface_edges: bool = True
     """Whether Newton creates surface bending-edge constraints."""
 
-    surface_edge_ke: float = 0.0
-    """Surface bending-edge stiffness."""
-
-    surface_edge_kd: float = 0.0
-    """Surface bending-edge damping."""
+    def __post_init__(self) -> None:
+        if isinstance(self.surface_props, Mapping):
+            self.surface_props = SurfaceElementPropertiesCfg(**self.surface_props)
 
 
 @configclass
-class ClothPhysicalAttributesCfg:
-    """Newton cloth triangle, bending-edge, and spring parameters."""
+class SurfaceDeformablePhysicsCfg:
+    """Surface density, Newton surface elements, and optional mesh springs."""
 
     density: float = 1.0
-    """Surface density in kg/m²."""
+    """Surface density [kg/m²]."""
 
-    tri_ke: float | None = None
-    """Triangle elastic stiffness; ``None`` uses the Newton default."""
-
-    tri_ka: float | None = None
-    """Triangle area stiffness; ``None`` uses the Newton default."""
-
-    tri_kd: float | None = None
-    """Triangle damping; ``None`` uses the Newton default."""
-
-    tri_drag: float | None = None
-    """Aerodynamic drag; ``None`` uses the Newton default."""
-
-    tri_lift: float | None = None
-    """Aerodynamic lift; ``None`` uses the Newton default."""
-
-    edge_ke: float | None = None
-    """Bending-edge stiffness; ``None`` uses the Newton default."""
-
-    edge_kd: float | None = None
-    """Bending-edge damping; ``None`` uses the Newton default."""
+    surface_props: SurfaceElementPropertiesCfg = SurfaceElementPropertiesCfg()
+    """Triangle, bending, and aerodynamic overrides; None uses Newton defaults."""
 
     add_springs: bool = False
     """Whether Newton creates explicit mesh-edge springs."""
@@ -134,6 +147,17 @@ class ClothPhysicalAttributesCfg:
 
     spring_kd: float | None = None
     """Spring damping; ``None`` uses the Newton default."""
+
+    def __post_init__(self) -> None:
+        if isinstance(self.surface_props, Mapping):
+            self.surface_props = SurfaceElementPropertiesCfg(**self.surface_props)
+
+
+def _mesh_cfg_from_dict(data: Mapping[str, Any]) -> MeshCfg:
+    cfg = MeshCfg.from_dict({"shape_type": "Mesh", **data})
+    if not isinstance(cfg, MeshCfg):
+        raise TypeError("Deformable shape must be a MeshCfg.")
+    return cfg
 
 
 @configclass
@@ -168,6 +192,35 @@ class DeformableObjectCfg(ObjectBaseCfg):
     validate_mesh: bool = False
     """Whether Newton reports source-mesh quality validation warnings."""
 
+    def __post_init__(self) -> None:
+        if isinstance(self.shape, Mapping):
+            self.shape = _mesh_cfg_from_dict(self.shape)
+        visual_shape = getattr(self, "visual_shape", None)
+        if isinstance(visual_shape, Mapping):
+            self.visual_shape = _mesh_cfg_from_dict(visual_shape)
+
+    @classmethod
+    def from_dict(cls, init_dict: Mapping[str, Any]) -> DeformableObjectCfg:
+        """Parse nested deformable configs using the current schema.
+
+        Args:
+            init_dict: Configuration fields from a dictionary or YAML loader.
+
+        Returns:
+            A typed configuration with the base asset pose conventions applied.
+        """
+        cfg = cls(**dict(init_dict))
+        pose = ObjectBaseCfg.from_dict(
+            {
+                "init_pos": cfg.init_pos,
+                "init_rot": cfg.init_rot,
+                "init_local_pose": cfg.init_local_pose,
+            }
+        )
+        cfg.init_pos, cfg.init_rot = pose.init_pos, pose.init_rot
+        cfg.init_local_pose = pose.init_local_pose
+        return cfg
+
 
 @configclass
 class VolumeDeformableObjectCfg(DeformableObjectCfg):
@@ -175,16 +228,18 @@ class VolumeDeformableObjectCfg(DeformableObjectCfg):
 
     deformable_type: Literal["volume"] = "volume"
 
-    voxel_attr: SoftbodyVoxelAttributesCfg = SoftbodyVoxelAttributesCfg()
+    meshing: VolumeDeformableMeshingCfg = VolumeDeformableMeshingCfg()
     """Tetrahedral simulation-mesh voxelization attributes."""
 
-    physical_attr: SoftbodyPhysicalAttributesCfg = SoftbodyPhysicalAttributesCfg()
+    attrs: VolumeDeformablePhysicsCfg = VolumeDeformablePhysicsCfg()
     """Newton volume-deformable physical attributes."""
 
-
-@configclass
-class SoftObjectCfg(VolumeDeformableObjectCfg):
-    """Compatibility name for :class:`VolumeDeformableObjectCfg`."""
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if isinstance(self.attrs, Mapping):
+            self.attrs = VolumeDeformablePhysicsCfg(**self.attrs)
+        if isinstance(self.meshing, Mapping):
+            self.meshing = VolumeDeformableMeshingCfg(**self.meshing)
 
 
 @configclass
@@ -208,10 +263,10 @@ class SurfaceDeformableObjectCfg(DeformableObjectCfg):
     when the render mesh duplicates simulation vertices along texture seams.
     """
 
-    physical_attr: ClothPhysicalAttributesCfg = ClothPhysicalAttributesCfg()
+    attrs: SurfaceDeformablePhysicsCfg = SurfaceDeformablePhysicsCfg()
     """Newton surface-deformable physical attributes."""
 
-
-@configclass
-class ClothObjectCfg(SurfaceDeformableObjectCfg):
-    """Compatibility name for :class:`SurfaceDeformableObjectCfg`."""
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if isinstance(self.attrs, Mapping):
+            self.attrs = SurfaceDeformablePhysicsCfg(**self.attrs)

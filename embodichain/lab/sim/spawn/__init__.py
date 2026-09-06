@@ -20,9 +20,7 @@ from __future__ import annotations
 
 from .descriptors import (
     articulation_desc_from_cfg,
-    cloth_desc_from_cfg,
     rigid_desc_from_cfg,
-    soft_desc_from_cfg,
     surface_deformable_desc_from_cfg,
     volume_deformable_desc_from_cfg,
 )
@@ -31,10 +29,8 @@ from .usd import articulation_desc_from_usd, rigid_desc_from_usd
 __all__ = [
     "articulation_desc_from_cfg",
     "articulation_desc_from_usd",
-    "cloth_desc_from_cfg",
     "rigid_desc_from_cfg",
     "rigid_desc_from_usd",
-    "soft_desc_from_cfg",
     "surface_deformable_desc_from_cfg",
     "volume_deformable_desc_from_cfg",
 ]

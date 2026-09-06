@@ -32,12 +32,12 @@ from embodichain.lab.sim.cfg import (
     NewtonCollisionPipelineCfg,
     NewtonPhysicsCfg,
     RenderCfg,
-    SoftObjectCfg,
-    SoftbodyVoxelAttributesCfg,
-    SoftbodyPhysicalAttributesCfg,
+    VolumeDeformableObjectCfg,
+    VolumeDeformableMeshingCfg,
+    VolumeDeformablePhysicsCfg,
 )
 from embodichain.lab.sim.shapes import MeshCfg
-from embodichain.lab.sim.objects import SoftObject
+from embodichain.lab.sim.objects import VolumeDeformableObject
 
 
 def main() -> None:
@@ -95,20 +95,20 @@ def main() -> None:
     print("[INFO]: Scene setup complete!")
 
     # add softbody to the scene
-    cow: SoftObject = sim.add_soft_object(
-        cfg=SoftObjectCfg(
+    cow: VolumeDeformableObject = sim.add_deformable_object(
+        cfg=VolumeDeformableObjectCfg(
             uid="cow",
             shape=MeshCfg(
                 fpath=get_resources_data_path("Model", "cow", "cow.obj"),
             ),
             init_pos=[0.0, 5.0, 3.0],
             particle_radius=0.01,
-            voxel_attr=SoftbodyVoxelAttributesCfg(
+            meshing=VolumeDeformableMeshingCfg(
                 triangle_remesh_resolution=24,
                 simulation_mesh_resolution=16,
                 voxel_num_relaxation_iters=5,
             ),
-            physical_attr=SoftbodyPhysicalAttributesCfg(
+            attrs=VolumeDeformablePhysicsCfg(
                 # Equivalent to the DexSim demo's k_mu=1e4 and k_lambda=5e4.
                 youngs=2.833333333e4,
                 poissons=5.0 / 12.0,
@@ -132,7 +132,7 @@ def main() -> None:
     run_simulation(sim, cow)
 
 
-def run_simulation(sim: SimulationManager, soft_obj: SoftObject) -> None:
+def run_simulation(sim: SimulationManager, soft_obj: VolumeDeformableObject) -> None:
     """Run the simulation loop.
 
     Args:

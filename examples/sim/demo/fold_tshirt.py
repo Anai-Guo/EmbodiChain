@@ -29,9 +29,10 @@ from embodichain.data import get_data_path
 from embodichain.lab.gym.utils.gym_utils import add_env_launcher_args_to_parser
 from embodichain.lab.sim import SimulationManager, SimulationManagerCfg
 from embodichain.lab.sim.cfg import (
+    SurfaceElementPropertiesCfg,
     ArticulationRootPropertiesCfg,
-    ClothObjectCfg,
-    ClothPhysicalAttributesCfg,
+    SurfaceDeformableObjectCfg,
+    SurfaceDeformablePhysicsCfg,
     JointDrivePropertiesCfg,
     NewtonCollisionPropertiesCfg,
     NewtonPhysicsCfg,
@@ -42,7 +43,7 @@ from embodichain.lab.sim.cfg import (
     RenderCfg,
 )
 from embodichain.lab.sim.material import VisualMaterialCfg
-from embodichain.lab.sim.objects import ClothObject, RigidObject, Robot
+from embodichain.lab.sim.objects import SurfaceDeformableObject, RigidObject, Robot
 from embodichain.lab.sim.shapes import CubeCfg, MeshCfg
 from embodichain.lab.visualization import visualization_cfg_from_args
 from embodichain.utils import logger
@@ -467,7 +468,7 @@ def create_shirt(
     *,
     visual_mesh_path: Path | None,
     texture_path: Path | None,
-) -> ClothObject:
+) -> SurfaceDeformableObject:
     """Declare the low-resolution cloth and its independently bound visual mesh."""
     if visual_mesh_path is not None:
         # The OBJ carries seam-duplicated vertices, authored UVs, and its own
@@ -490,8 +491,8 @@ def create_shirt(
             ),
         )
 
-    return sim.add_cloth_object(
-        ClothObjectCfg(
+    return sim.add_deformable_object(
+        SurfaceDeformableObjectCfg(
             uid="shirt",
             shape=MeshCfg(vertices=vertices, triangles=triangles),
             visual_shape=visual_shape,
@@ -499,13 +500,15 @@ def create_shirt(
             init_pos=SHIRT_POSITION,
             init_rot=(0.0, 0.0, -90.0),
             particle_radius=0.008,
-            physical_attr=ClothPhysicalAttributesCfg(
+            attrs=SurfaceDeformablePhysicsCfg(
                 density=200.0,
-                tri_ke=1.5e3,
-                tri_ka=1.5e3,
-                tri_kd=1.0e-5,
-                edge_ke=1.2,
-                edge_kd=0.1,
+                surface_props=SurfaceElementPropertiesCfg(
+                    tri_ke=1.5e3,
+                    tri_ka=1.5e3,
+                    tri_kd=1.0e-5,
+                    edge_ke=1.2,
+                    edge_kd=0.1,
+                ),
             ),
         )
     )
@@ -631,7 +634,7 @@ def main() -> None:
             sim.set_emission_light([1.0, 1.0, 1.0], 90.0)
             configure_window_camera(sim)
 
-        particle_count = shirt.get_default_nodal_state().shape[1]
+        particle_count = shirt.data.n_nodes
         logger.log_info(
             "Running W1 T-shirt fold | "
             f"driver={'static' if args.static_w1 else 'kinematic-trajectory'} | "

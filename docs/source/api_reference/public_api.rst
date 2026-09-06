@@ -888,19 +888,6 @@ embodichain.lab.sim.objects.articulation
    Articulation
    ArticulationJointKinematics
 
-embodichain.lab.sim.objects.cloth_object
-----------------------------------------
-
-.. currentmodule:: embodichain.lab.sim.objects.cloth_object
-
-.. autosummary::
-
-   ClothBodyData
-   ClothObject
-   ClothObjectCfg
-   SurfaceDeformableData
-   SurfaceDeformableObject
-   SurfaceDeformableObjectCfg
 
 embodichain.lab.sim.objects.constraint
 --------------------------------------
@@ -958,19 +945,6 @@ embodichain.lab.sim.objects.robot
    ControlGroup
    Robot
 
-embodichain.lab.sim.objects.soft_object
----------------------------------------
-
-.. currentmodule:: embodichain.lab.sim.objects.soft_object
-
-.. autosummary::
-
-   SoftBodyData
-   SoftObject
-   SoftObjectCfg
-   VolumeDeformableData
-   VolumeDeformableObject
-   VolumeDeformableObjectCfg
 
 embodichain.lab.sim.physics
 ---------------------------
@@ -1388,10 +1362,8 @@ into DexSim Spawn descriptors.
 
    articulation_desc_from_cfg
    articulation_desc_from_usd
-   cloth_desc_from_cfg
    rigid_desc_from_cfg
    rigid_desc_from_usd
-   soft_desc_from_cfg
    surface_deformable_desc_from_cfg
    volume_deformable_desc_from_cfg
 
@@ -1403,10 +1375,8 @@ embodichain.lab.sim.spawn.descriptors
 .. autosummary::
 
    articulation_desc_from_cfg
-   cloth_desc_from_cfg
    configure_articulation_desc
    rigid_desc_from_cfg
-   soft_desc_from_cfg
    surface_deformable_desc_from_cfg
    volume_deformable_desc_from_cfg
 

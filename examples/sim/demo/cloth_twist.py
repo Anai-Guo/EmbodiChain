@@ -28,13 +28,14 @@ from embodichain.data import get_data_path
 from embodichain.lab.gym.utils.gym_utils import add_env_launcher_args_to_parser
 from embodichain.lab.sim import SimulationManager, SimulationManagerCfg
 from embodichain.lab.sim.cfg import (
-    ClothObjectCfg,
-    ClothPhysicalAttributesCfg,
+    SurfaceElementPropertiesCfg,
+    SurfaceDeformableObjectCfg,
+    SurfaceDeformablePhysicsCfg,
     NewtonPhysicsCfg,
     RenderCfg,
 )
 from embodichain.lab.sim.material import VisualMaterialCfg
-from embodichain.lab.sim.objects import ClothObject
+from embodichain.lab.sim.objects import SurfaceDeformableObject
 from embodichain.lab.sim.shapes import MeshCfg
 from embodichain.lab.visualization import visualization_cfg_from_args
 from embodichain.utils import logger
@@ -281,10 +282,10 @@ def create_cloth(
     triangles: np.ndarray,
     uv_coords: np.ndarray,
     particle_flags: np.ndarray,
-) -> ClothObject:
+) -> SurfaceDeformableObject:
     """Declare the textured cloth with reference VBD material parameters."""
-    return sim.add_cloth_object(
-        ClothObjectCfg(
+    return sim.add_deformable_object(
+        SurfaceDeformableObjectCfg(
             uid="twist_cloth",
             shape=MeshCfg(
                 vertices=vertices,
@@ -301,13 +302,15 @@ def create_cloth(
             init_pos=CLOTH_POSITION,
             init_rot=(0.0, 0.0, 90.0),
             particle_flags=particle_flags,
-            physical_attr=ClothPhysicalAttributesCfg(
+            attrs=SurfaceDeformablePhysicsCfg(
                 density=0.2,
-                tri_ke=1.0e3,
-                tri_ka=1.0e3,
-                tri_kd=2.0e-4,
-                edge_ke=1.0e-3,
-                edge_kd=1.0e-2,
+                surface_props=SurfaceElementPropertiesCfg(
+                    tri_ke=1.0e3,
+                    tri_ka=1.0e3,
+                    tri_kd=2.0e-4,
+                    edge_ke=1.0e-3,
+                    edge_kd=1.0e-2,
+                ),
             ),
         )
     )
@@ -356,7 +359,7 @@ def main() -> None:
         if not args.headless and sim.open_window():
             configure_window_camera(sim)
 
-        particle_count = cloth.get_default_nodal_state().shape[1]
+        particle_count = cloth.data.n_nodes
         logger.log_info(
             f"Running cloth twist for {args.iterations} frames at {FPS} Hz "
             f"with {particle_count} particles."

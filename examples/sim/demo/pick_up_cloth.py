@@ -32,8 +32,9 @@ from embodichain.data import get_data_path
 from embodichain.lab.gym.utils.gym_utils import add_env_launcher_args_to_parser
 from embodichain.lab.sim import SimulationManager, SimulationManagerCfg
 from embodichain.lab.sim.cfg import (
-    ClothObjectCfg,
-    ClothPhysicalAttributesCfg,
+    SurfaceElementPropertiesCfg,
+    SurfaceDeformableObjectCfg,
+    SurfaceDeformablePhysicsCfg,
     MassPropertiesCfg,
     NewtonCollisionPropertiesCfg,
     NewtonPhysicsCfg,
@@ -42,7 +43,7 @@ from embodichain.lab.sim.cfg import (
     RigidObjectCfg,
     RenderCfg,
 )
-from embodichain.lab.sim.objects import ClothObject, RigidObject, Robot
+from embodichain.lab.sim.objects import SurfaceDeformableObject, RigidObject, Robot
 from embodichain.lab.sim.robots import URRobotCfg
 from embodichain.lab.sim.shapes import CubeCfg, MeshCfg
 from embodichain.lab.sim.utility.action_utils import interpolate_with_nums
@@ -195,7 +196,7 @@ def create_2d_grid_mesh(
     return verts, faces
 
 
-def create_cloth(sim: SimulationManager) -> ClothObject:
+def create_cloth(sim: SimulationManager) -> SurfaceDeformableObject:
     cloth_verts, cloth_faces = create_2d_grid_mesh(
         width=CLOTH_SIZE,
         height=CLOTH_SIZE,
@@ -209,8 +210,8 @@ def create_cloth(sim: SimulationManager) -> ClothObject:
     cloth_save_path = os.path.join(tempfile.gettempdir(), "cloth_mesh.ply")
     o3d.io.write_triangle_mesh(cloth_save_path, cloth_mesh)
 
-    cloth = sim.add_cloth_object(
-        cfg=ClothObjectCfg(
+    cloth = sim.add_deformable_object(
+        cfg=SurfaceDeformableObjectCfg(
             uid="cloth",
             shape=MeshCfg(fpath=cloth_save_path),
             init_pos=[0.5, 0.0, 0.3],
@@ -218,16 +219,18 @@ def create_cloth(sim: SimulationManager) -> ClothObject:
             # Keep the collision shell close to the rendered surface.  A large
             # radius can make the gripper carry cloth while visibly separated.
             particle_radius=CLOTH_PARTICLE_RADIUS,
-            physical_attr=ClothPhysicalAttributesCfg(
+            attrs=SurfaceDeformablePhysicsCfg(
                 # Give gravity enough authority to produce fabric-like drape.
                 # Stretch remains firmer than bending so the cloth folds
                 # instead of behaving like an elastic sheet.
                 density=0.05,
-                tri_ke=2.0e2,
-                tri_ka=2.0e2,
-                tri_kd=1.0e-5,
-                edge_ke=0.005,
-                edge_kd=0.01,
+                surface_props=SurfaceElementPropertiesCfg(
+                    tri_ke=2.0e2,
+                    tri_ka=2.0e2,
+                    tri_kd=1.0e-5,
+                    edge_ke=0.005,
+                    edge_kd=0.01,
+                ),
             ),
         )
     )

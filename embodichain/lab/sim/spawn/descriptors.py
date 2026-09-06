@@ -65,7 +65,6 @@ from dexsim.types import ActorType, DriveType, LoadOption as DexsimLoadOption
 from embodichain.lab.sim.cfg import (
     _normalize_joint_target_mode,
     ArticulationCfg,
-    ClothObjectCfg,
     CollisionPropertiesCfg,
     DefaultCollisionPropertiesCfg,
     DefaultRigidBodyPropertiesCfg,
@@ -75,7 +74,6 @@ from embodichain.lab.sim.cfg import (
     RigidBodyMaterialCfg,
     RigidBodyPhysicsCfg,
     RigidObjectCfg,
-    SoftObjectCfg,
     SurfaceDeformableObjectCfg,
     VolumeDeformableObjectCfg,
 )
@@ -92,10 +90,8 @@ if TYPE_CHECKING:
 
 __all__ = [
     "articulation_desc_from_cfg",
-    "cloth_desc_from_cfg",
     "configure_articulation_desc",
     "rigid_desc_from_cfg",
-    "soft_desc_from_cfg",
     "surface_deformable_desc_from_cfg",
     "volume_deformable_desc_from_cfg",
 ]
@@ -459,10 +455,11 @@ def volume_deformable_desc_from_cfg(
     material_ref, material_entry = _compile_visual_material(
         uid, cfg.shape.visual_material
     )
-    physical_attr = cfg.physical_attr
-    youngs = float(physical_attr.youngs)
-    poissons = float(physical_attr.poissons)
-    density = float(physical_attr.density)
+    attrs = cfg.attrs
+    surface_props = attrs.surface_props
+    youngs = float(attrs.youngs)
+    poissons = float(attrs.poissons)
+    density = float(attrs.density)
     particle_radius = (
         None if cfg.particle_radius is None else float(cfg.particle_radius)
     )
@@ -491,24 +488,25 @@ def volume_deformable_desc_from_cfg(
             volume_density=density,
             k_mu=youngs / (2.0 * (1.0 + poissons)),
             k_lambda=(youngs * poissons / ((1.0 + poissons) * (1.0 - 2.0 * poissons))),
-            k_damp=float(physical_attr.elasticity_damping),
-            surface_tri_ke=float(physical_attr.surface_tri_ke),
-            surface_tri_ka=float(physical_attr.surface_tri_ka),
-            surface_tri_kd=float(physical_attr.surface_tri_kd),
-            surface_tri_drag=float(physical_attr.surface_tri_drag),
-            surface_tri_lift=float(physical_attr.surface_tri_lift),
-            add_surface_edges=bool(physical_attr.add_surface_edges),
-            surface_edge_ke=float(physical_attr.surface_edge_ke),
-            surface_edge_kd=float(physical_attr.surface_edge_kd),
+            k_damp=float(attrs.elasticity_damping),
+            add_surface_edges=bool(attrs.add_surface_edges),
+            **{
+                f"surface_{item.name}": (
+                    0.0
+                    if (value := getattr(surface_props, item.name)) is None
+                    else float(value)
+                )
+                for item in fields(surface_props)
+            },
         ),
         meshing=SoftBodyMeshingDesc(
-            proxy_simplify_target=cfg.voxel_attr.triangle_simplify_target,
-            proxy_remesh_resolution=cfg.voxel_attr.triangle_remesh_resolution,
-            voxel_resolution=cfg.voxel_attr.simulation_mesh_resolution,
-            voxel_num_relaxation_iters=cfg.voxel_attr.voxel_num_relaxation_iters,
-            voxel_rel_min_tet_volume=cfg.voxel_attr.voxel_rel_min_tet_volume,
-            voxel_surface_dist_ratio=cfg.voxel_attr.voxel_surface_dist_ratio,
-            embedding_impl=cfg.voxel_attr.embedding_impl,
+            proxy_simplify_target=cfg.meshing.triangle_simplify_target,
+            proxy_remesh_resolution=cfg.meshing.triangle_remesh_resolution,
+            voxel_resolution=cfg.meshing.simulation_mesh_resolution,
+            voxel_num_relaxation_iters=cfg.meshing.voxel_num_relaxation_iters,
+            voxel_rel_min_tet_volume=cfg.meshing.voxel_rel_min_tet_volume,
+            voxel_surface_dist_ratio=cfg.meshing.voxel_surface_dist_ratio,
+            embedding_impl=cfg.meshing.embedding_impl,
         ),
         particle_flags=_particle_flags_from_cfg(cfg.particle_flags),
         particle_radius=particle_radius,
@@ -544,8 +542,9 @@ def surface_deformable_desc_from_cfg(
     material_ref, material_entry = _compile_visual_material(
         uid, render_shape.visual_material
     )
-    physical_attr = cfg.physical_attr
-    density = float(physical_attr.density)
+    attrs = cfg.attrs
+    surface_props = attrs.surface_props
+    density = float(attrs.density)
     particle_radius = (
         None if cfg.particle_radius is None else float(cfg.particle_radius)
     )
@@ -579,16 +578,10 @@ def surface_deformable_desc_from_cfg(
         visual_binding_mode=cfg.visual_binding_mode,
         physics=ClothPhysicsDesc(
             surface_density=density,
-            tri_ke=physical_attr.tri_ke,
-            tri_ka=physical_attr.tri_ka,
-            tri_kd=physical_attr.tri_kd,
-            tri_drag=physical_attr.tri_drag,
-            tri_lift=physical_attr.tri_lift,
-            edge_ke=physical_attr.edge_ke,
-            edge_kd=physical_attr.edge_kd,
-            add_springs=bool(physical_attr.add_springs),
-            spring_ke=physical_attr.spring_ke,
-            spring_kd=physical_attr.spring_kd,
+            add_springs=bool(attrs.add_springs),
+            spring_ke=attrs.spring_ke,
+            spring_kd=attrs.spring_kd,
+            **_configured_values(surface_props),
         ),
         particle_flags=_particle_flags_from_cfg(cfg.particle_flags),
         particle_radius=particle_radius,
@@ -597,24 +590,6 @@ def surface_deformable_desc_from_cfg(
     )
     materials = {} if material_entry is None else {material_entry[0]: material_entry[1]}
     return descriptor, materials
-
-
-def soft_desc_from_cfg(
-    cfg: SoftObjectCfg,
-    *,
-    per_env: bool = True,
-) -> tuple[SoftBodyDesc, dict[str, MaterialDesc]]:
-    """Compatibility wrapper for :func:`volume_deformable_desc_from_cfg`."""
-    return volume_deformable_desc_from_cfg(cfg, per_env=per_env)
-
-
-def cloth_desc_from_cfg(
-    cfg: ClothObjectCfg,
-    *,
-    per_env: bool = True,
-) -> tuple[ClothDesc, dict[str, MaterialDesc]]:
-    """Compatibility wrapper for :func:`surface_deformable_desc_from_cfg`."""
-    return surface_deformable_desc_from_cfg(cfg, per_env=per_env)
 
 
 def articulation_desc_from_cfg(

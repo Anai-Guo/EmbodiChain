@@ -101,7 +101,7 @@ The browser scene currently includes:
 - `RigidObject`, including multi-segment render meshes;
 - each constituent object in a `RigidObjectGroup`;
 - every visible link of `Robot` and `Articulation`;
-- dynamic `SoftObject` and `ClothObject` geometry;
+- dynamic `VolumeDeformableObject` and `SurfaceDeformableObject` geometry;
 - camera frustums and low-frequency RGB previews, including the primary (left)
   RGB view of stereo sensors;
 - read-only Gizmo frames, or interactive transform controls when commands are

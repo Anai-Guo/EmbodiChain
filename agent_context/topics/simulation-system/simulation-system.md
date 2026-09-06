@@ -131,18 +131,28 @@ single-axis rotation can hide an incorrect order.
 
 Deformables use the same public hierarchy for both topologies:
 `DeformableObjectCfg` is specialized by `VolumeDeformableObjectCfg` and
-`SurfaceDeformableObjectCfg`; `SoftObjectCfg` and `ClothObjectCfg` remain
-compatibility subclasses. `objects/deformable/` owns the common
+`SurfaceDeformableObjectCfg`. `objects/deformable/` owns the common
 `DeformableObject`/`DeformableObjectData` contract and the Newton particle-set
-volume and surface implementations. Consumers should use `data.nodal_pos_w`,
+volume and surface implementations. Both use one concrete `DeformableObjectData`.
+Consumers should use `data.nodal_pos_w`,
 `data.nodal_vel_w`, `data.nodal_state_w`, `get_surface_vertices()`, and
-`get_surface_triangles()`. Legacy soft/cloth methods delegate to that contract.
+`get_surface_triangles()`.
 At the Spawn boundary, volume and surface configs translate to DexSim's typed
 `SoftBodyDesc` and `ClothDesc` particle-set descriptors; volume voxel
 settings use `SoftBodyMeshingDesc`.
+Deformable object configs use `attrs` (`VolumeDeformablePhysicsCfg` or
+`SurfaceDeformablePhysicsCfg`) and volume-only `meshing`
+(`VolumeDeformableMeshingCfg`). Both physics configs compose
+`SurfaceElementPropertiesCfg` through `surface_props`. Volume elasticity
+uses `youngs` and `poissons`; density remains kg/m³ for volumes
+and kg/m² for surfaces. Surface coefficients default to zero for volumes and
+None (Newton defaults) for cloth. `DeformableObjectCfg.from_dict()` owns nested
+parsing; the rigid-specific `ObjectBaseCfg.attrs` parser must not decode these
+physics groups. Only the current field names are accepted; no legacy aliases
+or migration layer is maintained.
 
 `SimulationManager` stores both topologies once in `_deformable_objects` and
-exposes `add/get_deformable_object()` plus filtered legacy soft/cloth APIs.
+exposes `add/get_deformable_object()` for both topologies.
 Only the Newton backend is registered; the Default backend intentionally
 reports both deformable capabilities as unsupported. Declaration requires CUDA
 and a particle-capable Newton solver (`xpbd`, `semi_implicit`, `vbd`, or
