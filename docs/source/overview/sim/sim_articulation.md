@@ -23,6 +23,8 @@ Articulations are configured using the {class}`~cfg.ArticulationCfg` dataclass.
 | `attrs` | `RigidBodyPhysicsCfg` | empty groups | Grouped rigid-body physics applied to all links. |
 | `link_attrs` | `dict[str, LinkPhysicsOverrideCfg]` | `None` | Optional per-link overrides keyed by group name; each group matches link names via regex. |
 
+At runtime, call `articulation.set_gravity(...)` to change gravity for every
+environment or for a selected set of environment indices.
 
 ### Per-link physics (`link_attrs`)
 
@@ -210,6 +212,19 @@ print(f"Degrees of freedom: {articulation.dof}")
 print(f"Current Joint Positions: {articulation.get_qpos()}")
 print(f"End Effector Pose: {articulation.get_link_pose('ee_link')}")
 ```
+
+### Atomic Action Geometry Adapter
+
+`Articulation` exposes deterministic, domain-neutral facts through APIs such as
+`get_link_vert_face()`, `compute_fk()`, and `get_parent_joint_chain()`. Atomic
+Action integrations compose those facts with initial-state mesh transforms,
+Open3D surface sampling, and affordance-specific geometry metadata through
+`sample_initial_articulation_geometry()` in
+`embodichain.lab.sim.atomic_actions`. The adapter returns a typed value; call
+`to_object_geometry()` only at the `ObjectSemantics.geometry` boundary.
+
+Keeping this stochastic conversion in the Atomic Action layer means simulation
+objects do not own private point-cloud keys or affordance interpretation.
 
 ### Visual Appearance
 

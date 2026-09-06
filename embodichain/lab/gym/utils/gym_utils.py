@@ -633,6 +633,7 @@ def config_to_cfg(
 
     env_cfg.max_episode_steps = config.get("max_episode_steps", 300)
     env_cfg.num_envs = config.get("num_envs", 1)
+    env_cfg.seed = config.get("seed", None)
 
     render_config = deepcopy(config.get("render_cfg", {}))
     if "renderer" in config:
@@ -652,6 +653,8 @@ def config_to_cfg(
 
     env_cfg.sim_cfg = SimulationManagerCfg(
         headless=config.get("headless", False),
+        enable_entity_gizmo=config.get("enable_entity_gizmo", True),
+        robot_ik_gizmo=config.get("robot_ik_gizmo", {}),
         device=config.get("device"),
         render_cfg=RenderCfg(**render_config),
         gpu_id=config.get("gpu_id", 0),
@@ -811,6 +814,7 @@ def config_to_cfg(
                 mode=event_params_modified["mode"],
                 params=event_params_modified["params"],
                 interval_step=interval_step,
+                is_global=event_params_modified.get("is_global", False),
             )
             setattr(env_cfg.events, event_name, event)
 
@@ -1013,6 +1017,7 @@ def add_env_launcher_args_to_parser(
 
     This function adds the following arguments to the provided parser:
         --num_envs: Number of environments to run in parallel (default: 1)
+        --seed: Task-environment seed. The task config is used when omitted.
         --device: Runtime device override. When omitted, the selected backend
             supplies its own default (CPU for Default, CUDA for Newton).
         --headless: Whether to perform the simulation in headless mode (default: False)
@@ -1041,6 +1046,12 @@ def add_env_launcher_args_to_parser(
         help="The number of environments to run in parallel. "
         "If not given, falls back to the gym config's `num_envs` (default 1).",
         default=1,
+        type=int,
+    )
+    parser.add_argument(
+        "--seed",
+        help="Task-environment seed. Overrides the gym config when provided.",
+        default=None,
         type=int,
     )
     parser.add_argument(
@@ -1176,6 +1187,8 @@ def merge_args_with_gym_config(args: argparse.Namespace, gym_config: dict) -> di
     configured_physics = _declared_physics_backend(merged_config)
     if args.num_envs is not None:
         merged_config["num_envs"] = args.num_envs
+    if getattr(args, "seed", None) is not None:
+        merged_config["seed"] = args.seed
     if args.device is not None:
         merged_config["device"] = args.device
     viser_enabled = bool(getattr(args, "viser", False))
@@ -1386,6 +1399,21 @@ def init_rollout_buffer_from_gym_space(
             ),
             "segment_end": torch.zeros(
                 (num_envs, max_episode_steps), dtype=torch.bool, device=device
+            ),
+            "segment_accepted": torch.zeros(
+                (num_envs, max_episode_steps), dtype=torch.bool, device=device
+            ),
+            "segment_attempt_id": torch.full(
+                (num_envs, max_episode_steps),
+                -1,
+                dtype=torch.int64,
+                device=device,
+            ),
+            "continuity_id": torch.full(
+                (num_envs, max_episode_steps),
+                -1,
+                dtype=torch.int64,
+                device=device,
             ),
             "terminated": torch.zeros(
                 (num_envs, max_episode_steps), dtype=torch.bool, device=device
@@ -1612,6 +1640,21 @@ def init_rollout_buffer_from_config(
             ),
             "segment_end": torch.zeros(
                 (batch_size, max_episode_steps), dtype=torch.bool, device=device
+            ),
+            "segment_accepted": torch.zeros(
+                (batch_size, max_episode_steps), dtype=torch.bool, device=device
+            ),
+            "segment_attempt_id": torch.full(
+                (batch_size, max_episode_steps),
+                -1,
+                dtype=torch.int64,
+                device=device,
+            ),
+            "continuity_id": torch.full(
+                (batch_size, max_episode_steps),
+                -1,
+                dtype=torch.int64,
+                device=device,
             ),
             "terminated": torch.zeros(
                 (batch_size, max_episode_steps), dtype=torch.bool, device=device

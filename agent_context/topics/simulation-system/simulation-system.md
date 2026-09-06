@@ -143,8 +143,9 @@ until native object and data adapters are implemented and validated.
 the scene can be assembled before a native window is opened. It sets
 `SimulationManagerCfg.num_envs` from `EnvCfg.num_envs`.
 
-`SimulationManager` enables physics, selects manual physics updates, prepares
-the configured Arena layout, and owns a thin Spawn scene coordinator. With the
+`SimulationManager` fixes the native world to explicit physics updates before
+enabling physics, prepares the configured Arena layout, and owns a thin Spawn
+scene coordinator. With the
 Default backend, preparing the Arena layout lets `add_*` materialize native
 entities immediately, so articulation metadata and render nodes are available
 before finalization. A source-backed articulation added to an eager Default
@@ -204,6 +205,21 @@ provides this boundary automatically between `_setup_scene()` and
 metadata-dependent setup. `SimulationManager.update()` still calls the
 readiness path defensively before advancing the requested physics steps.
 
+`scripts/tutorials/sim/gizmo_robot.py` supports only manual physics. It initializes
+GPU physics after robot creation when needed, sets both current and target
+joint positions, and advances once before opening the window. It explicitly
+sets `GizmoCfg(ik_start_enabled=True)` so the native controller activates on the
+first update after opening the window. Its loop only
+calls `sim.update(step=1)`; the manager owns native IK updates and Viser
+commands/capture. The loop is paced by `physics_dt` and has no automatic
+physics polling path.
+
+`ArticulationCfg.enable_gravity` defaults to `True`. During articulation
+construction, `Articulation` applies this explicit runtime flag to every native
+entity before the first physics update, including when
+`use_usd_properties=True`. Use `Articulation.set_gravity(...)` to change the
+flag later for all or selected environment indices.
+
 ## Module Boundaries
 
 | Area | Owner | Routed topic |
@@ -241,6 +257,19 @@ for integrations that need link ancestry. It returns immediate-parent-first
 `ArticulationJointKinematics` values containing copied names, joint type,
 origin, axis, and optional limits. Consumers must not reach into
 `BatchEntity._entities` or retain backend-native joint-info objects.
+
+`Articulation.get_link_render_nodes(link_name)` is the explicit render-attachment
+query, inherited by Robot. It validates every instance and returns live render
+nodes in environment order; those nodes must not be used after asset destruction.
+`sensors.attachment.resolve_parent_nodes()` owns camera parent-name resolution
+using public asset queries. `SimulationManager.add_sensor()` only supplies the
+asset registry and environment count, then coordinates creation and attachment.
+
+`Articulation` also exposes deterministic link meshes through
+`get_link_vert_face()` and named-state FK through `compute_fk()` with
+`qpos_joint_names`. Stochastic surface sampling and Atomic Action geometry keys
+do not belong to the simulation object; use
+`atomic_actions.sample_initial_articulation_geometry()` for that adaptation.
 
 ## Configuration Flow
 
@@ -312,6 +341,49 @@ Newton gap; an active Newton configuration rejects an ambiguous standalone
 `contact_offset` unless a native margin or gap completes the intent. Explicit
 `NewtonCollisionPropertiesCfg.margin/gap` values take precedence over this
 translation.
+
+### Gizmo ownership
+
+Native entity manipulation belongs to DexSim 0.5.0. The first successful native
+window open enables its world-owned `EntityGizmoManipulator` by default, after
+the scene and default plane are ready. The manager registers the default plane
+as a static external target. `SimulationManagerCfg.enable_entity_gizmo=False`
+opts out; Gym deployments accept the same top-level JSON/YAML field through
+`gym.utils.gym_utils.config_to_cfg()`.
+
+`sim.enable_entity_gizmo(config)` explicitly enables/configures the controller;
+`sim.disable_entity_gizmo()` also cancels pending automatic enablement before
+the first window. These explicit calls take precedence over the startup default.
+Query through `sim.get_world().get_entity_gizmo()`. DexSim owns window
+detach/reopen and controller state; reopening never reapplies the default or
+overwrites an explicit native disable. Pure headless and Viser runs do not
+automatically create a native entity controller.
+
+`SimulationManagerCfg.robot_ik_gizmo` defaults to `GizmoCfg()`. During normal
+updates the manager registers robot control parts with complete solver chain/TCP
+metadata in single-environment interactive runs. Pure headless, read-only Viser, and
+multi-environment runs do not register automatic controls. The first native I
+press creates DexSim's `IKGizmoController` by default;
+`GizmoCfg(ik_start_enabled=True)` opts into activation on the first update with
+an open window. The startup attempt is consumed once, including on failure;
+later key presses can retry. Viser constructs IK on its first drag.
+Registration never writes drive targets. `Gizmo` owns managed native input and
+target-node cleanup, detaches input on window close, and reattaches the same
+controller on reopen. Robot removal releases all its managed controls.
+
+Set `robot_ik_gizmo=None` to opt out or supply `GizmoCfg` overrides; Gym
+JSON/YAML accepts the same mapping/null. `enable_gizmo()` can override one part,
+and `disable_gizmo()` prevents automatic recreation (all parts when omitted).
+The explicit `create_robot_ik_gizmo_controller()` factory still returns
+caller-owned controllers; a weak registry prevents automatic duplicates.
+Both robot paths
+default to native Newton IK; `GizmoCfg(ik_solver="embodichain")` adapts the
+control part's existing solver, such as PinkSolver. Both support one environment
+and write only selected non-mimic joint drive targets through `Robot`.
+
+`SimulationManagerCfg` owns window size, headless mode, rendering, GPU/CPU
+selection, arena count and spacing, physics timestep, physics and GPU-memory
+settings, recording, profiling, and browser visualization.
 
 `EnvCfg` embeds `SimulationManagerCfg` and supplies the control-to-physics
 step ratio. Gym configuration has no implicit physics backend: an inline
@@ -590,6 +662,8 @@ where `None` means “leave the source/backend value unchanged.”
   object initialization is only for state and supported live batch properties.
 - Manual update is the default; normal environment stepping must advance
   physics through `SimulationManager.update()`.
+- Drawing markers and publishing visualization do not advance physics.
+  Use `capture_visualization(force=True)` to publish marker edits while paused.
 - Reset only the requested environment rows and honor
   `excluded_uids` for resources detached from automatic reset.
 - Keep the `default_mass`, `default_inertia`, and `default_com_pose` values in
@@ -603,6 +677,8 @@ where `None` means “leave the source/backend value unchanged.”
   DexSim topology access encapsulated by `Articulation`.
 - Resolve rigid contacts through the Spawn result's `ContactQuery`; do not add
   a second PhysicsScene/Newton contact path in `SimulationManager` or sensors.
+- Keep articulation mesh access, FK, and topology domain-neutral. Perform
+  affordance sampling and semantic-key conversion in the Atomic Action adapter.
 
 ## Common Failure Modes
 

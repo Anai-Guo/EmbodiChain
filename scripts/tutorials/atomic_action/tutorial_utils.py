@@ -110,7 +110,7 @@ TUTORIAL_PARALLEL_JAW_MODEL = ParallelJawGripperModelCfg(
     finger_thickness=0.01,
     palm_depth=0.096,
 )
-DEFAULT_GRIPPER_CLOSE_QPOS = 0.024
+DEFAULT_GRIPPER_CLOSE_QPOS = 0.036
 NEWTON_GRASP_CONTACT_STIFFNESS = 4.0e4
 NEWTON_GRASP_CONTACT_DAMPING = 4.0e2
 # The official Newton native-contact grasp example uses condim=4 to retain
@@ -1261,12 +1261,15 @@ def create_ur5_gripper_robot_cfg(
             },
             "joint_drive_props": {
                 "stiffness": {
+                    "arm": 5e4,
                     GRIPPER_HAND_JOINT_PATTERN: 1e3,
                 },
                 "damping": {
+                    "arm": 5e3,
                     GRIPPER_HAND_JOINT_PATTERN: 1e2,
                 },
                 "max_effort": {
+                    "arm": 1e6,
                     GRIPPER_HAND_JOINT_PATTERN: 1e4,
                 },
             },

@@ -1627,6 +1627,43 @@ class Articulation(BatchEntity):
         verts, faces = self.body_data.link_vert_face[link_name]
         return verts, faces
 
+    def get_link_render_nodes(self, link_name: str) -> list[dexsim.engine.Node]:
+        """Get a link's native render node for every articulation instance.
+
+        This is the render-attachment boundary for cameras and other scene
+        integrations. Returned nodes belong to this articulation and must not
+        be used after the owning asset is destroyed.
+
+        Args:
+            link_name: Canonical link name, without backend clone suffixes.
+
+        Returns:
+            Render nodes ordered by environment index.
+
+        Raises:
+            ValueError: If the link is not part of this articulation.
+            RuntimeError: If any instance is missing the link or its render node.
+        """
+        if link_name not in self.link_names:
+            raise ValueError(f"Articulation {self.uid!r} has no link {link_name!r}.")
+
+        nodes: list[dexsim.engine.Node] = []
+        for env_idx, entity in enumerate(self._entities):
+            if link_name not in entity.get_link_names():
+                raise RuntimeError(
+                    f"Articulation {self.uid!r} is missing link "
+                    f"{link_name!r} in arena {env_idx}."
+                )
+            render_body = entity.get_render_body(link_name)
+            node = None if render_body is None else render_body.render_node()
+            if node is None:
+                raise RuntimeError(
+                    f"Articulation {self.uid!r} link {link_name!r} has "
+                    f"no render node in arena {env_idx}."
+                )
+            nodes.append(node)
+        return nodes
+
     def get_link_pose(
         self, link_name: str, env_ids: Sequence[int] | None = None, to_matrix=False
     ) -> torch.Tensor:
@@ -2904,10 +2941,12 @@ class Articulation(BatchEntity):
     def compute_fk(
         self,
         qpos: torch.Tensor | np.ndarray | None,
-        link_names: str | list[str] | tuple[str] | None = None,
+        link_names: str | list[str] | tuple[str, ...] | None = None,
         end_link_name: str | None = None,
         root_link_name: str | None = None,
         to_dict: bool = False,
+        *,
+        qpos_joint_names: Sequence[str] | None = None,
         **kwargs,
     ) -> Union[torch.Tensor, dict[str, "pk.Transform3d"]]:
         """Compute the forward kinematics (FK) for the given joint positions.
@@ -2920,6 +2959,9 @@ class Articulation(BatchEntity):
             end_link_name (str, optional): Name of the end link for which FK is computed. If None, all links are considered.
             root_link_name (str, optional): Name of the root link for which FK is computed. Defaults to None.
             to_dict (bool, optional): If True, returns the FK result as a dictionary of Transform3d objects. Defaults to False.
+            qpos_joint_names: Optional names corresponding to the last dimension
+                of ``qpos``. When supplied, the values are reordered into the
+                kinematic chain's parameter order before FK.
             **kwargs: Additional keyword arguments for customization.
 
         Raises:
@@ -2935,6 +2977,52 @@ class Articulation(BatchEntity):
         frame_indices = None
         if self.pk_chain is None:
             logger.log_error("pk_chain is not initialized for this articulation.")
+
+        if qpos_joint_names is not None:
+            if end_link_name is not None or root_link_name is not None:
+                raise ValueError(
+                    "qpos_joint_names cannot be combined with serial-chain FK."
+                )
+            if isinstance(qpos_joint_names, (str, bytes)) or not isinstance(
+                qpos_joint_names,
+                Sequence,
+            ):
+                raise TypeError("qpos_joint_names must be a sequence of names.")
+            supplied_joint_names = tuple(qpos_joint_names)
+            if any(
+                type(name) is not str or not name or name != name.strip()
+                for name in supplied_joint_names
+            ):
+                raise ValueError(
+                    "qpos_joint_names must contain non-empty string names."
+                )
+            if len(set(supplied_joint_names)) != len(supplied_joint_names):
+                raise ValueError("qpos_joint_names must not contain duplicates.")
+            if qpos is None:
+                raise ValueError("qpos is required when qpos_joint_names is supplied.")
+            qpos_tensor = torch.as_tensor(qpos, device=self.device)
+            if qpos_tensor.dim() not in (1, 2) or qpos_tensor.shape[-1] != len(
+                supplied_joint_names
+            ):
+                raise ValueError("qpos last dimension must match qpos_joint_names.")
+            kinematic_joint_names = tuple(self.pk_chain.get_joint_parameter_names())
+            if len(supplied_joint_names) != len(kinematic_joint_names) or set(
+                supplied_joint_names
+            ) != set(kinematic_joint_names):
+                raise ValueError(
+                    "qpos_joint_names must match the kinematic-chain joint names."
+                )
+            if kinematic_joint_names:
+                qpos_by_name = {
+                    name: qpos_tensor[..., index]
+                    for index, name in enumerate(supplied_joint_names)
+                }
+                qpos = torch.stack(
+                    [qpos_by_name[name] for name in kinematic_joint_names],
+                    dim=-1,
+                )
+            else:
+                qpos = qpos_tensor[..., :0].clone()
 
         # Adapt link_names to work with get_frame_indices
         if link_names is not None:
@@ -3420,6 +3508,21 @@ class Articulation(BatchEntity):
             self._entities[env_idx].set_articulation_flag(
                 ArticulationFlag.DISABLE_SELF_COLLISION, not enable
             )
+
+    def set_gravity(
+        self,
+        enable: bool = True,
+        env_ids: Sequence[int] | None = None,
+    ) -> None:
+        """Set whether gravity is enabled for the articulation.
+
+        Args:
+            enable: Whether to enable gravity. Defaults to True.
+            env_ids: Environment indices. If None, all environments are used.
+        """
+        local_env_ids = self._all_indices if env_ids is None else env_ids
+        for env_idx in local_env_ids:
+            self._entities[env_idx].enable_gravity(bool(enable))
 
     def destroy(self) -> None:
         if self.is_declared or self.is_spawn_bound:

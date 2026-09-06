@@ -55,7 +55,7 @@ from .articulation import (
 )
 from .robot import Robot, RobotCfg, RobotWorkspaceCfg
 from .light import Light, LightCfg
-from .gizmo import Gizmo, GizmoCfg
+from .gizmo import Gizmo, GizmoCfg, create_robot_ik_gizmo_controller
 from .constraint import RigidConstraint
 
 

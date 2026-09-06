@@ -276,8 +276,11 @@ embodichain.lab.gym.envs.demo
 
    DEMO_ANNOTATION_KEYS
    DEMO_SCHEMA_VERSION
+   DemoExecutionCfg
    DemoEpisodeResult
+   DemoOutputMode
    DemoSegment
+   DemoSegmentOutcomeKind
    DemoSegmentResult
    execute_demo_episode
    resolve_demo_segments
@@ -899,10 +902,15 @@ embodichain.lab.sim.objects.gizmo
 
 .. currentmodule:: embodichain.lab.sim.objects.gizmo
 
+Native robot targets use DexSim's controller with Newton IK by default.
+Set ``GizmoCfg.ik_solver="embodichain"`` to reuse the robot control part's
+configured solver, including PinkSolver; Viser uses the same solver adapter.
+
 .. autosummary::
 
    Gizmo
    GizmoCfg
+   create_robot_ik_gizmo_controller
 
 embodichain.lab.sim.objects.rigid_object
 ----------------------------------------
@@ -1651,6 +1659,22 @@ embodichain.lab.visualization.cli
    add_viser_args_to_parser
    visualization_cfg_from_args
 
+embodichain.lab.visualization.picker
+------------------------------------
+
+.. currentmodule:: embodichain.lab.visualization.picker
+
+Browser picking caches triangle geometry and returns the closest node hit by
+a world-space ray. The Viser worker pairs this geometry with poses from the
+same scene revision before producing a pick command.
+
+.. autosummary::
+
+   ScenePicker
+
+.. autoclass:: ScenePicker
+   :members:
+
 embodichain.lab.visualization.protocol
 --------------------------------------
 
@@ -1672,6 +1696,7 @@ embodichain.lab.visualization.protocol
    JointControlSpec
    JointControlState
    MeshGeometry
+   PickCommand
    PointCloudOverlay
    SceneFrame
    SceneManifest

@@ -73,7 +73,6 @@ class BaseSolverTest:
     def setup_simulation(self, device):
         config = SimulationManagerCfg(headless=True, device=device)
         self.sim = SimulationManager(config)
-        self.sim.set_manual_update(False)
 
         cfg_dict = {
             "uid": "CobotMagic",

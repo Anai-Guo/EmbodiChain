@@ -44,6 +44,9 @@ class CameraCfg(SensorCfg):
         The extrinsics define the position and orientation of the camera in the 3D world.
         If eye, target, and up are provided, they will be used to compute the extrinsics.
         Otherwise, the position and orientation will be set to the defaults.
+
+        SimulationManager resolves ``parent`` as a Robot or Articulation link
+        name. Use ``"<asset_uid>/<link_name>"`` when the link name is ambiguous.
         """
 
         eye: Tuple[float, float, float] | None = None
@@ -284,6 +287,7 @@ class Camera(BaseSensor):
         Raises:
             RuntimeError: If the number of parent nodes does not match the
                 number of camera instances.
+            ValueError: If any parent node is missing.
         """
         nodes = list(parent_nodes)
         if len(nodes) != self.num_instances:
@@ -291,6 +295,8 @@ class Camera(BaseSensor):
                 f"Camera attachment received {len(nodes)} parent nodes for "
                 f"{self.num_instances} camera instances."
             )
+        if any(node is None for node in nodes):
+            raise ValueError("Camera attachment requires a parent node in every arena.")
         for entity, parent in zip(self._entities, nodes, strict=True):
             entity.attach_node(parent)
         # Extrinsics are expressed in the parent frame. Reapply them after

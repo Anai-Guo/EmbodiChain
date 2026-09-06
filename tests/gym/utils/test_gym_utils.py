@@ -272,6 +272,10 @@ class TestInitRolloutBufferFromConfig:
         # Check actions and rewards
         assert buffer["actions"].shape == (4, 100, 7)
         assert buffer["rewards"].shape == (4, 100)
+        assert buffer["segment_accepted"].shape == (4, 100)
+        assert not buffer["segment_accepted"].any()
+        assert (buffer["segment_attempt_id"] == -1).all()
+        assert (buffer["continuity_id"] == -1).all()
 
     def test_extra_observation_with_shape_tuple(self):
         """Test that extra observations with shape tuple are added correctly."""
@@ -575,6 +579,28 @@ def test_launcher_preserves_gym_renderer_when_cli_omits_override():
     assert args.renderer is None
     assert "renderer" not in merged_config
     assert merged_config["render_cfg"]["renderer"] == "rt"
+
+
+def test_launcher_seed_overrides_gym_config() -> None:
+    """The common launcher exposes an explicit task-environment seed override."""
+    parser = argparse.ArgumentParser()
+    add_env_launcher_args_to_parser(parser, require_gym_config=True)
+
+    args = parser.parse_args(["--gym_config", "gym_config.yaml", "--seed", "1234"])
+    merged_config = merge_args_with_gym_config(args, {"seed": 99})
+
+    assert merged_config["seed"] == 1234
+
+
+def test_launcher_preserves_config_seed_without_override() -> None:
+    """Omitting ``--seed`` keeps the value declared by the task config."""
+    parser = argparse.ArgumentParser()
+    add_env_launcher_args_to_parser(parser, require_gym_config=True)
+
+    args = parser.parse_args(["--gym_config", "gym_config.yaml"])
+    merged_config = merge_args_with_gym_config(args, {"seed": 99})
+
+    assert merged_config["seed"] == 99
 
 
 def test_env_launcher_includes_viser_arguments():
@@ -1607,10 +1633,62 @@ class TestConfigToCfgFromFile:
                 source_path=tmp_path / "env.yaml",
             )
 
+    @pytest.mark.parametrize("suffix", ["yaml", "json"])
+    @pytest.mark.parametrize("enabled", [None, False, True])
+    def test_gym_config_preserves_entity_gizmo_startup_preference(
+        self, tmp_path: Path, suffix: str, enabled: bool | None
+    ) -> None:
+        """Task deployments default to native interaction and can opt out."""
+        config = {
+            "id": "EmbodiedEnv-v1",
+            "env": {},
+            "robot": {"uid": "TestRobot"},
+        }
+        if enabled is not None:
+            config["enable_entity_gizmo"] = enabled
+        config_path = tmp_path / f"gym_config.{suffix}"
+        save_config(config_path, config)
+
+        cfg = config_to_cfg(
+            load_config(config_path), manager_modules=DEFAULT_MANAGER_MODULES
+        )
+
+        assert cfg.sim_cfg.enable_entity_gizmo is (enabled is not False)
+
+    @pytest.mark.parametrize("suffix", ["yaml", "json"])
+    @pytest.mark.parametrize(
+        "settings", [None, {}, {"ik_solver": "embodichain"}, {"ik_start_enabled": True}]
+    )
+    def test_gym_config_parses_automatic_robot_gizmo_settings(
+        self, tmp_path: Path, suffix: str, settings: dict | None
+    ) -> None:
+        """Deployments may disable automatic IK controls or select their solver."""
+        path = tmp_path / f"gym_config.{suffix}"
+        save_config(
+            path,
+            {
+                "id": "EmbodiedEnv-v1",
+                "env": {},
+                "robot": {"uid": "robot"},
+                "robot_ik_gizmo": settings,
+            },
+        )
+        cfg = config_to_cfg(load_config(path), manager_modules=DEFAULT_MANAGER_MODULES)
+        if settings is None:
+            assert cfg.sim_cfg.robot_ik_gizmo is None
+        else:
+            assert cfg.sim_cfg.robot_ik_gizmo.ik_solver == settings.get(
+                "ik_solver", "dexsim"
+            )
+            assert cfg.sim_cfg.robot_ik_gizmo.ik_start_enabled is settings.get(
+                "ik_start_enabled", False
+            )
+
     def test_yaml_gym_config_parses_to_cfg(self, tmp_path):
         config = {
             "id": "EmbodiedEnv-v1",
             "physics": "default",
+            "seed": 2026,
             "max_episode_steps": 100,
             "physics_config": {
                 "gravity": [0.0, 0.0, -1.62],
@@ -1636,7 +1714,15 @@ class TestConfigToCfgFromFile:
             "env": {
                 "sim_steps_per_control": 2,
                 "target_control_frequency": 20.0,
-                "events": {},
+                "events": {
+                    "global_light": {
+                        "func": "randomize_emission_light",
+                        "mode": "interval",
+                        "interval_step": 7,
+                        "is_global": True,
+                        "params": {"intensity_range": [0.1, 0.9]},
+                    }
+                },
                 "observations": {},
                 "rewards": {},
             },
@@ -1663,6 +1749,9 @@ class TestConfigToCfgFromFile:
         cfg = config_to_cfg(loaded, manager_modules=DEFAULT_MANAGER_MODULES)
 
         assert cfg.max_episode_steps == 100
+        assert cfg.seed == 2026
+        assert cfg.events.global_light.interval_step == 7
+        assert cfg.events.global_light.is_global is True
         assert cfg.robot.uid == "TestRobot"
         assert cfg.sim_steps_per_control == 2
         assert cfg.target_control_frequency == 20.0

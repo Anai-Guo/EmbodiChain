@@ -164,10 +164,12 @@ the update loop or optional `--preview` REPL.
 | `stop_visualization()` | Stops the worker/backend and releases the server port |
 | `destroy()` | Stops visualization before queuing deferred simulation cleanup |
 
-During manual `SimulationManager.update()`, each physics step increments the
+During explicit `SimulationManager.update()`, each physics step increments the
 visualization step/time counters and attempts a rate-limited capture. A topology
 revision mismatch publishes a fresh manifest before its first matching frame.
 `BaseEnv.reset()` also requests a forced capture after resetting scene state.
+Drawing markers and capturing visualization do not advance physics; interactive
+loops call `SimulationManager.update(step=1)` to process Gizmos and step the world.
 
 Manager add methods mark topology dirty for rigid objects, rigid-object groups,
 soft bodies, cloth, robots, articulations, and `Camera` sensors. Supported
@@ -257,6 +259,32 @@ node kind, path, and color.
   manifest geometry is rejected.
 
 ## Browser Controls and Overlays
+
+Gizmo implementation lives in `embodichain/lab/sim/objects/gizmo.py`. Native
+windows delegate object picking/manipulation to DexSim's entity gizmo and robot
+targets to its `IKGizmoController`. Entity interaction defaults on at the first
+native window open; `SimulationManagerCfg.enable_entity_gizmo=False` or
+`sim.disable_entity_gizmo()` opts out and reopening preserves the choice.
+Pure headless and Viser runs do not automatically create native controls.
+`SimulationManagerCfg.robot_ik_gizmo` automatically registers robot parts with
+solver chain/TCP metadata: native IK activates on I by default, or on the first
+update with an open window when `GizmoCfg(ik_start_enabled=True)`. The robot
+tutorial uses this startup option. Viser builds IK on the first drag. The manager updates both and preserves native controls across window
+reopen. Explicit configuration and disable calls take precedence; caller-owned
+native factory controllers are not duplicated. Automatic Viser registration
+requires `allow_commands`, independently of native interaction preferences.
+Viser transports poses to the
+simulation thread. Both robot paths use Newton IK by default or, with
+`GizmoCfg(ik_solver="embodichain")`, reuse the configured control-part solver
+(including Pink). Chain roots follow the live robot link, including upstream
+joint motion; TCP overrides adapt targets without changing the shared solver.
+
+Viser click picking runs on the visualization worker via the existing GUI
+event queue. A manifest invalidates cached pick poses until its matching frame
+arrives; stale clicks are dropped. The manager validates `PickCommand` run and
+revision before attaching a gizmo and tracks picker ownership independently
+from explicitly created gizmos. Clearing selection releases only the picker
+gizmo. Native entity selection remains entirely DexSim-owned.
 
 The browser GUI has:
 

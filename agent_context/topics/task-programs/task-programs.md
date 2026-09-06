@@ -165,6 +165,14 @@ Gym tasks. Task Program integration and nested scene-binding composition is
 owned by `task_program/integrations/_configured_composition.py`. An embodiment
 component may omit `skill_profile`, while a scene component never owns Task
 Program metadata.
+
+Configured articulation-link Slide services sample initial articulation
+geometry only when `translation_axis` is omitted. Supplying the compatibility
+axis preserves the mesh-only legacy path and bypasses initial point-cloud
+sampling. This keeps the explicit axis usable when non-unit `body_scale` is
+rejected by the point-cloud adapter; it does not make automatic sampling
+scale-aware.
+
 Selecting a physical component does not by itself parameterize hard-coded
 Python control-part names or trajectory dimensions. A configured Task Program
 must select an embodiment `skill_profile`; its integration must declare a
@@ -203,6 +211,34 @@ Keep these boundaries separate:
 `DemoSegment` values so the ordinary Gym executor retains stepping, recording,
 reward, reset, and persistence. Final success is published only after every
 segment lifecycle completes normally.
+
+The bridge declares `progress_total_steps` only for deterministic open-loop
+Pick/Place segments with fixed interpolation samples and no recovery, runner
+holds, feedback settling, post-policies, or parallel execution. It links only
+the current segment's calls to their policy presets; progress display never
+performs full workflow analysis or downstream look-ahead. Handwritten
+trajectory tasks use the same `DemoSegment` field for a known fixed trajectory
+and settle suffix; paths whose emitted action count depends on runtime state
+remain indeterminate in both execution styles.
+
+## Demonstration outcome and persistence
+
+The bridge's accepted mask remains the sole segment-quality authority. The
+common demo executor records it in `DemoSegmentResult.successes`, classifies the
+first authoritative failure phase in `outcome_kinds`, and writes
+`segment_accepted`, `segment_attempt_id`, and `continuity_id` for every real
+rollout frame. Task Program segment metadata uses `task_program_id`; LeRobot
+fragment sidecars copy it to the provider-neutral `source_program_id` field.
+
+`DemoExecutionCfg` is collector-owned, not part of the Task Program language.
+Its default `continuous` mode preserves episode semantics. Its
+`segment_fragments` mode persists eligible naturally executed segments as
+independent LeRobot episodes, with failed fragments requiring explicit opt-in.
+Current execution remains fail-closed and every frame has `continuity_id == 0`;
+checkpoint capture, state restore, and suffix resume are deferred. Fragment
+commits are individually durable and recorder-locally idempotent by stable
+`fragment_id`, so a later write failure does not duplicate an earlier fragment
+on retry.
 
 ## Parallel and registered calls
 
@@ -251,6 +287,8 @@ language.
 | Live simulation binding | `integrations/simulation/` |
 | Gym action/segment lifecycle | `gym/envs/task_program/bridge.py` |
 | Episode program selection/final success | `gym/envs/embodied_env.py` |
+| Outcome annotations and persistence mode | `gym/envs/demo.py`, `gym/envs/embodied_env.py` |
+| LeRobot fragment slicing/idempotency | `gym/envs/managers/datasets.py`, `async_datasets.py` |
 
 ## Focused validation
 
@@ -258,6 +296,7 @@ language.
 pytest -q tests/lab/task_program
 pytest -q tests/gym/envs/task_program
 pytest -q tests/gym/envs/test_embodied_env_task_program.py
+pytest -q tests/gym/envs/test_demo.py tests/gym/envs/managers
 pytest -q tests/agents/mllm/test_task_program.py
 pytest -q tests/sim/atomic_actions
 python docs/scripts/check_api_docs.py

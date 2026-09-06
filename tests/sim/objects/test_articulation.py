@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -28,7 +29,7 @@ from embodichain.lab.sim import (
     SimulationManagerCfg,
     VisualMaterialCfg,
 )
-from embodichain.lab.sim.objects import Articulation, ArticulationJointKinematics
+from embodichain.lab.sim.objects import Articulation, ArticulationJointKinematics, Robot
 from embodichain.lab.sim.cfg import (
     ArticulationCfg,
     JointDrivePropertiesCfg,
@@ -53,6 +54,47 @@ def _teardown_newton_physics() -> None:
     teardown_newton_physics()
 
 
+class _GravityEntity:
+    """Record native gravity calls for an articulation test double."""
+
+    def __init__(self) -> None:
+        self.calls: list[bool] = []
+
+    def enable_gravity(self, flag: bool) -> None:
+        self.calls.append(flag)
+
+
+@pytest.mark.no_sim
+@pytest.mark.parametrize("enable", [True, False])
+def test_set_gravity_updates_only_selected_environments(enable: bool) -> None:
+    """Runtime gravity updates are dispatched to the requested native entities."""
+    articulation = object.__new__(Articulation)
+    articulation._entities = [_GravityEntity() for _ in range(3)]
+    articulation._all_indices = torch.arange(3, dtype=torch.int32)
+
+    articulation.set_gravity(enable, env_ids=(2, 0))
+
+    assert articulation._entities[0].calls == [enable]
+    assert articulation._entities[1].calls == []
+    assert articulation._entities[2].calls == [enable]
+
+
+@pytest.mark.no_sim
+def test_set_gravity_updates_all_environments_by_default() -> None:
+    """Omitting environment indices applies gravity to every native entity."""
+    articulation = object.__new__(Articulation)
+    articulation._entities = [_GravityEntity() for _ in range(3)]
+    articulation._all_indices = torch.arange(3, dtype=torch.int32)
+
+    articulation.set_gravity(False)
+
+    assert [entity.calls for entity in articulation._entities] == [
+        [False],
+        [False],
+        [False],
+    ]
+
+
 def test_get_qf_returns_all_articulation_joint_efforts():
     expected_qf = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=torch.float32)
     articulation = object.__new__(Articulation)
@@ -61,6 +103,52 @@ def test_get_qf_returns_all_articulation_joint_efforts():
     actual_qf = articulation.get_qf()
 
     assert torch.equal(actual_qf, expected_qf)
+
+
+@pytest.mark.no_sim
+def test_compute_fk_reorders_named_qpos_into_kinematic_joint_order():
+    articulation = object.__new__(Articulation)
+    captured: dict[str, object] = {}
+    expected_result = {"target": object()}
+
+    def forward_kinematics(
+        *,
+        th: torch.Tensor,
+        frame_indices: object,
+    ) -> dict[str, object]:
+        captured["qpos"] = th.clone()
+        captured["frame_indices"] = frame_indices
+        return expected_result
+
+    articulation.pk_chain = SimpleNamespace(
+        get_joint_parameter_names=lambda: ["joint_a", "joint_b"],
+        forward_kinematics=forward_kinematics,
+    )
+
+    result = articulation.compute_fk(
+        torch.tensor(((2.0, 1.0),)),
+        qpos_joint_names=("joint_b", "joint_a"),
+        to_dict=True,
+    )
+
+    assert result is expected_result
+    assert torch.equal(captured["qpos"], torch.tensor(((1.0, 2.0),)))
+    assert captured["frame_indices"] is None
+
+
+@pytest.mark.no_sim
+def test_compute_fk_rejects_named_qpos_for_serial_chain():
+    articulation = object.__new__(Articulation)
+    articulation.pk_chain = SimpleNamespace(
+        get_joint_parameter_names=lambda: ["joint"],
+    )
+
+    with pytest.raises(ValueError, match="cannot be combined with serial-chain FK"):
+        articulation.compute_fk(
+            torch.tensor((0.0,)),
+            end_link_name="target",
+            qpos_joint_names=("joint",),
+        )
 
 
 @pytest.mark.no_sim
@@ -146,6 +234,65 @@ def test_get_parent_joint_chain_uses_newton_joint_descriptors_when_needed():
     assert [joint.name for joint in chain] == ["handle_fixed", "door_hinge"]
     assert [joint.joint_type for joint in chain] == ["fixed", "revolute"]
     assert chain[1].joint_limits == (0.0, 2.0)
+
+
+def _make_render_node_articulation(
+    asset_type: type[Articulation] = Articulation, num_envs: int = 2
+) -> tuple[Articulation, list[object]]:
+    asset = object.__new__(asset_type)
+    asset.uid = "arm"
+    asset._data = SimpleNamespace(link_names=["wrist"])
+    nodes = [object() for _ in range(num_envs)]
+    asset._entities = []
+    for node in nodes:
+        entity = MagicMock(spec=["get_link_names", "get_render_body"])
+        entity.get_link_names.return_value = ["wrist"]
+        entity.get_render_body.return_value.render_node.return_value = node
+        asset._entities.append(entity)
+    return asset, nodes
+
+
+@pytest.mark.no_sim
+@pytest.mark.parametrize("asset_type", [Articulation, Robot])
+@pytest.mark.parametrize("num_envs", [1, 3])
+def test_get_link_render_nodes_uses_canonical_link_in_each_arena(
+    asset_type: type[Articulation], num_envs: int
+) -> None:
+    asset, nodes = _make_render_node_articulation(asset_type, num_envs)
+
+    assert asset.get_link_render_nodes("wrist") == nodes
+    for entity in asset._entities:
+        entity.get_render_body.assert_called_once_with("wrist")
+
+
+@pytest.mark.no_sim
+def test_get_link_render_nodes_rejects_unknown_link_before_native_access() -> None:
+    asset, _ = _make_render_node_articulation()
+
+    with pytest.raises(ValueError, match="has no link 'missing'"):
+        asset.get_link_render_nodes("missing")
+
+    for entity in asset._entities:
+        entity.get_render_body.assert_not_called()
+
+
+@pytest.mark.no_sim
+@pytest.mark.parametrize("failure", ["missing_link", "missing_body", "missing_node"])
+def test_get_link_render_nodes_rejects_incomplete_arena_topology(failure: str) -> None:
+    asset, _ = _make_render_node_articulation()
+    entity = asset._entities[1]
+    if failure == "missing_link":
+        entity.get_link_names.return_value = []
+        error = "missing link 'wrist' in arena 1"
+    else:
+        if failure == "missing_body":
+            entity.get_render_body.return_value = None
+        else:
+            entity.get_render_body.return_value.render_node.return_value = None
+        error = "no render node in arena 1"
+
+    with pytest.raises(RuntimeError, match=error):
+        asset.get_link_render_nodes("wrist")
 
 
 def _link_static_friction(art: Articulation, link_name: str, env_idx: int = 0) -> float:

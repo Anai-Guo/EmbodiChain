@@ -24,6 +24,10 @@ topics:
       - SimulationManagerCfg
       - PhysicsBackendCfg
       - DefaultPhysicsCfg
+      - EntityGizmoManipulator
+      - enable_entity_gizmo
+      - disable_entity_gizmo
+      - robot_ik_gizmo
       - DexSim
       - AutoSolverCfg
       - Newton AutoSolver
@@ -37,7 +41,7 @@ topics:
       - sim update
       - scene object
       - asset registry
-      - manual update
+      - explicit physics stepping
       - GPU physics
       - simulation lifecycle
       - CameraCfg.extrinsics.parent
@@ -66,6 +70,8 @@ topics:
       - quaternion
       - xyzw
       - pose convention
+      - get_link_render_nodes
+      - ArticulationCfg
     paths:
       - topics/simulation-system/simulation-system.md
     source_of_truth:
@@ -353,13 +359,17 @@ topics:
       - pointcloud
       - quaternion
       - xyzw
+      - resolve_parent_nodes
     paths:
       - topics/sensor-system/sensor-system.md
     source_of_truth:
       - embodichain/lab/sim/sensors/base_sensor.py
       - embodichain/lab/sim/sensors/camera.py
       - embodichain/lab/sim/sensors/stereo.py
+      - embodichain/lab/sim/sensors/attachment.py
       - embodichain/lab/sim/sensors/contact_sensor.py
+      - embodichain/lab/sim/sim_manager.py
+      - embodichain/lab/sim/objects/articulation.py
       - embodichain/lab/gym/utils/gym_utils.py
       - embodichain/lab/gym/utils/_component_composition.py
       - embodichain/lab/task_program/integrations/_configured_composition.py
@@ -405,11 +415,18 @@ topics:
       - cloth
       - quaternion
       - xyzw
+      - gizmo
+      - IKGizmoController
+      - create_robot_ik_gizmo_controller
+      - GizmoCfg
+      - ScenePicker
+      - PickCommand
     paths:
       - topics/sim-visualization/sim-visualization.md
     source_of_truth:
       - embodichain/lab/sim/sim_manager.py
       - embodichain/lab/visualization/
+      - embodichain/lab/sim/objects/gizmo.py
       - embodichain/lab/gym/utils/gym_utils.py
       - embodichain/lab/gym/envs/base_env.py
       - embodichain/lab/scripts/preview_asset.py
@@ -726,6 +743,12 @@ topics:
       - RigidObjectSceneProvider
       - create_simulation_atomic_action_engine
       - ObjectSemantics
+      - ArticulationAffordanceGeometry
+      - ArticulationGeometryProvider
+      - ArticulationJointGeometry
+      - sample_initial_articulation_geometry
+      - articulation geometry adapter
+      - non_target_articulation_point_cloud
       - entity_id
       - frozen ObjectSemantics
       - canonical entity identity
@@ -836,6 +859,8 @@ topics:
       - embodichain/lab/sim/atomic_actions/goals.py
       - embodichain/lab/sim/atomic_actions/effects.py
       - embodichain/lab/sim/atomic_actions/affordance.py
+      - embodichain/lab/sim/atomic_actions/_articulation_geometry_keys.py
+      - embodichain/lab/sim/atomic_actions/articulation_geometry.py
       - embodichain/lab/sim/atomic_actions/bindings.py
       - embodichain/lab/sim/atomic_actions/control.py
       - embodichain/lab/sim/atomic_actions/invocation.py
