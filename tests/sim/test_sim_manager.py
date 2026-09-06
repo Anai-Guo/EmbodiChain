@@ -1084,6 +1084,7 @@ def test_constructor_starts_visualization_after_default_scene(
     SimulationManager.__init__(
         sim,
         SimulationManagerCfg(
+            startup_summary="off",
             num_envs=3,
             headless=headless,
             enable_entity_gizmo=entity_gizmo,

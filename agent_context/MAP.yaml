@@ -22,6 +22,8 @@ topics:
       - simulation
       - SimulationManager
       - SimulationManagerCfg
+      - startup_summary
+      - dexsim_startup_info
       - PhysicsBackendCfg
       - DefaultPhysicsCfg
       - EntityGizmoManipulator
@@ -96,6 +98,7 @@ topics:
     source_of_truth:
       - embodichain/lab/sim/__init__.py
       - embodichain/lab/sim/sim_manager.py
+      - embodichain/lab/sim/_startup_summary.py
       - embodichain/lab/sim/_runtime_controls.py
       - embodichain/lab/sim/cfg/
       - embodichain/lab/sim/physics/
@@ -185,6 +188,7 @@ topics:
       - embodichain/__main__.py
       - embodichain/lab/gym/envs/base_env.py
       - embodichain/lab/gym/envs/types.py
+      - embodichain/lab/gym/envs/_startup_summary.py
       - embodichain/lab/gym/envs/demo.py
       - embodichain/lab/gym/envs/embodied_env.py
       - embodichain/lab/gym/envs/task_program/bridge.py

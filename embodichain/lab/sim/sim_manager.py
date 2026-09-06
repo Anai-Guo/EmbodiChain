@@ -39,6 +39,7 @@ from typing import (
     Dict,
     Iterator,
     List,
+    Literal,
     Mapping,
     Sequence,
     Union,
@@ -236,7 +237,11 @@ class SimulationManagerCfg:
         visualization: VisualizationCfg | None = None,
         window_record: WindowRecordCfg | None = None,
         window_camera_pose: WindowCameraPoseCfg | None = None,
+        startup_summary: Literal["compact", "full", "off"] = "compact",
+        dexsim_startup_info: bool = False,
     ) -> None:
+        self.startup_summary = startup_summary
+        self.dexsim_startup_info = dexsim_startup_info
         self.width = width
         self.height = height
         self.headless = headless
@@ -284,6 +289,16 @@ class SimulationManagerCfg:
 
     width: int = 1920
     """The width of the simulation window."""
+
+    startup_summary: Literal["compact", "full", "off"] = "compact"
+    """Startup table detail. ``off`` disables both simulation and Gym summaries."""
+
+    dexsim_startup_info: bool = False
+    """Show DexSim's native startup information in addition to our summary.
+
+    Warnings and errors remain visible regardless of this setting. Requires
+    a DexSim build exposing ``WorldConfig.log_startup_info``.
+    """
 
     height: int = 1080
     """The height of the simulation window."""
@@ -369,6 +384,8 @@ class SimulationManagerCfg:
 
     def __post_init__(self) -> None:
         """Validate physics and apply visualization-dependent defaults."""
+        if self.startup_summary not in ("compact", "full", "off"):
+            raise ValueError("startup_summary must be 'compact', 'full', or 'off'.")
         validate_physics_cfg(self.physics_cfg)
         if isinstance(self.robot_ik_gizmo, dict):
             self.robot_ik_gizmo = GizmoCfg(**self.robot_ik_gizmo)
@@ -477,6 +494,8 @@ class SimulationManager:
 
     Args:
         sim_config (SimulationManagerCfg, optional): simulation configuration. Defaults to SimulationManagerCfg().
+        defer_startup_summary: Let an owning environment emit one combined table
+            after task and manager initialization. Standalone callers keep False.
     """
 
     _instances = {}
@@ -490,7 +509,12 @@ class SimulationManager:
         "ContactSensor": ContactSensor,
     }
 
-    def __new__(cls, sim_config: SimulationManagerCfg = SimulationManagerCfg()):
+    def __new__(
+        cls,
+        sim_config: SimulationManagerCfg = SimulationManagerCfg(),
+        *,
+        defer_startup_summary: bool = False,
+    ):
         """Create or return the instance based on instance_id."""
         n_instance = len(list(cls._instances.keys()))
         instance = super(SimulationManager, cls).__new__(cls)
@@ -501,8 +525,21 @@ class SimulationManager:
         return instance
 
     def __init__(
-        self, sim_config: SimulationManagerCfg = SimulationManagerCfg()
+        self,
+        sim_config: SimulationManagerCfg = SimulationManagerCfg(),
+        *,
+        defer_startup_summary: bool = False,
     ) -> None:
+        self._defer_startup_summary = defer_startup_summary
+        self._startup_summary_logged = False
+        self._scene_summary_logged = False
+        self._requested_renderer = sim_config.render_cfg.renderer
+        solver_cfg = getattr(sim_config.physics_cfg, "solver_cfg", None)
+        self._requested_solver = str(
+            solver_cfg.get("solver_type", solver_cfg.get("class_type", "auto"))
+            if isinstance(solver_cfg, Mapping)
+            else getattr(solver_cfg, "solver_type", "auto")
+        )
         instance_id = SimulationManager.get_instance_num() - 1
 
         # Mark as initialized
@@ -533,11 +570,21 @@ class SimulationManager:
         self.physics = make_physics_backend(sim_config.physics_cfg, self)
 
         world_config = self._convert_sim_config(sim_config)
+        self._world_config = world_config
         self.profiler = Profiler(sim_config.profiler, self.device)
 
         # Initialize Warp before creating the world. For Newton, honor the
         # configured startup/kernel-log suppression from the very first init.
         _initialize_warp_runtime(sim_config.physics_cfg)
+        self._render_device_name: str | None = None
+        if sim_config.startup_summary != "off":
+            # Warp already enumerated these devices during initialization. Read
+            # its cached names instead of lazily initializing PyTorch CUDA just
+            # to print diagnostics for CPU-physics/explicit-renderer programs.
+            for render_device in wp.get_cuda_devices():
+                if render_device.ordinal == sim_config.gpu_id:
+                    self._render_device_name = render_device.name
+                    break
         self._world: dexsim.World = dexsim.World(world_config)
         # The caller owns physics time, including while the scene is assembled.
         self._world.set_manual_update(True)
@@ -609,6 +656,7 @@ class SimulationManager:
         )
         self._arenas = list(self._spawn_scene.builder.prepare_arenas())
         self._prepared_spawn_topology_revision = -1
+        self._ready_spawn_topology_revision = -1
         self._synced_spawn_render_topology_revision = -1
         self._camera_attachment_topology_revision = -1
 
@@ -646,6 +694,43 @@ class SimulationManager:
             self._enable_default_entity_gizmo()
 
         self._is_constructed = True
+        if not self._defer_startup_summary:
+            self._log_startup_summary()
+
+    def _log_startup_summary(self) -> None:
+        """Emit the engine snapshot once, after successful construction."""
+        if self.sim_config.startup_summary == "off" or self._startup_summary_logged:
+            return
+        from ._startup_summary import format_summary, simulation_rows
+
+        logger.log_info(
+            format_summary("Simulation initialized", simulation_rows(self)),
+            prefix=False,
+        )
+        self._startup_summary_logged = True
+
+    def _log_scene_summary(self) -> None:
+        """Emit the first usable scene snapshot, never a partial prepare."""
+        if (
+            not getattr(self, "_is_constructed", False)
+            or getattr(self, "_defer_startup_summary", True)
+            or getattr(self, "_scene_summary_logged", True)
+            or self.sim_config.startup_summary == "off"
+            or self.spawn_result is None
+        ):
+            return
+        from ._startup_summary import format_summary, scene_is_ready, scene_rows
+
+        if not scene_is_ready(self):
+            return
+        if (
+            self.physics.name == "newton"
+            and self.physics.cuda_graph_status == "pending"
+        ):
+            return
+
+        logger.log_info(format_summary("Scene ready", scene_rows(self)), prefix=False)
+        self._scene_summary_logged = True
 
     @classmethod
     def get_instance(cls, instance_id: int = 0) -> SimulationManager:
@@ -1017,6 +1102,7 @@ class SimulationManager:
         self, sim_config: SimulationManagerCfg
     ) -> dexsim.WorldConfig:
         world_config = dexsim.WorldConfig()
+        world_config.log_startup_info = sim_config.dexsim_startup_info
         win_config = dexsim.WindowsConfig()
         win_config.width = sim_config.width
         win_config.height = sim_config.height
@@ -1034,7 +1120,7 @@ class SimulationManager:
             )
 
             resolved_renderer = select_default_renderer(sim_config.gpu_id)
-            logger.log_info(
+            logger.log_debug(
                 f"Auto-selected '{resolved_renderer}' renderer for gpu_id={sim_config.gpu_id}."
             )
             sim_config.render_cfg.renderer = resolved_renderer
@@ -1449,6 +1535,7 @@ class SimulationManager:
 
     def prepare(self) -> None:
         """Materialize declarations, bind state, and restore camera parents."""
+        self._ready_spawn_topology_revision = -1
         scene = self._spawn_scene
         result = scene.builder.result
         if (
@@ -1479,6 +1566,7 @@ class SimulationManager:
         ):
             self._attach_parented_cameras()
             self._camera_attachment_topology_revision = topology_revision
+        self._ready_spawn_topology_revision = topology_revision
 
     def _prepare_spawn_runtime(self, result: Scene) -> None:
         """Prepare backend runtime buffers for one Spawn topology revision."""
@@ -1552,6 +1640,7 @@ class SimulationManager:
         """
 
         self._world.render_camera_group(group_ids)
+        self._log_scene_summary()
 
     def update(self, physics_dt: float | None = None, step: int = 10) -> None:
         """Advance physics explicitly and publish the resulting simulation state.
@@ -1595,6 +1684,9 @@ class SimulationManager:
                             self.capture_visualization_safely(
                                 capture_camera_images=i == step - 1
                             )
+
+            if step > 0:
+                self._log_scene_summary()
 
     def get_env(self, arena_index: int = -1) -> dexsim.environment.Arena:
         """Get the arena or env by index.
@@ -1751,6 +1843,7 @@ class SimulationManager:
         ):
             self.enable_window_camera_pose_hotkey(**self._window_camera_pose_hotkey_cfg)
         self.is_window_opened = True
+        self._log_scene_summary()
         return True
 
     def close_window(self) -> None:

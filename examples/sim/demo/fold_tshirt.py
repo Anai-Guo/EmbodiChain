@@ -321,7 +321,10 @@ def initialize_simulation(
     cfg = SimulationManagerCfg(
         width=1920,
         height=1080,
-        headless=args.headless,
+        # Defer native-window creation until the complete Spawn scene has been
+        # materialized below. ``main()`` opens it explicitly after ``prepare()``
+        # unless the caller requested ``--headless``.
+        headless=True,
         device=args.device,
         gpu_id=args.gpu_id,
         num_envs=args.num_envs,

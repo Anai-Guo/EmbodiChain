@@ -380,8 +380,8 @@ that do not export `AutoSolverCfg` and is therefore insufficient.
 Newton's `suppress_warp_kernel_logs=True` suppresses Warp's one-time runtime
 banner plus module compile/load chatter during manager startup, build, facade
 initialization, and physics updates, then restores the process-wide setting.
-It does not suppress DexSim native startup output or genuine Warp/Newton
-warnings and errors.
+It does not suppress genuine Warp/Newton warnings and errors. Native startup
+information is controlled separately by `dexsim_startup_info`.
 
 EmbodiChain-authored Newton collision shapes use a default margin and gap of
 `0.001 m` each only when no portable or Newton-native envelope is authored.
@@ -782,3 +782,41 @@ where `None` means “leave the source/backend value unchanged.”
 | Simulation advances at the wrong control rate | `physics_dt` and `sim_steps_per_control` were configured inconsistently; see `env-framework` |
 | A test leaks a DexSim world | `destroy(exit_process=False)` was called without flushing the cleanup queue |
 | Python exits during cleanup | `destroy()` used its process-exit default; pass `exit_process=False` for embedded or test lifecycles |
+
+## Startup summaries
+
+`SimulationManagerCfg.startup_summary` selects `compact` (default), `full`, or
+`off`. `dexsim_startup_info=False` is forwarded to DexSim's
+`WorldConfig.log_startup_info` before World construction; the matching DexSim
+build is required. This hides only native startup information, not warnings or
+errors. The switch is independent of Newton's Warp kernel-log suppression.
+
+`sim/_startup_summary.py` owns read-only row collection and PrettyTable output.
+A standalone manager emits its engine table after construction, then one scene
+snapshot after its first successful update, camera render, or native-window
+open with a prepared scene. When Newton CUDA Graph capture is pending, opening
+the native window or rendering cameras does not consume that snapshot; the
+first successful physics update emits it after capture resolves to `CAPTURED`
+or `DISABLED`. `prepare()` does not print, and neither snapshot steps or
+finalizes the scene. The readiness revision is invalidated at each `prepare()`
+entry and published only after every preparation stage succeeds; a finalized
+but unprepared or dirty scene cannot emit `READY`. An owning Gym environment
+passes `defer_startup_summary=True` and emits one combined table at its existing
+initialization-complete boundary. Reset/step do not repeat the tables.
+
+Render and compute devices, native-window state and browser visualization are
+separate fields. Closed windows do not imply disabled offscreen rendering.
+Environment collision isolation appears as `Physics / Collision policy`;
+the compact table does not include an `External collisions` row.
+The Default display is `Default` with `TGS` or `PGS`, read from the native
+`enable_tgs` setting. Newton displays requested versus resolved solver and
+reads `NewtonBackend.cuda_graph_status` through the physics adapter; pending
+capture is never labelled captured. Scene counts are per environment and
+exclude the separately identified global ground. Full mode adds rendering,
+backend and system diagnostics; compact mode omits thread and stepping rows.
+
+Device names reuse the metadata already enumerated by Warp startup and never
+initialize PyTorch CUDA for diagnostics.
+
+Summary colors are enabled only on terminals without `NO_COLOR`; the default
+console handler also strips ANSI escapes from redirected ordinary logs.

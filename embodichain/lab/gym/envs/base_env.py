@@ -30,6 +30,11 @@ from tensordict import TensorDict
 
 from embodichain.lab.sim.types import EnvObs, EnvAction
 from embodichain.lab.sim import SimulationManagerCfg, SimulationManager
+from embodichain.lab.sim._startup_summary import (
+    format_summary,
+    scene_rows,
+    simulation_rows,
+)
 from embodichain.lab.sim.objects import Robot
 from embodichain.lab.sim.sensors import BaseSensor, Camera
 from embodichain.lab.gym.utils import gym_utils
@@ -128,7 +133,6 @@ class BaseEnv(gym.Env):
     # EmbodiedEnv defers the summary until all managers and recording buffers
     # have been initialized.
     _defer_initialization_summary: bool = False
-    _initialization_summary_label_width: int = 22
 
     def __init__(
         self,
@@ -136,6 +140,7 @@ class BaseEnv(gym.Env):
         **kwargs,
     ):
         self.cfg = cfg
+        self._initialization_summary_logged = False
 
         # the number of envs to be simulated in parallel.
         self._num_envs = self.cfg.num_envs
@@ -226,11 +231,20 @@ class BaseEnv(gym.Env):
             self._log_initialization_summary()
 
     def _log_initialization_summary(self) -> None:
-        """Log the environment initialization summary without log prefixes."""
+        """Log the complete startup table once after the environment is ready."""
+        if self.sim_cfg.startup_summary == "off" or getattr(
+            self, "_initialization_summary_logged", False
+        ):
+            return
         logger.log_info("\n".join(self._initialization_summary_lines()), prefix=False)
+        self._initialization_summary_logged = True
+        self.sim._startup_summary_logged = True
+        self.sim._scene_summary_logged = True
 
     def _initialization_summary_lines(self) -> list[str]:
-        """Build a compact, structured summary of the initialized environment."""
+        """Combine the shared simulation snapshot with environment details."""
+        if self.sim_cfg.startup_summary == "off":
+            return []
         robot_description = type(self.robot).__name__
         robot_uid = getattr(self.robot, "uid", None)
         if robot_uid:
@@ -247,65 +261,47 @@ class BaseEnv(gym.Env):
             if self.cfg.max_episode_steps > 0
             else "unlimited"
         )
-
-        lines = [
-            f"╭─ Environment initialized: {type(self).__name__}",
-            "├─ Runtime",
-            self._format_initialization_summary_row("Config", type(self.cfg).__name__),
-            self._format_initialization_summary_row("Device", self.device),
-            self._format_initialization_summary_row(
-                "Parallel environments", self.num_envs
-            ),
-            self._format_initialization_summary_row(
-                "Seed", self.cfg.seed if self.cfg.seed is not None else "not set"
-            ),
-            self._format_initialization_summary_row(
-                "Headless", str(bool(self.sim_cfg.headless)).lower()
-            ),
-            self._format_initialization_summary_row("Robot", robot_description),
-            self._format_initialization_summary_row("Sensors", sensor_description),
-            "├─ Timing",
-            self._format_initialization_summary_row(
-                "Physics",
-                f"{self.physics_dt:g} s ({self.physics_frequency:g} Hz)",
-            ),
-            self._format_initialization_summary_row(
-                "Control",
-                f"{self.step_dt:g} s ({self.control_frequency:g} Hz, "
-                f"{self.cfg.sim_steps_per_control} physics steps)",
-            ),
-            self._format_initialization_summary_row("Episode limit", episode_limit),
-        ]
-
+        rows = simulation_rows(self.sim) + scene_rows(self.sim)
+        rows.extend(
+            [
+                ("Environment", "Config", type(self.cfg).__name__),
+                (
+                    "Environment",
+                    "Seed",
+                    str(self.cfg.seed) if self.cfg.seed is not None else "not set",
+                ),
+                ("Environment", "Robot", robot_description),
+                ("Environment", "Sensors", sensor_description),
+                (
+                    "Environment",
+                    "Control timestep",
+                    f"{self.step_dt:g} s ({self.control_frequency:g} Hz, "
+                    f"{self.cfg.sim_steps_per_control} physics steps)",
+                ),
+                ("Environment", "Episode limit", episode_limit),
+            ]
+        )
         summary_metadata = [
             (name, value)
             for name, value in self.metadata.items()
             if name != "render_fps"
         ]
-        if summary_metadata:
-            lines.append("├─ Metadata")
-            for name, value in sorted(summary_metadata, key=lambda item: str(item[0])):
-                lines.append(
-                    self._format_initialization_summary_row(
-                        str(name), self._format_initialization_metadata_value(value)
-                    )
+        for name, value in sorted(summary_metadata, key=lambda item: str(item[0])):
+            rows.append(
+                (
+                    "Metadata",
+                    str(name),
+                    self._format_initialization_metadata_value(value),
                 )
+            )
+        rows.extend(self._extra_initialization_summary_rows())
+        return format_summary(
+            f"Environment initialized: {type(self).__name__}", rows
+        ).splitlines()
 
-        lines.extend(self._extra_initialization_summary_lines())
-        lines.append("╰─ Ready")
-        return lines
-
-    def _extra_initialization_summary_lines(self) -> list[str]:
-        """Return subclass-specific initialization summary lines."""
+    def _extra_initialization_summary_rows(self) -> list[tuple[str, str, str]]:
+        """Return subclass-specific startup table rows."""
         return []
-
-    @classmethod
-    def _format_initialization_summary_row(
-        cls, label: str, value: object, indent: int = 0
-    ) -> str:
-        """Format an aligned key-value row inside the initialization tree."""
-        label_width = max(1, cls._initialization_summary_label_width - 2 * indent)
-        return f"│  {'  ' * indent}{label:<{label_width}} {value}"
 
     @staticmethod
     def _format_initialization_metadata_value(value: object) -> str:
@@ -515,7 +511,7 @@ class BaseEnv(gym.Env):
         # materialized, so construct the manager in headless mode first.
         headless = self.sim_cfg.headless
         self.sim_cfg.headless = True
-        self.sim = SimulationManager(self.sim_cfg)
+        self.sim = SimulationManager(self.sim_cfg, defer_startup_summary=True)
         self.sim_cfg.headless = headless
 
         logger.log_info(

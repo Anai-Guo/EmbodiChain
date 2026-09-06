@@ -58,6 +58,7 @@ from embodichain.lab.sim.objects import Robot
 from embodichain.lab.sim.sensors import BaseSensor, SensorCfg
 from embodichain.lab.sim.types import EnvObs, EnvAction
 from embodichain.lab.gym.envs import BaseEnv, EnvCfg
+from embodichain.lab.gym.envs._startup_summary import format_functor_summary
 from embodichain.lab.gym.envs.demo import (
     DEMO_SCHEMA_VERSION,
     DemoExecutionCfg,
@@ -300,8 +301,8 @@ class EmbodiedEnv(BaseEnv):
     _manager_summary_fields: tuple[tuple[str, str], ...] = (
         ("EventManager", "event_manager"),
         ("ObservationManager", "observation_manager"),
-        ("RewardManager", "reward_manager"),
         ("ActionManager", "action_manager"),
+        ("RewardManager", "reward_manager"),
         ("DatasetManager", "dataset_manager"),
     )
 
@@ -468,8 +469,27 @@ class EmbodiedEnv(BaseEnv):
 
         self._log_initialization_summary()
 
-    def _extra_initialization_summary_lines(self) -> list[str]:
-        """Build manager and functor details for the initialization summary."""
+    def _initialization_summary_lines(self) -> list[str]:
+        """Append a separate functor table after the environment summary."""
+        lines = super()._initialization_summary_lines()
+        if not lines:
+            return lines
+        managers = []
+        for name, attribute in self._manager_summary_fields:
+            manager = getattr(self, attribute, None)
+            if manager is not None:
+                managers.append(
+                    (name, manager, self._manager_functor_groups(name, manager))
+                )
+        details = format_functor_summary(
+            managers, full=self.sim_cfg.startup_summary == "full"
+        )
+        if details:
+            lines.extend(["", *details.splitlines()])
+        return lines
+
+    def _extra_initialization_summary_rows(self) -> list[tuple[str, str, str]]:
+        """Keep manager status and counts in the main initialization table."""
         manager_summaries: list[tuple[str, list[tuple[str, list[str]]] | None, int]] = (
             []
         )
@@ -489,30 +509,24 @@ class EmbodiedEnv(BaseEnv):
             total_functor_count += functor_count
 
         functor_noun = "functor" if total_functor_count == 1 else "functors"
-        lines = [
-            f"├─ Managers ({active_manager_count}/{len(manager_summaries)} active, "
-            f"{total_functor_count} {functor_noun})"
+        rows = [
+            (
+                "Managers",
+                "Total",
+                f"{active_manager_count}/{len(manager_summaries)} active, "
+                f"{total_functor_count} {functor_noun}",
+            )
         ]
         for manager_name, groups, functor_count in manager_summaries:
             if groups is None:
-                lines.append(
-                    self._format_initialization_summary_row(manager_name, "disabled")
-                )
+                rows.append(("Managers", manager_name, "disabled"))
                 continue
 
             manager_functor_noun = "functor" if functor_count == 1 else "functors"
-            lines.append(
-                self._format_initialization_summary_row(
-                    manager_name, f"{functor_count} {manager_functor_noun}"
-                )
+            rows.append(
+                ("Managers", manager_name, f"{functor_count} {manager_functor_noun}")
             )
-            for mode, names in groups:
-                lines.append(
-                    self._format_initialization_summary_row(
-                        mode, ", ".join(names), indent=1
-                    )
-                )
-        return lines
+        return rows
 
     @staticmethod
     def _manager_functor_groups(

@@ -568,6 +568,7 @@ def main():
     scoop = create_scoop(sim)
     heave_ice = create_heave_ice(sim)
     ice_cubes = create_ice_cubes(sim)
+    sim.prepare()
 
     if not args.headless:
         sim.open_window()

@@ -74,6 +74,15 @@ class NewtonPhysicsBackend(PhysicsBackend):
         return self._configured_solver_type
 
     # -- construction / world-config activation ------------------------- #
+
+    @property
+    def cuda_graph_status(self) -> str:
+        """Return the World-owned graph state without triggering capture."""
+        from dexsim.engine.newton_physics.backend_registry import get_newton_backend
+
+        backend = get_newton_backend(self._manager._world)
+        return backend.cuda_graph_status if backend is not None else "pending"
+
     def configure_world(self, world_config, sim_config: "SimulationManagerCfg") -> None:
         importlib.import_module("dexsim.engine.newton_physics")
 

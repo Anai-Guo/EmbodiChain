@@ -548,3 +548,27 @@ parent; the first `warmup_steps` samples are discarded.
 | Controller-ready action is transformed twice | Runtime output was passed as a raw tensor | Wrap it in `ControllerAction`; the environment skips only `pre` terms |
 | Controller action rejected before robot control | Batch, control key, dtype, or active/full joint width is invalid | Fix the producer at the controller boundary; do not bypass validation |
 | `Env X already registered` warning | Duplicate import or re-registration | Use `override=True` in tests/scripts |
+
+## Startup information table
+
+`BaseEnv._setup_scene()` constructs `SimulationManager` with
+`defer_startup_summary=True`, preserving the environment's requested headless
+state after temporary scene construction. `_log_initialization_summary()`
+uses the shared `sim/_startup_summary.py` simulation and scene rows, then adds
+seed, control timing, episode limit, robot identity, metadata and manager
+counts. `EmbodiedEnv` retains its later initialization-complete boundary so
+all managers are available. Each environment emits its startup tables once; its
+simulation-owned startup and scene snapshots are marked consumed.
+
+`SimulationManagerCfg.startup_summary` controls `compact`, `full`, and `off`.
+Both compact and full modes keep manager status/counts in the main table and
+append a separate **Functor Details** table, grouped by manager in configured
+execution order. `gym/envs/_startup_summary.py` reads the initialized managers'
+public getters to display each functor's name, actual callable, mode, and
+applicable interval/output key/action dimension/reward weight/dataset saving
+policy. Full mode additionally shows qualified callable paths and parameters;
+large containers, tensors and arbitrary objects receive bounded descriptions
+without evaluating functors or transferring tensor data. Empty managers remain
+in the main table; no detail table is emitted when there are no active functors.
+Off disables both tables; terminal colors honor `NO_COLOR` and non-TTY output. Gym JSON/YAML accepts top-level `startup_summary` and
+`dexsim_startup_info` and forwards them through `config_to_cfg()`.

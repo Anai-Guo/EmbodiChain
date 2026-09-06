@@ -401,7 +401,9 @@ def main() -> None:
         num_envs=args.num_envs,
         arena_space=args.arena_space,
         gpu_id=args.gpu_id,
-        headless=args.headless,
+        # Create the native window only after the complete Spawn scene has
+        # been prepared below.
+        headless=True,
         physics_dt=1.0 / 100.0,  # Physics timestep (100 Hz)
         device=args.device,
         render_cfg=RenderCfg(

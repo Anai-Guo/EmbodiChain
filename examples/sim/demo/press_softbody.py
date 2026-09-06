@@ -74,7 +74,9 @@ def initialize_simulation(args: argparse.Namespace) -> SimulationManager:
     config = SimulationManagerCfg(
         width=1920,
         height=1080,
-        headless=args.headless,
+        # Create the native window only after ``main()`` has prepared the
+        # complete Spawn scene.
+        headless=True,
         device=args.device,
         gpu_id=args.gpu_id,
         num_envs=args.num_envs,

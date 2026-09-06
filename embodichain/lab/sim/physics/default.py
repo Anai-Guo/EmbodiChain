@@ -36,6 +36,11 @@ class DefaultPhysicsBackend(PhysicsBackend):
 
     name = "default"
 
+    @property
+    def solver_type(self) -> str:
+        """Return the native PhysX constraint solver selected for the scene."""
+        return "TGS" if dexsim.get_physics_config().enable_tgs else "PGS"
+
     # -- construction / world-config activation ------------------------- #
     def configure_world(self, world_config, sim_config: "SimulationManagerCfg") -> None:
         cfg = sim_config.physics_cfg

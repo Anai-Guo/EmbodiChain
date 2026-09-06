@@ -652,6 +652,8 @@ def config_to_cfg(
         viser_server = ViserServerCfg(**viser_server_config)
 
     env_cfg.sim_cfg = SimulationManagerCfg(
+        startup_summary=config.get("startup_summary", "compact"),
+        dexsim_startup_info=config.get("dexsim_startup_info", False),
         headless=config.get("headless", False),
         enable_entity_gizmo=config.get("enable_entity_gizmo", True),
         robot_ik_gizmo=config.get("robot_ik_gizmo", {}),
