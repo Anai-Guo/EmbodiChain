@@ -270,7 +270,8 @@ def _make_sim_manager(
     sim._window_camera_pose_input_control = None
     sim._env = FakeEnv()
     sim._world = FakeWorld()
-    sim._default_plane = object()
+    sim._native_default_plane = object()
+    sim._default_plane = SimpleNamespace(native=lambda: sim._native_default_plane)
     sim._visualization_runtime = None
     sim.is_window_opened = window is not None
     return sim
@@ -882,7 +883,7 @@ def test_entity_gizmo_delegates_to_dexsim_and_excludes_default_plane() -> None:
         (
             SimulationManager._DEFAULT_PLANE_GIZMO_TARGET_ID,
             dexsim.interaction.EntityGizmoTargetType.RIGID_BODY,
-            sim._default_plane,
+            sim._native_default_plane,
             dexsim.types.ActorType.STATIC,
         )
     ]
@@ -896,7 +897,10 @@ def test_open_window_enables_entity_gizmo_by_default() -> None:
     assert sim.is_window_opened is True
     assert sim._world.window_open_count == 1
     assert sim._world.entity_gizmo_configs == [None]
-    assert sim._world.get_entity_gizmo().external_targets[0][2] is sim._default_plane
+    assert (
+        sim._world.get_entity_gizmo().external_targets[0][2]
+        is sim._native_default_plane
+    )
 
 
 def test_entity_gizmo_can_be_disabled_in_startup_configuration() -> None:

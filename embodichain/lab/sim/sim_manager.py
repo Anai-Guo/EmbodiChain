@@ -2992,7 +2992,7 @@ class SimulationManager:
         result = controller.register_external_target(
             self._DEFAULT_PLANE_GIZMO_TARGET_ID,
             dexsim.interaction.EntityGizmoTargetType.RIGID_BODY,
-            default_plane,
+            default_plane.native(),
             ActorType.STATIC,
         )
         if result != dexsim.interaction.EntityGizmoResult.SUCCESS:
