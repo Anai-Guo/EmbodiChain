@@ -49,6 +49,7 @@ from embodichain.lab.sim.motion.expansion import (
     ValidationCheck,
     ValidationResult,
 )
+from embodichain.lab.visualization import VisualizationCfg
 from embodichain.lab.trajectory_generation.execution import QposRolloutExecutor
 from embodichain.lab.trajectory_generation.initial_state import (
     FixedSceneHost,
@@ -140,6 +141,7 @@ def run_cube_pickup_collection(
             physics_dt=_PHYSICS_DT,
             arena_space=4.0,
             gpu_id=cuda_device,
+            visualization=VisualizationCfg(),
         )
     )
     generator = host = sink = writer = None

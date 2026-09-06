@@ -69,6 +69,7 @@ from embodichain.lab.sim.motion.expansion import (
 from embodichain.lab.sim.objects import RigidObjectCfg
 from embodichain.lab.sim.sensors import CameraCfg
 from embodichain.lab.sim.shapes import CubeCfg
+from embodichain.lab.visualization import VisualizationCfg
 from embodichain.utils.math import look_at_to_pose
 from scripts.tutorials.atomic_action.tutorial_utils import (
     create_antipodal_semantics,
@@ -321,6 +322,7 @@ def run_cube_grasp_parallel(
             physics_dt=_PHYSICS_DT,
             arena_space=4.0,
             gpu_id=cuda_device,
+            visualization=VisualizationCfg(),
         )
     )
     generator = writer = None

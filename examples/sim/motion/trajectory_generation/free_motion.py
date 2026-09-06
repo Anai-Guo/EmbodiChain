@@ -67,6 +67,7 @@ from embodichain.lab.sim.objects import RigidObjectCfg
 from embodichain.lab.sim.robots import FrankaPandaCfg, URRobotCfg
 from embodichain.lab.sim.shapes import CubeCfg
 from embodichain.lab.sim.sensors import CameraCfg
+from embodichain.lab.visualization import VisualizationCfg
 from embodichain.lab.trajectory_generation.execution import QposRolloutExecutor
 from embodichain.lab.trajectory_generation.initial_state import (
     FixedSceneHost,
@@ -128,6 +129,7 @@ def run_free_motion(
             num_envs=1,
             physics_dt=physics_dt,
             gpu_id=cuda_device,
+            visualization=VisualizationCfg(),
         )
     )
     host = sink = generator = video_writer = None
