@@ -198,6 +198,7 @@ def _run_workflow(
             "final_bundle": (
                 None if result.final_bundle is None else result.final_bundle.as_posix()
             ),
+            "video_paths": _report_saved_videos(result.output_dir) if execute else [],
         }
     )
     accepted = result.succeeded if execute else result.status == "prepared"
@@ -234,9 +235,34 @@ def _run_prepared_bundle(args: argparse.Namespace) -> int:
             "status": "succeeded" if accepted else "failed",
             "output_dir": allocation.path.as_posix(),
             "execution_report": report,
+            "video_paths": _report_saved_videos(allocation.path),
         }
     )
     return 0 if accepted else 2
+
+
+def _report_saved_videos(output_dir: Path) -> list[str]:
+    """List recordings only after the current run has finished publishing."""
+    try:
+        paths = sorted(
+            {
+                path.resolve().as_posix()
+                for pattern in (
+                    "videos/*.mp4",
+                    "attempts/scene_*/action_attempts/action_*/videos/*.mp4",
+                )
+                for path in output_dir.glob(pattern)
+                if path.is_file()
+            }
+        )
+    except OSError as exc:
+        print(f"[Task Engine] Unable to list saved videos: {exc}", file=sys.stderr)
+        return []
+    for path in paths:
+        print(f"[Task Engine] Video saved: {path}", file=sys.stderr)
+    if not paths:
+        print("[Task Engine] No video files generated for this run.", file=sys.stderr)
+    return paths
 
 
 def _instruction(args: argparse.Namespace) -> str:

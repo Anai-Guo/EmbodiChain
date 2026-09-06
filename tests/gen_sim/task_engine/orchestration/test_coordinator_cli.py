@@ -938,6 +938,7 @@ def test_run_all_cli_forwards_open_window(
 def test_prepare_cli_stops_before_simulator_execution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     captured = {}
 
@@ -978,11 +979,92 @@ def test_prepare_cli_stops_before_simulator_execution(
 
     assert result == 0
     assert captured["execute"] is False
+    output = capsys.readouterr()
+    assert json.loads(output.out)["video_paths"] == []
+    assert output.err == ""
 
 
+@pytest.mark.parametrize("succeeded", [True, False])
+def test_run_all_cli_reports_published_videos_for_every_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    succeeded: bool,
+) -> None:
+    history = tmp_path / "history"
+    prior_video = history / "old_run" / "videos" / "previous.mp4"
+    prior_video.parent.mkdir(parents=True)
+    prior_video.write_bytes(b"previous video")
+    relative_paths = [
+        Path("attempts/scene_0001/action_attempts/action_0001/videos/episode_0.mp4"),
+        Path("attempts/scene_0001/action_attempts/action_0002/videos/episode_0.mp4"),
+        Path("attempts/scene_0002/action_attempts/action_0001/videos/episode_0.mp4"),
+    ]
+
+    class FakeWorkflow:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def run(self, request, **_kwargs):
+            with ArtifactTransaction(request["output_dir"]) as transaction:
+                staging = transaction.staging_dir
+                assert staging is not None
+                for relative_path in reversed(relative_paths):
+                    video = staging / relative_path
+                    video.parent.mkdir(parents=True)
+                    video.write_bytes(b"video")
+                (staging / "videos" / "directory.mp4").mkdir(parents=True)
+                (staging / "not_a_recording.mp4").write_bytes(b"unrelated asset")
+                published = transaction.commit()
+            assert not staging.exists()
+            return SimpleNamespace(
+                status="succeeded" if succeeded else "failed",
+                succeeded=succeeded,
+                failure_class=None if succeeded else "action_execution",
+                output_dir=published,
+                manifest_path=published / "run_manifest.json",
+                final_bundle=published / "final" / "bundle" if succeeded else None,
+            )
+
+    monkeypatch.setattr(cli, "SceneAdapter", lambda **_kwargs: object())
+    monkeypatch.setattr(cli, "TaskEngineWorkflow", FakeWorkflow)
+    result = cli.main(
+        [
+            "run-all",
+            "--mode",
+            "image",
+            "--task-id",
+            "task",
+            "--instruction",
+            "place the cup",
+            "--image",
+            str(tmp_path / "input.png"),
+            "--output-root",
+            str(history),
+        ]
+    )
+
+    assert result == (0 if succeeded else 2)
+    output = capsys.readouterr()
+    payload = json.loads(output.out)
+    expected = [
+        (Path(payload["output_dir"]) / relative_path).as_posix()
+        for relative_path in relative_paths
+    ]
+    assert payload["video_paths"] == expected
+    assert all(Path(path).is_absolute() and Path(path).is_file() for path in expected)
+    assert output.err.splitlines() == [
+        f"[Task Engine] Video saved: {path}" for path in expected
+    ]
+    assert ".staging-" not in output.out + output.err
+
+
+@pytest.mark.parametrize("has_video", [True, False])
 def test_run_cli_executes_an_existing_bundle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    has_video: bool,
 ) -> None:
     bundle = tmp_path / "bundle"
     bundle.mkdir()
@@ -990,6 +1072,10 @@ def test_run_cli_executes_an_existing_bundle(
     class Executor:
         def __call__(self, _bundle, output, **kwargs):
             Path(output).mkdir()
+            if has_video:
+                videos = Path(output) / "videos"
+                videos.mkdir()
+                (videos / "episode_0.mp4").write_bytes(b"video")
             assert kwargs["num_envs"] == 2
             assert kwargs["failure_policy"] == "continue"
             assert kwargs["open_window"] is True
@@ -1019,3 +1105,29 @@ def test_run_cli_executes_an_existing_bundle(
     )
 
     assert result == 0
+    output = capsys.readouterr()
+    payload = json.loads(output.out)
+    if has_video:
+        expected = (Path(payload["output_dir"]) / "videos" / "episode_0.mp4").as_posix()
+        assert payload["video_paths"] == [expected]
+        assert output.err == f"[Task Engine] Video saved: {expected}\n"
+    else:
+        assert payload["video_paths"] == []
+        assert output.err == "[Task Engine] No video files generated for this run.\n"
+
+
+def test_video_listing_error_is_diagnostic_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def denied_glob(self, pattern):
+        raise PermissionError("recordings are unreadable")
+
+    monkeypatch.setattr(Path, "glob", denied_glob)
+    assert cli._report_saved_videos(tmp_path) == []
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err == (
+        "[Task Engine] Unable to list saved videos: recordings are unreadable\n"
+    )
