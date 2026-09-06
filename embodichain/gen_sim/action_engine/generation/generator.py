@@ -41,6 +41,7 @@ from .artifacts import artifact_paths, write_generation_artifacts
 from .assets import normalize_scene_assets
 from .config_builder import (
     VLM_CAMERA_UIDS,
+    _apply_open_door_solver_budget,
     build_agent_config,
     build_fast_gym_config,
     canonical_robot_profile,
@@ -289,6 +290,9 @@ def generate_action_engine_config(
         gym_config["env"]["dataset"]["lerobot"]["params"]["save_path"] = (
             output_root / ".ab_datasets"
         ).as_posix()
+    _apply_open_door_solver_budget(
+        gym_config, execution_program, gripper_model=gripper_model
+    )
     _validate_agent_config(agent_config)
     return write_generation_artifacts(
         output_dir,

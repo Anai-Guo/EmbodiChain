@@ -308,13 +308,32 @@ def cli() -> int | None:
         # the final episode as well; otherwise only episodes followed by a next
         # iteration reach the configured dataset recorder.
         env.reset(options={"final": True})
-        archived_video = _archive_task_recording(
-            env,
-            str(args.task_name),
-            previous_sources=previous_video_sources,
-        )
-        if archived_video is not None:
-            log_info(f"Archived task video: {archived_video}", color="green")
+        if (
+            task_engine_reports
+            and any_failed
+            and all(
+                report.status == "failed"
+                and report.action_count == 0
+                and report.environments
+                and all(
+                    environment.get("success") is False
+                    for environment in report.environments
+                )
+                for report in task_engine_reports
+            )
+        ):
+            log_warning(
+                "No commands executed in this failed run; no new video to archive. "
+                "Preserving the execution failure report."
+            )
+        else:
+            archived_video = _archive_task_recording(
+                env,
+                str(args.task_name),
+                previous_sources=previous_video_sources,
+            )
+            if archived_video is not None:
+                log_info(f"Archived task video: {archived_video}", color="green")
     except KeyboardInterrupt:
         log_warning("Action Engine run interrupted by user.")
         return 130 if args.task_engine_report else None

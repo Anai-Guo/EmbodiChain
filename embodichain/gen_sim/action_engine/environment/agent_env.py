@@ -54,6 +54,9 @@ from embodichain.gen_sim.action_engine.runtime.solver_compat import (
 from embodichain.gen_sim.action_engine.runtime.motion_policy import (
     resolve_motion_policy,
 )
+from embodichain.gen_sim.action_engine.runtime.interaction_physics import (
+    _restore_gravity_contract,
+)
 from embodichain.lab.gym.envs import EmbodiedEnv, EmbodiedEnvCfg
 from embodichain.lab.gym.utils.registration import register_env
 
@@ -148,15 +151,23 @@ class ActionEngineEnv(EmbodiedEnv):
         """Reapply configured initial qpos after reset-event physics updates."""
         list_articulations = getattr(self.sim, "get_articulation_uid_list", None)
         get_articulation = getattr(self.sim, "get_articulation", None)
+        self._generated_usd_reset_gravity: dict[str, dict[str, Any]] = {}
         if not callable(list_articulations) or not callable(get_articulation):
             return
+        articulations = []
         for uid in list_articulations():
             articulation = get_articulation(str(uid))
             if articulation is None:
                 continue
             source = str(getattr(getattr(articulation, "cfg", None), "fpath", ""))
             if source.lower().endswith((".usd", ".usda", ".usdc")):
-                articulation.reset(env_ids=env_ids)
+                evidence = _restore_gravity_contract(articulation, env_ids=env_ids)
+                if evidence is not None:
+                    self._generated_usd_reset_gravity[str(uid)] = evidence
+                articulations.append(articulation)
+        # Each native reset advances physics for the whole scene.
+        for articulation in articulations:
+            articulation.reset(env_ids=env_ids)
 
     def _capture_runtime_state(self) -> None:
         """Capture reset-relative robot and object state used by symbolic bindings."""

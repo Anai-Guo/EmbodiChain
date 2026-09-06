@@ -71,6 +71,8 @@ class _InteractionGraspSelectionContext:
     roll_degrees: tuple[float, ...]
     support_surface_z: torch.Tensor | None
     minimum_support_clearance: float
+    pair_depth_variants: bool
+    prefer_unmodified_roll: bool
 
 
 class _TracingAntipodalGraspPoseGenerator(AntipodalGraspPoseGenerator):
@@ -98,6 +100,7 @@ class _TracingAntipodalGraspPoseGenerator(AntipodalGraspPoseGenerator):
         self._last_dual_trace: dict[str, Any] | None = None
         self._last_upright_trace: dict[str, Any] | None = None
         self._last_interaction_trace: dict[str, Any] | None = None
+        self._interaction_contact_offset: torch.Tensor | None = None
         self._selection_context: _DualGraspSelectionContext | None = None
         self._upright_selection_context: _UprightGraspSelectionContext | None = None
         self._interaction_selection_context: (
@@ -113,6 +116,12 @@ class _TracingAntipodalGraspPoseGenerator(AntipodalGraspPoseGenerator):
     def last_upright_trace(self) -> dict[str, Any] | None:
         """Return an owned snapshot of the most recent upright-grasp trace."""
         return deepcopy(self._last_upright_trace)
+
+    @property
+    def interaction_contact_offset(self) -> torch.Tensor | None:
+        """Own the current selected TCP-to-sampler-contact vectors, in TCP frame."""
+        value = self._interaction_contact_offset
+        return None if value is None else value.detach().clone()
 
     @property
     def last_interaction_trace(self) -> dict[str, Any] | None:
@@ -150,12 +159,18 @@ class _TracingAntipodalGraspPoseGenerator(AntipodalGraspPoseGenerator):
         roll_degrees: Any = (0.0,),
         support_surface_z: Any = None,
         minimum_support_clearance: float = 0.0,
+        pair_depth_variants: bool = False,
+        prefer_unmodified_roll: bool = False,
     ) -> Iterator[None]:
         """Select one kinematically distinct single-arm grasp candidate."""
         if self._interaction_selection_context is not None:
             raise RuntimeError("Interaction grasp selection context cannot be nested.")
         if type(candidate_rank) is not int or candidate_rank < 0:
             raise ValueError("Interaction grasp candidate_rank must be non-negative.")
+        if type(pair_depth_variants) is not bool:
+            raise TypeError("pair_depth_variants must be boolean.")
+        if type(prefer_unmodified_roll) is not bool:
+            raise TypeError("prefer_unmodified_roll must be boolean.")
         reference = torch.as_tensor(reference_xpos, dtype=torch.float32)
         if reference.ndim == 2:
             reference = reference.unsqueeze(0)
@@ -199,25 +214,61 @@ class _TracingAntipodalGraspPoseGenerator(AntipodalGraspPoseGenerator):
             roll_degrees=tuple(normalized_roll),
             support_surface_z=None if support is None else support.clone(),
             minimum_support_clearance=float(minimum_support_clearance),
+            pair_depth_variants=pair_depth_variants,
+            prefer_unmodified_roll=prefer_unmodified_roll,
         )
         try:
             yield
         finally:
             self._interaction_selection_context = None
+            self._interaction_contact_offset = None
 
     def get_best_grasp_poses(
         self,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Select a ranked interaction candidate when a context is installed."""
+        self._interaction_contact_offset = None
         context = self._interaction_selection_context
         if context is None:
             return super().get_best_grasp_poses(**kwargs)
+        self._last_interaction_trace = None
+        object_poses = self._object_poses(
+            kwargs.get("obj_poses"), device=context.reference_xpos.device
+        )
+        batch_size = object_poses.shape[0]
+        approach_world = self._approach_directions(
+            kwargs.get("approach_direction"),
+            batch_size=batch_size,
+            device=object_poses.device,
+        )
+        # Preserve the primitive's approach axis independently of grasp roll.
+        approach_local = self._approach_directions(
+            torch.matmul(
+                object_poses[:, :3, :3].transpose(1, 2),
+                approach_world.unsqueeze(-1),
+            ).squeeze(-1),
+            batch_size=batch_size,
+            device=object_poses.device,
+        )
         rows = self.get_valid_grasp_poses(**kwargs)
+        if len(rows) != batch_size:
+            raise ValueError("Interaction candidate batch must match obj_poses batch.")
         successes: list[bool] = []
         selected: list[torch.Tensor] = []
         trace_rows: list[dict[str, Any]] = []
+        contact_offsets: list[tuple[float, float, float]] = []
         for row_index, (poses, costs) in enumerate(rows):
+            approach_trace = {
+                "approach_direction_world": approach_world[row_index]
+                .detach()
+                .cpu()
+                .tolist(),
+                "approach_direction_local": approach_local[row_index]
+                .detach()
+                .cpu()
+                .tolist(),
+            }
             poses = torch.as_tensor(poses, dtype=torch.float32)
             costs = torch.as_tensor(costs, dtype=torch.float32, device=poses.device)
             if poses.ndim == 2:
@@ -251,6 +302,7 @@ class _TracingAntipodalGraspPoseGenerator(AntipodalGraspPoseGenerator):
                 )
             )
             support_rejection_count = 0
+            minimum_clearance = context.minimum_support_clearance
             expanded_by_base: list[
                 list[
                     tuple[
@@ -317,7 +369,7 @@ class _TracingAntipodalGraspPoseGenerator(AntipodalGraspPoseGenerator):
                         )
                         if (
                             support_clearance is not None
-                            and support_clearance < context.minimum_support_clearance
+                            and support_clearance < minimum_clearance
                         ):
                             support_rejection_count += 1
                             continue
@@ -340,6 +392,7 @@ class _TracingAntipodalGraspPoseGenerator(AntipodalGraspPoseGenerator):
                 )
                 variants.sort(
                     key=lambda item: (
+                        int(item[2] != 0.0) if context.prefer_unmodified_roll else 0,
                         item[-1],
                         abs(item[2]),
                         abs(item[3] - preferred_depth),
@@ -350,7 +403,31 @@ class _TracingAntipodalGraspPoseGenerator(AntipodalGraspPoseGenerator):
             expanded: list[
                 tuple[int, int, float, float, torch.Tensor, float | None, float]
             ] = []
-            if expanded_by_base:
+            if expanded_by_base and context.pair_depth_variants:
+                remaining = []
+                for variants in expanded_by_base:
+                    preferred = variants[0]
+                    paired = next(
+                        (
+                            index
+                            for index, variant in enumerate(variants[1:], 1)
+                            if variant[2] == preferred[2] and variant[3] != preferred[3]
+                        ),
+                        None,
+                    )
+                    leading = {0, paired}
+                    expanded.extend(
+                        variant
+                        for index, variant in enumerate(variants)
+                        if index in leading
+                    )
+                    remaining.extend(
+                        variant
+                        for index, variant in enumerate(variants)
+                        if index not in leading
+                    )
+                expanded.extend(remaining)
+            elif expanded_by_base:
                 anchor = expanded_by_base[0]
                 secondary = expanded_by_base[1:]
                 anchor_count = min(_INTERACTION_ANCHOR_ROLL_COUNT, len(anchor))
@@ -361,13 +438,17 @@ class _TracingAntipodalGraspPoseGenerator(AntipodalGraspPoseGenerator):
                     expanded.extend(variants[1:])
             if context.candidate_rank >= len(expanded):
                 successes.append(False)
+                contact_offsets.append((0.0, 0.0, 0.0))
                 selected.append(torch.eye(4, dtype=poses.dtype, device=poses.device))
                 trace_rows.append(
                     {
+                        **approach_trace,
                         "requested_candidate_rank": context.candidate_rank,
                         "candidate_count": len(expanded),
+                        "pair_depth_variants": context.pair_depth_variants,
                         "raw_candidate_count": int(raw_ranked.numel()),
                         "support_rejection_count": support_rejection_count,
+                        "minimum_support_clearance": minimum_clearance,
                         "selected": False,
                         "reason": "requested_candidate_rank_unavailable",
                     }
@@ -383,11 +464,14 @@ class _TracingAntipodalGraspPoseGenerator(AntipodalGraspPoseGenerator):
                 rotation_distance,
             ) = expanded[context.candidate_rank]
             successes.append(True)
+            contact_offsets.append((0.0, 0.0, depth_offset))
             selected.append(candidate)
             trace_rows.append(
                 {
+                    **approach_trace,
                     "requested_candidate_rank": context.candidate_rank,
                     "candidate_count": len(expanded),
+                    "pair_depth_variants": context.pair_depth_variants,
                     "raw_candidate_count": int(raw_ranked.numel()),
                     "support_rejection_count": support_rejection_count,
                     "selected": True,
@@ -401,15 +485,16 @@ class _TracingAntipodalGraspPoseGenerator(AntipodalGraspPoseGenerator):
                     "support_surface_z": support_z,
                     "support_clearance": support_clearance,
                     "minimum_support_clearance": (
-                        context.minimum_support_clearance
-                        if support_z is not None
-                        else None
+                        minimum_clearance if support_z is not None else None
                     ),
                     "reference_rotation_distance": rotation_distance,
                 }
             )
         self._last_interaction_trace = {"environment_rows": trace_rows}
         device = selected[0].device
+        self._interaction_contact_offset = torch.tensor(
+            contact_offsets, dtype=selected[0].dtype, device=device
+        )
         return (
             torch.tensor(successes, dtype=torch.bool, device=device),
             torch.stack(selected),

@@ -20,6 +20,7 @@ import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -216,6 +217,191 @@ def test_cli_archives_task_video_after_final_reset_and_before_close(
 
     assert run_agent_module.cli() is None
     assert events == ["final_reset", "archive:task2_1", "close"]
+
+
+@pytest.mark.parametrize(
+    ("episodes", "skip_archive"),
+    [
+        ([([False], 0)], True),
+        ([([False], 0), ([False], 0)], True),
+        ([([True], 0)], False),
+        ([([False], 3)], False),
+        ([([True], 3), ([False], 0)], False),
+        ([([False], 0), ([True], 3)], False),
+        ([([False], 0), ([True], 0)], False),
+        ([([True], 0), ([False], 0)], False),
+        ([([False, True], 0)], False),
+    ],
+    ids=[
+        "zero-command-failure",
+        "all-episodes-zero-command-failures",
+        "zero-command-success-still-needs-fresh-video",
+        "executed-failure-still-needs-fresh-video",
+        "earlier-executed-episode-prevents-skip",
+        "later-executed-episode-prevents-skip",
+        "later-zero-command-success-prevents-skip",
+        "earlier-zero-command-success-prevents-skip",
+        "failed-report-with-successful-environment-prevents-skip",
+    ],
+)
+def test_cli_preserves_zero_command_failure_without_reusing_stale_video(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    episodes: list[tuple[list[bool], int]],
+    skip_archive: bool,
+) -> None:
+    from embodichain.gen_sim.action_engine.agent import ActionAgent
+
+    events = []
+    reports = [
+        ExecutionReport(
+            task_id="task",
+            plan_hash="0" * 64,
+            action_graph_hash="1" * 64,
+            status="succeeded" if all(successes) else "failed",
+            run_id="run",
+            episode_id=str(index),
+            provenance=build_execution_provenance(),
+            action_count=count,
+            environments=tuple(
+                {
+                    "env_id": str(env_id),
+                    "success": success,
+                    "semantic_success": {"open_door": success},
+                    "action_count": count,
+                    "retry_count": 0,
+                    "recovery_count": 0,
+                    "revision_count": 0,
+                    "failures": [] if success else [{"type": "planning_failed"}],
+                }
+                for env_id, success in enumerate(successes)
+            ),
+            failure_events=(
+                ()
+                if all(successes)
+                else (
+                    {
+                        "type": "planning_failed",
+                        "edge_id": "open_door",
+                        "error": "OpenDoor precontact rejected before execution",
+                    },
+                )
+            ),
+        )
+        for index, (successes, count) in enumerate(episodes)
+    ]
+    results = iter(
+        SimpleNamespace(
+            already_executed=True,
+            runtime_success=successes,
+            runtime_graph_output_dir=None,
+            report=report,
+        )
+        for (successes, _), report in zip(episodes, reports)
+    )
+
+    class Env:
+        num_envs = len(episodes[0][0])
+
+        def reset(self, *, seed=None, options=None) -> None:
+            if options == {"final": True}:
+                events.append("final_reset")
+
+        def get_wrapper_attr(self, name):
+            assert name == "create_demo_action_list"
+            return lambda **_kwargs: next(results)
+
+        def close(self) -> None:
+            events.append("close")
+
+    env = Env()
+    monkeypatch.setattr(
+        run_agent_module,
+        "build_env_cfg_from_args",
+        lambda _args: (
+            SimpleNamespace(seed=None),
+            {"id": "ActionEngine-v1", "max_episodes": len(episodes)},
+            None,
+        ),
+    )
+    monkeypatch.setattr(run_agent_module, "load_config", lambda _path: {})
+    monkeypatch.setattr(run_agent_module, "_validate_gym_id", lambda _cfg: None)
+    monkeypatch.setattr(run_agent_module, "_validate_run_contract", lambda *_args: None)
+    monkeypatch.setattr(
+        run_agent_module,
+        "load_agent_execution_program",
+        lambda *_args, **_kwargs: SimpleNamespace(seed_graph={}),
+    )
+    monkeypatch.setattr(run_agent_module, "_load_grounded_task_plan", lambda _path: {})
+    monkeypatch.setattr(run_agent_module.gymnasium, "make", lambda **_kwargs: env)
+    monkeypatch.setattr(
+        ActionAgent,
+        "report_execution_result",
+        lambda _self, result, **_kwargs: result.report,
+    )
+    abortion_report = Mock(
+        return_value=ExecutionReport(
+            task_id="task",
+            plan_hash="0" * 64,
+            action_graph_hash="1" * 64,
+            status="aborted",
+            run_id="run",
+            episode_id="0",
+            provenance=build_execution_provenance(),
+            error="No fresh task recording",
+        )
+    )
+    monkeypatch.setattr(ActionAgent, "abortion_report", abortion_report)
+    sources = {"old_video": "unchanged"}
+    monkeypatch.setattr(
+        run_agent_module, "_snapshot_task_recording", lambda _env: sources
+    )
+
+    def archive(completed_env, task_id, *, previous_sources=None):
+        assert completed_env is env
+        assert task_id == "task"
+        assert previous_sources is sources
+        assert events == ["final_reset"]
+        events.append("archive")
+        raise RuntimeError("No fresh task recording")
+
+    archive_mock = Mock(side_effect=archive)
+    monkeypatch.setattr(run_agent_module, "_archive_task_recording", archive_mock)
+    warnings = []
+    monkeypatch.setattr(run_agent_module, "log_warning", warnings.append)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_agent",
+            "--task_name",
+            "task",
+            "--gym_config",
+            str(tmp_path / "gym.json"),
+            "--agent_config",
+            str(tmp_path / "agent.json"),
+            "--task-engine-report",
+        ],
+    )
+
+    exit_code = run_agent_module.cli()
+    payload = json.loads((tmp_path / "execution_report.json").read_text())
+
+    if skip_archive:
+        assert exit_code == 1
+        archive_mock.assert_not_called()
+        abortion_report.assert_not_called()
+        assert events == ["final_reset", "close"]
+        assert payload == reports[-1].as_mapping()
+        assert any("no commands" in warning.lower() for warning in warnings)
+        assert any("no new video" in warning.lower() for warning in warnings)
+    else:
+        assert exit_code == 3
+        archive_mock.assert_called_once()
+        abortion_report.assert_called_once()
+        assert events == ["final_reset", "archive", "close"]
+        assert payload["status"] == "aborted"
+        assert payload["error"] == "No fresh task recording"
 
 
 def _worker_config(route: str) -> _ABWorkerConfig:

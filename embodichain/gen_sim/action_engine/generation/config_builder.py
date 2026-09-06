@@ -562,6 +562,35 @@ def validate_fast_gym_config(config: dict[str, Any]) -> None:
         raise ValueError("Every rigid object must have one live-pose registry entry.")
 
 
+def _apply_open_door_solver_budget(
+    config: dict[str, Any],
+    program: Mapping[str, Any],
+    *,
+    gripper_model: str,
+) -> None:
+    """Resolve numerical contact precision for Robotiq on generated USD doors.
+
+    This is independent of cleanup, drive gains, and physical success thresholds.
+    The budget is persisted in RobotCfg rather than injected during execution.
+    """
+    if gripper_model != "robotiq":
+        return
+    usd_uids = {
+        item["uid"]
+        for item in config.get("articulation", ())
+        if Path(str(item.get("fpath", ""))).suffix.lower() in _USD_ARTICULATION_SUFFIXES
+    }
+    if not any(
+        node.get("atomic_action") == "OpenDoor" and node.get("object_uid") in usd_uids
+        for node in program.get("nodes", ())
+    ):
+        return
+    robot = config["robot"]
+    # Thin handles expose unconverged mimic constraints at the generic 4/1 budget.
+    robot["min_position_iters"] = max(robot.get("min_position_iters", 4), 32)
+    robot["min_velocity_iters"] = max(robot.get("min_velocity_iters", 1), 8)
+
+
 def _runtime_articulation_config(value: Mapping[str, Any]) -> dict[str, Any]:
     """Reduce one source articulation to the simulator-facing config contract."""
     result = {

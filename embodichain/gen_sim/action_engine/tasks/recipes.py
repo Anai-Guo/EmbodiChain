@@ -1329,7 +1329,7 @@ def _single_arm_interaction(
     postcondition: Mapping[str, Any],
     role: str,
 ) -> list[dict[str, Any]]:
-    """Build an interaction followed by safety retreat and best-effort home."""
+    """Build an interaction and an ordered, verified clearance suffix."""
     nodes: list[dict[str, Any]] = []
     previous = dependencies
     next_index = 1
@@ -1367,7 +1367,14 @@ def _single_arm_interaction(
         object_uid,
         actor,
         "arm",
-        target_binding,
+        {
+            **target_binding,
+            **(
+                {"external_cleanup": True}
+                if action_name in {"Slide", "OpenDoor"}
+                else {}
+            ),
+        },
         previous,
         role,
         postcondition,
@@ -1375,8 +1382,51 @@ def _single_arm_interaction(
     )
     nodes.append(interaction_node)
     next_index += 1
-    if action_name in {"Slide", "OpenDoor"}:
-        return nodes
+    articulated = action_name in {"Slide", "OpenDoor"}
+    previous = [interaction_node["id"]]
+    if articulated:
+        detach = _node(
+            group_id,
+            next_index,
+            "MoveJoints",
+            task_type,
+            object_uid,
+            actor,
+            "hand",
+            {
+                "kind": "joint_state",
+                "source": "gripper_open",
+                "operation": "articulation_detach",
+            },
+            previous,
+            "cleanup",
+            {},
+            motion_policy(),
+        )
+        nodes.append(detach)
+        next_index += 1
+        disengage = _node(
+            group_id,
+            next_index,
+            "MoveEndEffector",
+            task_type,
+            object_uid,
+            actor,
+            "arm",
+            {
+                "kind": "policy_pose",
+                "source": "interaction",
+                "operation": "articulation_disengage",
+                "interaction": interaction,
+            },
+            [detach["id"]],
+            "cleanup",
+            {},
+            motion_policy(),
+        )
+        nodes.append(disengage)
+        next_index += 1
+        previous = [disengage["id"]]
     retreat = _node(
         group_id,
         next_index,
@@ -1390,14 +1440,38 @@ def _single_arm_interaction(
             "source": "interaction",
             "operation": "safe_retreat",
             "interaction": interaction,
+            **({"articulation_cleanup": True} if articulated else {}),
         },
-        [interaction_node["id"]],
+        previous,
         "cleanup",
         {},
         motion_policy(),
     )
     nodes.append(retreat)
     next_index += 1
+    previous = [retreat["id"]]
+    if articulated:
+        full_open = _node(
+            group_id,
+            next_index,
+            "MoveJoints",
+            task_type,
+            object_uid,
+            actor,
+            "hand",
+            {
+                "kind": "joint_state",
+                "source": "gripper_open",
+                "operation": "articulation_full_open",
+            },
+            previous,
+            "cleanup",
+            {},
+            motion_policy(),
+        )
+        nodes.append(full_open)
+        next_index += 1
+        previous = [full_open["id"]]
     home = _node(
         group_id,
         next_index,
@@ -1409,9 +1483,10 @@ def _single_arm_interaction(
         {
             "kind": "joint_state",
             "source": "initial",
-            "required_home": False,
+            "required_home": articulated,
+            **({"articulation_cleanup": True} if articulated else {}),
         },
-        [retreat["id"]],
+        previous,
         "cleanup",
         {},
         motion_policy(),

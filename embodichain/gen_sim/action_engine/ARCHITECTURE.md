@@ -220,6 +220,148 @@ accepted at entry. GenSim retains the tutorial `Slide` sampling and
 hand-interpolation budgets and inserts an explicit close-pose settle segment so
 simulator drives can converge before the drawer interaction starts.
 
+New E6/E7 recipes declare `external_cleanup` on the interaction binding.
+GenSim executes the planned prefix before the internal hand-open/release
+segment. Cleanup runs detach, disengage, retreat, full-open, then required-home.
+Detach stops further opening after three fresh control-step observations show
+no target or obstacle contact and actual opening progress. It preserves the
+partial opening during withdrawal instead of requiring full opening at the
+original grasp pose. Raw hand observations remain separate from legal
+master/mimic hold commands. A clear-at-entry hand is recorded separately
+from observed contact release. Unknown or saturated contact buffers cannot prove
+release. Full opening remains a separate verified action after withdrawal.
+Hand-only detach and full-open keep the selected arm's existing controller
+position target. They must not re-anchor that target to measured joint positions
+and accumulate servo tracking error at each phase transition. PlanningContext
+continues to contain the actual observation. Release support checks combine the
+hand sweep with sampled observed-to-commanded arm FK poses before those arm-hold
+commands are emitted. Ordinary arm motions and abort-time measured holds retain
+their original behavior.
+When another environment continues, a completed detach row freezes its existing
+arm command and the first observed master's legal hand command rather than
+re-anchoring them on every tick. A later hazard replaces that row's hold with its
+first measured abort state; later clear observations cannot resume its normal
+hold. The default stop behavior outside staged detachment is unchanged.
+Internal release, retract, and push-return segments are recorded
+as deferred, not executed. The original planner success mask still covers the
+complete core plan; truncation never turns a failed plan into a successful one.
+Bundles without this declaration retain their existing execution behavior.
+
+The selected grasp request supplies the approach vector, saved in the owning
+link frame independently of gripper roll. After that interaction executes,
+detach checks inverse approach, tool-back, same-arm baseward, and world-up
+corridors without shortening the configured distance. Each
+candidate uses current-to-commanded hand geometry, dense target-link and table
+clearance samples, and an RNG-isolated same-arm endpoint IK probe. Distance and
+IK eligibility remain separate evidence; positive clearance alone cannot permit
+withdrawal. Each environment selects the feasible candidate with the largest
+minimum path clearance. Within a 1 micrometre numerical tie, larger terminal
+clearance wins; an exact tie retains the listed candidate order. Terminal margin
+never bypasses the path-clearance or endpoint-IK gates.
+Disengagement entry fixes the selected world-space endpoint and wrist orientation
+per task step, arm, and environment row. Retries replan to that same endpoint.
+Reset clears this provenance, choices, hand holds, and endpoints. Legacy full-open
+cleanup retains its inverse-approach route. Retreat keeps
+the verified detached posture; full-open must pass before home. Core-terminal
+joint observations are frozen before any cleanup. A physical core failure is
+not blindly retried or erased by later cleanup, but actual execution provenance
+still permits safety-required cleanup. Final predicates must also remain true.
+The OpenDoor progress gate treats the first open-segment sample as the unchanged
+starting configuration supplied by MotionGenerator, and the last as the full
+requested hinge target. It must not wait for nonzero hinge progress while
+repeatedly issuing the unchanged starting command. This preserves the original
+progress tolerance and maximum repeat budget.
+E6/E7 cores with external cleanup also observe robot/world contacts after every
+control command, including commands repeated by the progress gate. Selected-hand
+contact with the named moving link is allowed; other world contact or unknown
+contact data latches a row-local failure. The first contact evidence is retained
+even if later observations clear. Core stops flush one final robot command with
+measured holds on aborted rows, including when peers finish normally, so the last
+unsafe drive target is not left active. Invalid measured
+holds are rejected instead of dispatched. Non-gated cleanup keeps its existing
+stop semantics, and stopped batch rows stay held while peers continue.
+Core records retain both joint-motion success and safety-aborted state; meeting
+the joint target cannot turn a collision abort into success. Failure reports
+separate contact-aborted rows from other joint-postcondition failures. These are
+reactive last-substep observations, not continuous or predictive collision
+certification, and a safely stopped task is still incomplete.
+
+Before E6/E7 execution, GenSim checks each USD target's live per-link gravity
+flags against its explicit `cfg.enable_gravity`. Physical-attribute construction
+can overwrite that flag with a backend default. Only mismatching environment
+rows are restored and read back; a failed readback stops execution. This applies
+the existing generated configuration, not a new zero-gravity policy, joint latch,
+qpos injection, or friction change. Per-action traces retain this run-entry
+before/after snapshot; they are not repeated live gravity measurements.
+The environment also restores configured gravity for selected reset rows before
+its existing generated-USD reset pass. All relevant articulations are corrected
+before any native reset, since a native reset advances the whole physics world.
+Restoring gravity only at executor entry leaves velocity imparted by that reset
+step. This ordering change adds no qpos, velocity, force, or target injection;
+the existing initial-state reset still owns clearing dynamics. Runtime evidence
+separately retains the reset-time restoration and the executor-entry readback.
+
+Cleanup geometry does not alter core grasp selection. Each release samples the
+observed hand configuration toward the requested opening at the hand action's
+sampling resolution. Detach may use a collision-free prefix; full-open may not
+substitute a partial opening. Withdrawal audits the observed-to-commanded hand
+tracking envelope along actual planned FK poses, never a fictitious full closure.
+Geometry is environment-local and is not cached across changing hand states.
+Fallback and reachability-search candidates cannot bypass the support audit.
+The audit only removes successful rows and records its scope and clearance.
+Live contact, hand tracking, and articulation target-retention guards stop unsafe
+cleanup rows without converting their failure into a task success.
+
+Generated USD OpenDoor has separate core-contact checks, independent of the
+external-cleanup flag. Approach/reach checks exclude the interaction joint's
+moving subtree; the closing sweep excludes only the exact handle submesh and
+checks the remaining door, other articulation links, and explicit support plane.
+Both audits retain the raw planner mask and can only reject successful rows.
+Each attempted OpenDoor candidate records its pre-audit trajectory and segments,
+including a null trajectory when the planner supplies none. Failed raw rows
+must not be interpreted as valid requested motion merely because a hold-filled
+trajectory exists. Within the configured candidate budget, OpenDoor prioritizes
+unmodified sampler roll when available and tries paired existing depth variants;
+Slide retains its original ordering. These core-grasp choices require independent
+physical qualification and are not evidence that cleanup succeeds.
+For the existing horizontal-hinge wrist-roll adaptation, TCP depth offsets must
+not move the sampled handle contact off the rigid door arc. The invocation-local
+grasp selector supplies a detached TCP-frame contact offset independently of its
+diagnostic trace, and clears it when the selection context exits. After reducing
+wrist rotation, GenSim adjusts translation by `(R_rigid - R_relaxed) * offset`.
+The door-link poses, target angle, roll fraction, and vertical-hinge behavior are
+unchanged. This preserves the selected anchor geometrically, not a guaranteed
+physical grasp; it still requires live contact and joint-motion validation.
+When a validated seed graph actually binds OpenDoor to a generated USD object
+with Robotiq, generation raises the robot's minimum numerical solver budget to
+32 position / 8 velocity iterations, preserving higher template values. The
+resolved RobotCfg stores this policy explicitly. It changes neither drive gains
+nor contact/verifier tolerances, and is independent of external cleanup. Other
+grippers, URDF doors, and graphs without that OpenDoor binding retain their
+existing budget. Because solver iterations are articulation-wide, all robot
+motions in a mixed episode containing this binding use the resolved budget;
+they are not a per-joint or per-waypoint setting. This numerical qualification
+does not prove grasping or complete E7 success.
+
+A failed CLI run with zero commands and explicitly failed environment rows in
+every report preserves the original failure without attempting to archive an
+unproduced video. Any success, mixed or unknown state, or nonzero command count
+still requires the fresh-video gate. Missing media never permits copying a stale
+recording or turning a failed execution into success.
+
+These checks do not certify collision-free withdrawal: the discrete hand samples
+and trajectory waypoints are not continuous collision detection, visual meshes
+are not necessarily backend collision hulls, and the support check does not
+cover the full arm. The separate prospective corridor check covers all target
+articulation links and the table, but endpoint IK does not certify an entire
+arm trajectory. Contact guards observe the last physics
+substep of each control step, not continuous collision-free motion. The current `ik_interp` path has no complete
+world-collision validation, and the clearance verifier measures TCP endpoint
+error and root distance. In particular,
+the inverse-approach candidate can point toward a tabletop for a drop-down door.
+Alternative directions are explicitly traced, geometrically checked candidates,
+not a universally safe reversal of the interaction path.
+
 Adding an executable skill consists of registering its descriptor and reusable
 materializer/verifier hooks plus focused tests. Planner and executor dispatch
 do not maintain a parallel action-class table.

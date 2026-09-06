@@ -20,10 +20,14 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import replace
+from types import SimpleNamespace
+
+import torch
 
 import embodichain.gen_sim.action_engine.domain.task_contracts as task_contracts_module
 import embodichain.gen_sim.action_engine.domain.v2 as domain_v2_module
 from embodichain.gen_sim.action_engine.runtime import load_execution_program
+from embodichain.gen_sim.action_engine.runtime.executor import ProgramExecutor
 from embodichain.gen_sim.action_engine.tasks import (
     ground_instruction_draft,
     instantiate_seed_graph,
@@ -36,16 +40,70 @@ from tests.gen_sim.action_engine.task_fixtures import (
 )
 
 
-def test_e6_e7_recipes_delegate_the_complete_interaction_to_atomic_action() -> None:
+def test_e6_e7_recipes_require_release_clearance_and_home() -> None:
     expected = {"E6": "Slide", "E7": "OpenDoor"}
     for task_type, interaction in expected.items():
         task, _ = make_task_spec(task_type)
         graph = instantiate_seed_graph(task, {"object_01": "interaction_target"})
         nodes = graph["nodes"]
-        assert [node["atomic_action"] for node in nodes] == [interaction]
-        assert [node["contract"]["failure_policy"] for node in nodes] == [
-            "task_required"
+        assert [node["atomic_action"] for node in nodes] == [
+            interaction,
+            "MoveJoints",
+            "MoveEndEffector",
+            "MoveEndEffector",
+            "MoveJoints",
+            "MoveJoints",
         ]
+        assert [node["contract"]["failure_policy"] for node in nodes] == [
+            "task_required",
+            "safety_required",
+            "safety_required",
+            "safety_required",
+            "safety_required",
+            "safety_required",
+        ]
+        assert nodes[1]["target_binding"] == {
+            "kind": "joint_state",
+            "source": "gripper_open",
+            "operation": "articulation_detach",
+        }
+        assert nodes[1]["control"] == "hand"
+        assert nodes[2]["target_binding"]["operation"] == "articulation_disengage"
+        assert nodes[3]["target_binding"]["operation"] == "safe_retreat"
+        assert nodes[4]["target_binding"] == {
+            "kind": "joint_state",
+            "source": "gripper_open",
+            "operation": "articulation_full_open",
+        }
+        assert nodes[4]["control"] == "hand"
+        assert nodes[5]["target_binding"]["required_home"] is True
+        assert [node["role"] for node in nodes[1:]] == ["cleanup"] * 5
+        for previous, current in zip(nodes, nodes[1:]):
+            assert current["depends_on"] == [previous["id"]]
+
+
+def test_e6_e7_core_failure_allows_detach_but_failed_detach_blocks_departure() -> None:
+    for task_type in ("E6", "E7"):
+        task, _ = make_task_spec(task_type)
+        graph = instantiate_seed_graph(task, {"object_01": "interaction_target"})
+        program = load_execution_program(graph)
+        core, detach, disengage, retreat, full_open, home = program.edges
+        executor = object.__new__(ProgramExecutor)
+        executor.env = SimpleNamespace(num_envs=2, device="cpu")
+        executor.edges = {edge.id: edge for edge in program.edges}
+        executor._completion_only_dependencies = frozenset()
+        failed_core = {core.id: torch.tensor([True, False])}
+        assert executor._edge_failure_policy(detach) == "safety_required"
+        assert executor._safety_dependency_failures(detach, failed_core).tolist() == [
+            False,
+            False,
+        ]
+        failed_detach = {detach.id: torch.tensor([False, True])}
+        assert executor._safety_dependency_failures(
+            disengage, failed_detach
+        ).tolist() == [False, True]
+        assert full_open.depends_on == (retreat.id,)
+        assert home.depends_on == (full_open.id,)
 
 
 def test_e8_e9_recipes_use_staging_interaction_retreat_and_home() -> None:

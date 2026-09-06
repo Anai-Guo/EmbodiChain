@@ -83,9 +83,11 @@ from embodichain.utils.logger import log_info, log_warning
 from embodichain.utils.math import matrix_from_quat, quat_from_matrix, quat_slerp
 
 from .body_grasp import AxisAlignBodyGraspAdapter
-from .articulation import _effective_joint_position, _scene_entity
+from .articulation import _effective_joint_position, _is_usd_articulation, _scene_entity
+from .interaction_clearance import _InteractionClearance
 from .coordinated_safety import _trajectory_safety_report
 from .grasp_diagnostics import _TracingAntipodalGraspPoseGenerator
+from .gripper_geometry import _commanded_gripper_qpos, _gripper_points
 from .models import ActionOutcome, GroundedAction
 from .state import _CollisionOverrideSceneSnapshot, ExecutionState
 
@@ -250,6 +252,7 @@ class AtomicActionAdapter:
             tuple[bool, float, bool], AtomicActionEngine
         ] = {}
         self._semantics: dict[str, ObjectSemantics] = {}
+        self._precontact_geometry: _InteractionClearance | None = None
         self._scene_time = 0.0
         if scene_provider is not None and not isinstance(scene_provider, SceneProvider):
             raise TypeError("scene_provider must implement SceneProvider.")
@@ -422,6 +425,7 @@ class AtomicActionAdapter:
         """Plan one grounded primitive through the mainline typed contract."""
         capability = self.capabilities.require_executable(grounded.action_class)
         state = state or self.initial_state()
+        grounded = self._prepare_articulation_release(grounded)
         grounded = self._select_transport_yaw(grounded, state)
         context = self._planning_context(state, grounded)
         coordinated_candidates = self._adapt_coordinated_pickment_grasps(
@@ -505,6 +509,35 @@ class AtomicActionAdapter:
                 _capture_retreat_warnings(capture_warnings) as warnings,
             ):
                 candidate_plan = candidate_engine.plan(candidate_invocation, context)
+            proposal: dict[str, Any] = {}
+            if capability.target_materializer == "open_door":
+                raw_trajectory = candidate_plan.joint_trajectory
+                proposal = {
+                    "raw_plan_success": candidate_plan.plan_success.detach().clone(),
+                    "segment_planning": deepcopy(
+                        candidate_plan.diagnostics.metadata.get(
+                            "gensim_open_door_segment_planning", []
+                        )
+                    ),
+                    "proposed_trajectory": (
+                        None
+                        if raw_trajectory is None
+                        else raw_trajectory.positions.detach().clone()
+                    ),
+                    "proposed_segments": {
+                        segment.name: {"start": segment.start, "stop": segment.stop}
+                        for segment in candidate_plan.segments
+                    },
+                }
+            candidate_plan = self._audit_interaction_support(
+                candidate, capability, candidate_plan
+            )
+            candidate_plan = self._audit_open_door_precontact(
+                candidate, capability, candidate_plan
+            )
+            candidate_plan = self._audit_open_door_closure(
+                candidate, capability, candidate_plan
+            )
             if interaction_rank is not None:
                 _, hand_part, _ = self._parts(candidate.arm)
                 generator = (
@@ -525,8 +558,36 @@ class AtomicActionAdapter:
                         .cpu()
                         .tolist(),
                         "grasp": deepcopy(trace),
+                        **proposal,
+                        "precontact": deepcopy(
+                            candidate_plan.diagnostics.metadata.get(
+                                "open_door_precontact"
+                            )
+                        ),
+                        "grasp_closure": deepcopy(
+                            candidate_plan.diagnostics.metadata.get(
+                                "open_door_grasp_closure"
+                            )
+                        ),
                     }
                 )
+            if interaction_rank is not None and isinstance(trace, Mapping):
+                rows = trace.get("environment_rows", ())
+                if len(rows) == self.num_envs and all(
+                    "approach_direction_local" in row for row in rows
+                ):
+                    candidate = replace(
+                        candidate,
+                        motion_policy={
+                            **candidate.motion_policy,
+                            "articulation_approach_direction_local": torch.tensor(
+                                [row["approach_direction_local"] for row in rows],
+                                dtype=torch.float32,
+                                device=self.device,
+                            ),
+                            "articulation_approach_source": "selected_atomic_grasp_request",
+                        },
+                    )
             self._record_selected_upright_grasp(
                 candidate,
                 candidate_plan,
@@ -626,6 +687,9 @@ class AtomicActionAdapter:
                 initial_positions=selected_positions,
                 initial_success=primary_success,
                 initial_warnings=selected_warnings,
+                initial_support_audit=plan.diagnostics.metadata.get(
+                    "articulation_support_audit"
+                ),
             )
             invocation = replace(invocation, goal=grounded.target)
         combined_success = primary_success.clone()
@@ -655,6 +719,15 @@ class AtomicActionAdapter:
             fallback_plan = selected_engine.plan(
                 replace(invocation, motion_policy=fallback_policy),
                 context,
+            )
+            fallback_plan = self._audit_interaction_support(
+                grounded, capability, fallback_plan
+            )
+            fallback_plan = self._audit_open_door_precontact(
+                grounded, capability, fallback_plan
+            )
+            fallback_plan = self._audit_open_door_closure(
+                grounded, capability, fallback_plan
             )
             fallback_positions = self._positions_with_agent_holds(
                 fallback_plan,
@@ -691,6 +764,20 @@ class AtomicActionAdapter:
                     )
                 ),
             )
+
+        departure_valid = grounded.motion_policy.get("articulation_departure_valid")
+        release_valid = grounded.motion_policy.get("articulation_release_path_valid")
+        if release_valid is not None:
+            combined_success &= release_valid.to(device=self.device, dtype=torch.bool)
+        if departure_valid is not None:
+            departure_valid = torch.as_tensor(departure_valid, device=self.device)
+            if departure_valid.dtype != torch.bool or departure_valid.shape != (
+                self.num_envs,
+            ):
+                raise ValueError(
+                    "Articulation departure provenance must be a row-local boolean mask."
+                )
+            combined_success &= departure_valid
 
         terminal_qpos = (
             selected_positions[:, -1]
@@ -752,6 +839,11 @@ class AtomicActionAdapter:
                 # selected planner route retains its complete joint path.
                 "planned_trajectory": selected_positions.detach().clone(),
                 "primary_action_diagnostics": deepcopy(dict(plan.diagnostics.metadata)),
+                "primary_action_diagnostics_scope": (
+                    "initial_retreat_candidate"
+                    if reachability_search is not None
+                    else "selected_primary_plan"
+                ),
                 "fallback_action_diagnostics": (
                     None
                     if fallback_plan is None
@@ -766,6 +858,16 @@ class AtomicActionAdapter:
                     if segment.start < selected_positions.shape[1]
                 },
                 "interaction_grasp_search": deepcopy(interaction_search_attempts),
+                "articulation_departure_valid": (
+                    None
+                    if departure_valid is None
+                    else departure_valid.detach().clone()
+                ),
+                "deferred_cleanup_segments": [
+                    segment.name
+                    for segment in plan.segments
+                    if segment.start >= selected_positions.shape[1]
+                ],
             },
         )
 
@@ -1613,6 +1715,8 @@ class AtomicActionAdapter:
                 device=self.device,
             ),
             candidate_rank=int(rank),
+            pair_depth_variants=capability.target_materializer == "open_door",
+            prefer_unmodified_roll=capability.target_materializer == "open_door",
             roll_degrees=candidate.motion_policy.get(
                 "interaction_grasp_roll_degrees",
                 (0.0,),
@@ -1628,6 +1732,456 @@ class AtomicActionAdapter:
             ),
         ):
             yield
+
+    def _open_door_precontact_clearance(
+        self, grounded: GroundedAction, poses: torch.Tensor, hand: torch.Tensor
+    ) -> torch.Tensor:
+        if self._precontact_geometry is None:
+            self._precontact_geometry = _InteractionClearance(self.env)
+        return self._precontact_geometry.precontact(
+            grounded.object_uid,
+            grounded.motion_policy["articulation_joint_name"],
+            poses,
+            hand,
+        )
+
+    def _audit_open_door_precontact(
+        self, grounded: GroundedAction, capability: AtomicCapability, plan: ActionPlan
+    ) -> ActionPlan:
+        """Recheck generated-door approach/reach against non-target link geometry."""
+        if capability.target_materializer != "open_door" or not bool(
+            plan.plan_success.any()
+        ):
+            return plan
+        target = _scene_entity(self.env.sim, grounded.object_uid)
+        if not _is_usd_articulation(target):
+            return plan
+        approach = next(
+            (item for item in plan.segments if item.name == "approach"), None
+        )
+        reach = next((item for item in plan.segments if item.name == "reach"), None)
+        trajectory = plan.joint_trajectory
+        if (
+            trajectory is None
+            or approach is None
+            or reach is None
+            or approach.start != 0
+            or approach.stop != reach.start
+            or not reach.start < reach.stop <= trajectory.positions.shape[1]
+        ):
+            raise ValueError(
+                "OpenDoor pre-contact audit requires approach/reach segments."
+            )
+        prefix = trajectory.positions[:, : reach.stop]
+        arm, hand_part, _ = self._parts(grounded.arm)
+        ids = self.env.robot.get_joint_ids(name=hand_part)
+        commands = prefix[:, :, ids]
+        if not torch.allclose(
+            commands, commands[:, :1].expand_as(commands), atol=1e-6, rtol=0
+        ):
+            raise ValueError(
+                "OpenDoor pre-contact audit requires a constant commanded pre-shape."
+            )
+        hand = _gripper_points(self.env, grounded.arm, qpos=prefix[:, 0]).flatten(1, 2)
+        poses, _ = self._arm_trajectory_fk(prefix, arm)
+        clearance = self._open_door_precontact_clearance(grounded, poses, hand).to(
+            plan.plan_success.device
+        )
+        if clearance.shape != plan.plan_success.shape:
+            raise ValueError(
+                "OpenDoor pre-contact clearance must contain one value per environment."
+            )
+        success = plan.plan_success & torch.isfinite(clearance) & (clearance >= 0.003)
+        rejected = bool((plan.plan_success & ~success).any())
+        audit = {
+            "scope": "commanded_gripper_vs_non_target_articulation_links",
+            "stage": "approach_reach",
+            "raw_plan_success": plan.plan_success.detach().clone(),
+            "success": success.detach().clone(),
+            "clearance": clearance.detach().clone(),
+            "minimum_clearance": 0.003,
+            "hand_qpos": commands[:, 0].detach().clone(),
+            "world_collision_checked": False,
+        }
+        return replace(
+            plan,
+            plan_success=success,
+            diagnostics=replace(
+                plan.diagnostics,
+                metadata={
+                    **dict(plan.diagnostics.metadata),
+                    "open_door_precontact": audit,
+                },
+                messages=(
+                    *plan.diagnostics.messages,
+                    *(
+                        (
+                            "OpenDoor pre-contact gripper collision with non-target articulation links.",
+                        )
+                        if rejected
+                        else ()
+                    ),
+                ),
+                failure=(
+                    PlanningFailure("open_door_precontact_collision")
+                    if rejected
+                    else plan.diagnostics.failure
+                ),
+            ),
+        )
+
+    def _open_door_closure_clearance(
+        self, grounded: GroundedAction, pose: torch.Tensor, hand: torch.Tensor
+    ) -> torch.Tensor:
+        if self._precontact_geometry is None:
+            self._precontact_geometry = _InteractionClearance(self.env)
+        policy = grounded.motion_policy
+        return self._precontact_geometry.grasp_closure(
+            grounded.object_uid,
+            policy["articulation_target_link_name"],
+            policy["articulation_target_mesh_name"],
+            pose,
+            hand,
+            support_surface_z=policy.get("interaction_support_surface_z"),
+        )
+
+    def _audit_open_door_closure(
+        self, grounded: GroundedAction, capability: AtomicCapability, plan: ActionPlan
+    ) -> ActionPlan:
+        """Keep door-frame contact out of the intended handle-closing phase."""
+        if capability.target_materializer != "open_door" or not bool(
+            plan.plan_success.any()
+        ):
+            return plan
+        if not _is_usd_articulation(_scene_entity(self.env.sim, grounded.object_uid)):
+            return plan
+        close = next(
+            (segment for segment in plan.segments if segment.name == "close"), None
+        )
+        positions = (
+            None if plan.joint_trajectory is None else plan.joint_trajectory.positions
+        )
+        if (
+            positions is None
+            or close is None
+            or not 0 < close.start < close.stop <= positions.shape[1]
+        ):
+            raise ValueError(
+                "OpenDoor closure audit requires a close segment after reach."
+            )
+        arm, _, _ = self._parts(grounded.arm)
+        before = positions[:, close.start - 1]
+        after = positions[:, close.stop - 1]
+        arm_ids = self.env.robot.get_joint_ids(name=arm)
+        if not torch.allclose(
+            positions[:, close.start : close.stop, arm_ids],
+            before[:, None, arm_ids].expand(-1, close.stop - close.start, -1),
+            atol=1e-6,
+            rtol=0,
+        ):
+            raise ValueError("OpenDoor closing must hold its arm pose.")
+        poses, _ = self._arm_trajectory_fk(before[:, None], arm)
+        hand = _gripper_points(
+            self.env,
+            grounded.arm,
+            qpos=before,
+            target_qpos=after,
+            sample_count=max(5, close.stop - close.start),
+        )
+        clearance = self._open_door_closure_clearance(grounded, poses[:, 0], hand).to(
+            plan.plan_success.device
+        )
+        if clearance.shape != plan.plan_success.shape:
+            raise ValueError(
+                "OpenDoor closure clearance must contain one value per environment."
+            )
+        success = plan.plan_success & torch.isfinite(clearance) & (clearance >= 0.003)
+        rejected = bool((plan.plan_success & ~success).any())
+        return replace(
+            plan,
+            plan_success=success,
+            diagnostics=replace(
+                plan.diagnostics,
+                metadata={
+                    **dict(plan.diagnostics.metadata),
+                    "open_door_grasp_closure": {
+                        "scope": "articulation_except_exact_handle_and_support",
+                        "clearance": clearance.detach().clone(),
+                        "minimum_clearance": 0.003,
+                        "raw_plan_success": plan.plan_success.detach().clone(),
+                        "success": success.detach().clone(),
+                        "world_collision_checked": False,
+                    },
+                },
+                failure=(
+                    PlanningFailure("open_door_grasp_closure_collision")
+                    if rejected
+                    else plan.diagnostics.failure
+                ),
+                messages=(
+                    *plan.diagnostics.messages,
+                    *(
+                        ("OpenDoor closing sweep collides with non-handle geometry.",)
+                        if rejected
+                        else ()
+                    ),
+                ),
+            ),
+        )
+
+    def _departure_hand_geometry(self, grounded: GroundedAction) -> torch.Tensor:
+        """Bound observed-to-commanded hand tracking without fictitious closure."""
+        current = self.env.robot.get_qpos().detach().clone()
+        target = current.clone()
+        _, hand_part, hand_dof = self._parts(grounded.arm)
+        hand_ids = self.env.robot.get_joint_ids(name=hand_part)
+        hold = grounded.motion_policy.get("articulation_hand_hold_qpos")
+        target[:, hand_ids] = (
+            torch.as_tensor(hold, device=current.device, dtype=current.dtype)
+            if hold is not None
+            else _as_hand_qpos(self.env.open_state, hand_dof, self.device).to(current)
+        )
+        master = self.gripper_profile.control_joint_names(
+            "left" if grounded.arm == "left_arm" else "right"
+        )[0]
+        target = _commanded_gripper_qpos(
+            self.env,
+            grounded.arm,
+            self.gripper_profile,
+            target[:, self.env.robot.joint_names.index(master)],
+            reference_qpos=current,
+        )
+        points = _gripper_points(
+            self.env, grounded.arm, qpos=current, target_qpos=target
+        )
+        return points.flatten(1, 2)
+
+    def _prepare_articulation_release(self, grounded: GroundedAction) -> GroundedAction:
+        """Bound only a release action's actual opening sweep, never its grasp."""
+        policy = grounded.motion_policy
+        mode = policy.get("articulation_release_mode")
+        if mode not in {"detach", "fully_open"}:
+            return grounded
+        current = self.env.robot.get_qpos().detach().clone()
+        arm_part, hand_part, _ = self._parts(grounded.arm)
+        arm_ids = self.env.robot.get_joint_ids(name=arm_part)
+        commanded = self.env.robot.get_qpos(target=True)
+        if (
+            not isinstance(commanded, torch.Tensor)
+            or commanded.shape != current.shape
+            or not commanded.is_floating_point()
+            or not torch.isfinite(commanded[:, arm_ids]).all()
+        ):
+            raise ValueError(
+                "Articulation release requires finite full-robot arm targets."
+            )
+        arm_hold = commanded[:, arm_ids].detach().to(current).clone()
+        requested = current.clone()
+        ids = self.env.robot.get_joint_ids(name=hand_part)
+        requested[:, ids] = grounded.target.target.to(requested)
+        master_name = self.gripper_profile.control_joint_names(
+            "left" if grounded.arm == "left_arm" else "right"
+        )[0]
+        master_id = self.env.robot.joint_names.index(master_name)
+        command_start = _commanded_gripper_qpos(
+            self.env,
+            grounded.arm,
+            self.gripper_profile,
+            current[:, master_id],
+            reference_qpos=current,
+        )
+        support = policy.get("interaction_support_surface_z")
+        fraction = current.new_zeros(current.shape[0])
+        allowed = torch.zeros_like(fraction, dtype=torch.bool)
+        unresolved = torch.ones_like(allowed)
+        target = command_start.clone()
+        clearance = None
+        samples = max(5, int(policy.get("sample_interval", 15)))
+        fractions = (
+            range(1, samples)
+            if mode == "detach" and support is not None
+            else (samples - 1,)
+        )
+        if support is not None:
+            poses = self.env.get_current_xpos_agent()
+            pose = torch.as_tensor(poses[0 if grounded.arm == "left_arm" else 1]).to(
+                current
+            )[:, None]
+            if not torch.equal(arm_hold, current[:, arm_ids]):
+                # Retain the servo reference without pretending it is observed.
+                arm_samples = current[:, None].repeat(1, 5, 1)
+                weights = current.new_tensor([0.0, 0.25, 0.5, 0.75, 1.0])
+                arm_samples[:, :, arm_ids] = torch.lerp(
+                    current[:, None, arm_ids],
+                    arm_hold[:, None],
+                    weights[None, :, None],
+                )
+                arm_poses, _ = self._arm_trajectory_fk(arm_samples, arm_part)
+                pose = torch.cat((pose, arm_poses.to(pose)), dim=1)
+            surface = torch.as_tensor(support).to(current).reshape(-1)
+        for index in fractions:
+            amount = index / (samples - 1)
+            candidate = _commanded_gripper_qpos(
+                self.env,
+                grounded.arm,
+                self.gripper_profile,
+                torch.lerp(current[:, master_id], requested[:, master_id], amount),
+                reference_qpos=current,
+            )
+            valid = unresolved.clone()
+            if support is not None:
+                # Audit real-state relaxation and the realizable command path.
+                bounds = []
+                for start in (current, command_start):
+                    points = _gripper_points(
+                        self.env,
+                        grounded.arm,
+                        qpos=start,
+                        target_qpos=candidate,
+                        sample_count=samples,
+                    )
+                    height = torch.einsum("bti,bsni->btsn", pose[:, :, 2, :3], points)
+                    bounds.append(
+                        (
+                            height
+                            + pose[:, :, 2, 3, None, None]
+                            - surface[:, None, None, None]
+                        ).amin(dim=(1, 3))
+                    )
+                candidate_clearance = torch.minimum(*bounds)
+                valid &= (candidate_clearance >= 0.003).all(1)
+                if clearance is None:
+                    clearance = candidate_clearance.clone()
+                clearance = torch.where(
+                    (valid | ~allowed)[:, None], candidate_clearance, clearance
+                )
+            target = torch.where(valid[:, None], candidate, target)
+            if mode == "fully_open":
+                target = candidate
+            fraction = torch.where(valid, amount, fraction)
+            allowed |= valid
+            unresolved &= valid
+            if not bool(unresolved.any()):
+                break
+        return replace(
+            grounded,
+            target=replace(grounded.target, target=target[:, ids]),
+            motion_policy={
+                **policy,
+                "articulation_release_path_valid": allowed,
+                "articulation_release_fraction": fraction,
+                "articulation_release_sweep_clearance": clearance,
+                "articulation_arm_hold_qpos": arm_hold,
+                "articulation_arm_hold_observed_qpos": current[:, arm_ids].clone(),
+            },
+        )
+
+    def _audit_interaction_support(
+        self,
+        grounded: GroundedAction,
+        capability: AtomicCapability,
+        plan: ActionPlan,
+    ) -> ActionPlan:
+        """Reject withdrawal poses that place the current hand below the table.
+
+        This is a sampled support-plane check, not full world collision
+        validation. In particular, it does not test the target door or arm links.
+        """
+        policy = grounded.motion_policy
+        release_valid = policy.get("articulation_release_path_valid")
+        if release_valid is not None:
+            success = plan.plan_success & release_valid.to(plan.plan_success.device)
+            rejected = bool((plan.plan_success & ~success).any())
+            plan = replace(
+                plan,
+                plan_success=success,
+                diagnostics=replace(
+                    plan.diagnostics,
+                    metadata={
+                        **dict(plan.diagnostics.metadata),
+                        "articulation_release_geometry": {
+                            "mode": policy["articulation_release_mode"],
+                            "fraction": policy["articulation_release_fraction"],
+                            "clearance": policy["articulation_release_sweep_clearance"],
+                            "success": success.detach().clone(),
+                            "arm_hold_source": "live_controller_target",
+                            "arm_hold_qpos": policy["articulation_arm_hold_qpos"],
+                            "observed_arm_qpos": policy[
+                                "articulation_arm_hold_observed_qpos"
+                            ],
+                        },
+                    },
+                    messages=(
+                        *plan.diagnostics.messages,
+                        *(
+                            ("No collision-free opening sweep for this release phase.",)
+                            if rejected
+                            else ()
+                        ),
+                    ),
+                    failure=(
+                        PlanningFailure("articulation_release_sweep_blocked")
+                        if rejected
+                        else plan.diagnostics.failure
+                    ),
+                ),
+            )
+        departure = policy.get("articulation_support_audit", False)
+        support = policy.get("interaction_support_surface_z")
+        if not departure or support is None or not bool(plan.plan_success.any()):
+            return plan
+        trajectory = plan.joint_trajectory
+        if trajectory is None:
+            raise ValueError("Articulation support audit requires a joint trajectory.")
+        positions = trajectory.positions
+        control_part, _, _ = self._parts(grounded.arm)
+        poses, _ = self._arm_trajectory_fk(positions, control_part)
+        points = self._departure_hand_geometry(grounded).to(poses)
+        support = torch.as_tensor(support, device=poses.device, dtype=poses.dtype)
+        support = support.reshape(-1).expand(positions.shape[0])
+        if not torch.isfinite(support).all() or not torch.isfinite(poses).all():
+            raise ValueError("Articulation support audit requires finite geometry.")
+        heights = torch.einsum("bti,bni->btn", poses[:, :, 2, :3], points)
+        clearance = (heights + poses[:, :, 2, 3, None] - support[:, None, None]).amin(
+            dim=(1, 2)
+        )
+        minimum = max(
+            0.003, float(policy.get("interaction_grasp_minimum_support_clearance", 0.0))
+        )
+        success = plan.plan_success & (clearance >= minimum)
+        audit = {
+            "scope": "departure_trajectory",
+            "hand_geometry": "observed_to_commanded",
+            "raw_plan_success": plan.plan_success.detach().cpu().tolist(),
+            "success": success.detach().cpu().tolist(),
+            "minimum_clearance": minimum,
+            "observed_clearance": clearance.detach().cpu().tolist(),
+            "world_collision_checked": False,
+        }
+        rejected = bool((plan.plan_success & ~success).any())
+        diagnostics = replace(
+            plan.diagnostics,
+            metadata={
+                **dict(plan.diagnostics.metadata),
+                "articulation_support_audit": audit,
+            },
+            messages=(
+                *plan.diagnostics.messages,
+                *(
+                    (
+                        "GenSim articulation support audit rejected the planned linkage sweep.",
+                    )
+                    if rejected
+                    else ()
+                ),
+            ),
+            failure=(
+                PlanningFailure("articulation_support_clearance_failed")
+                if rejected
+                else plan.diagnostics.failure
+            ),
+        )
+        return replace(plan, plan_success=success, diagnostics=diagnostics)
 
     @staticmethod
     def _adapt_interaction_grasp_candidates(
@@ -1814,6 +2368,7 @@ class AtomicActionAdapter:
         initial_positions: torch.Tensor,
         initial_success: torch.Tensor,
         initial_warnings: Sequence[str] = (),
+        initial_support_audit: Mapping[str, Any] | None = None,
     ) -> tuple[GroundedAction, torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Select a row-local retreat candidate accepted by the live planner."""
         candidates = self._retreat_search_targets(grounded)
@@ -1859,6 +2414,7 @@ class AtomicActionAdapter:
                 .detach()
                 .clone(),
                 "success": initial_success.detach().clone(),
+                "articulation_support_audit": deepcopy(initial_support_audit),
             }
         ]
         for label, candidate_target in candidates[1:]:
@@ -1880,6 +2436,9 @@ class AtomicActionAdapter:
             )
             with _capture_retreat_warnings(True) as warnings:
                 candidate_plan = self._engine().plan(candidate_invocation, context)
+            candidate_plan = self._audit_interaction_support(
+                candidate_grounded, capability, candidate_plan
+            )
             suppressed_warnings.extend(warnings)
             candidate_positions = self._positions_with_agent_holds(
                 candidate_plan,
@@ -1915,6 +2474,11 @@ class AtomicActionAdapter:
                     .detach()
                     .clone(),
                     "success": candidate_success.detach().clone(),
+                    "articulation_support_audit": deepcopy(
+                        candidate_plan.diagnostics.metadata.get(
+                            "articulation_support_audit"
+                        )
+                    ),
                 }
             )
 
@@ -2818,6 +3382,49 @@ class AtomicActionAdapter:
             device=self.device,
             dtype=torch.float32,
         )
+        arm_hold = grounded.motion_policy.get("articulation_arm_hold_qpos")
+        if arm_hold is not None:
+            arm_part, _, _ = self._parts(grounded.arm)
+            arm_ids = self.env.robot.get_joint_ids(name=arm_part)
+            arm_hold = torch.as_tensor(arm_hold).to(positions)
+            if (
+                arm_hold.shape != (positions.shape[0], len(arm_ids))
+                or not torch.isfinite(arm_hold).all()
+            ):
+                raise ValueError("Articulation arm hold must be finite and row-local.")
+            positions = positions.clone()
+            positions[:, :, arm_ids] = arm_hold[:, None]
+        if grounded.motion_policy.get("articulation_keep_hand_open", False):
+            _, hand_part, hand_dof = self._parts(grounded.arm)
+            if hand_part is None or hand_dof == 0:
+                raise ValueError("Articulation cleanup requires a configured hand.")
+            positions = positions.clone()
+            hand_ids = self.env.robot.get_joint_ids(name=hand_part)
+            hold = grounded.motion_policy.get("articulation_hand_hold_qpos")
+            positions[:, :, hand_ids] = (
+                torch.as_tensor(hold).to(positions)[:, None]
+                if hold is not None
+                else _as_hand_qpos(self.env.open_state, hand_dof, self.device).to(
+                    positions
+                )
+            )
+        if (
+            grounded.motion_policy.get("articulation_release_mode")
+            in {"detach", "fully_open"}
+            or grounded.motion_policy.get("articulation_hand_hold_qpos") is not None
+        ):
+            master = self.gripper_profile.control_joint_names(
+                "left" if grounded.arm == "left_arm" else "right"
+            )[0]
+            master_id = self.env.robot.joint_names.index(master)
+            flat = positions.reshape(-1, positions.shape[-1])
+            positions = _commanded_gripper_qpos(
+                self.env,
+                grounded.arm,
+                self.gripper_profile,
+                flat[:, master_id],
+                reference_qpos=flat,
+            ).reshape_as(positions)
         hold_steps = int(grounded.cfg.get("post_hold_steps", 0))
         if capability.state_effect != "release" or hold_steps <= 0:
             return positions
@@ -2856,6 +3463,12 @@ class AtomicActionAdapter:
             raise ValueError(
                 f"{grounded.action_class} requires a valid {release_name!r} segment."
             )
+        if grounded.motion_policy.get("articulation_external_cleanup", False):
+            if release.start == 0:
+                raise ValueError(
+                    "External cleanup requires a non-empty interaction prefix."
+                )
+            return positions[:, : release.start]
         _, hand_part, hand_dof = self._parts(grounded.arm)
         if hand_part is None or hand_dof == 0:
             raise ValueError(f"{grounded.action_class} requires a configured hand.")
@@ -2877,6 +3490,7 @@ class AtomicActionAdapter:
             full_open[None, None],
             weights[None, :, None],
         )
+        result[:, release.stop :, hand_ids] = full_open
         if capability.target_materializer == "open_door" and not bool(
             grounded.motion_policy.get("articulation_retract_after_release", True)
         ):
@@ -2936,11 +3550,19 @@ class AtomicActionAdapter:
         active: torch.Tensor,
         waypoint_observer: Callable[[int], None] | None = None,
         waypoint_progress_gate: _WaypointProgressGate | None = None,
+        waypoint_stop: Callable[[int], torch.Tensor] | None = None,
+        waypoint_stop_hold: (
+            Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None
+        ) = None,
+        flush_stop_hold: bool = False,
     ) -> list[torch.Tensor]:
-        """Advance the environment while holding inactive vectorized rows."""
+        """Advance rows, optionally flushing measured stop holds before returning."""
         if trajectory.ndim != 3 or trajectory.shape[0] != self.num_envs:
             raise ValueError("Execution trajectory must have shape (N, T, robot_dof).")
-        active = active.to(device=trajectory.device, dtype=torch.bool)
+        active = active.to(device=trajectory.device, dtype=torch.bool).clone()
+        eligible = active.clone()
+        if not bool(active.any()):
+            return []
         current = self.env.robot.get_qpos().to(
             device=trajectory.device,
             dtype=trajectory.dtype,
@@ -2963,13 +3585,49 @@ class AtomicActionAdapter:
                 update()
             commands.append(command.detach())
 
+        def apply_stop(waypoint_index: int) -> None:
+            nonlocal current, active
+            if waypoint_stop is None:
+                return
+            stopped = waypoint_stop(waypoint_index).to(device=trajectory.device).clone()
+            if stopped.shape != active.shape or stopped.dtype != torch.bool:
+                raise ValueError("Waypoint stop must return a row-local boolean mask.")
+            stopped &= eligible
+            if waypoint_stop_hold is None:
+                newly_stopped = stopped & active
+                if bool(newly_stopped.any()):
+                    measured = self.env.robot.get_qpos().to(current)
+                    if (
+                        measured.shape != current.shape
+                        or not torch.isfinite(measured[newly_stopped]).all()
+                    ):
+                        raise ValueError(
+                            "Cannot dispatch an invalid observed safety hold."
+                        )
+                    current = torch.where(newly_stopped[:, None], measured, current)
+            elif bool(stopped.any()):
+                hold = waypoint_stop_hold(current.clone(), stopped.clone())
+                if (
+                    not isinstance(hold, torch.Tensor)
+                    or hold.shape != current.shape
+                    or not hold.is_floating_point()
+                    or not torch.isfinite(hold).all()
+                ):
+                    raise ValueError(
+                        "Waypoint stop hold must be finite full-robot commands."
+                    )
+                current = torch.where(stopped[:, None], hold.to(current), current)
+            active &= ~stopped
+
         for waypoint_index, waypoint in enumerate(trajectory.unbind(dim=1)):
             command = torch.where(active[:, None], waypoint, current)
             step_command(command)
             current = command
             repeats = 0
             waiting = torch.zeros_like(active)
-            if gate is not None and gate.start <= waypoint_index < gate.stop:
+            gated = gate is not None and gate.start <= waypoint_index < gate.stop
+            if gated:
+                apply_stop(waypoint_index)
                 waiting = gate.needs_repeat(waypoint_index).to(
                     device=trajectory.device,
                     dtype=torch.bool,
@@ -2982,6 +3640,7 @@ class AtomicActionAdapter:
                     step_command(repeated)
                     current = repeated
                     repeats += 1
+                    apply_stop(waypoint_index)
                     waiting = gate.needs_repeat(waypoint_index).to(
                         device=trajectory.device,
                         dtype=torch.bool,
@@ -3007,6 +3666,13 @@ class AtomicActionAdapter:
                     )
             if waypoint_observer is not None:
                 waypoint_observer(waypoint_index)
+            if not gated:
+                apply_stop(waypoint_index)
+            if not bool(active.any()):
+                break
+        if flush_stop_hold and commands and bool((eligible & ~active).any()):
+            # Stopping iteration alone leaves the last unsafe drive target live.
+            step_command(current)
         if gate is not None:
             gate.trace["execution_steps"] = len(commands)
             gate.trace["direct_qpos_write"] = False

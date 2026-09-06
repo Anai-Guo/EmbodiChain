@@ -18,7 +18,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
@@ -52,8 +52,17 @@ from embodichain.utils.logger import log_info, log_warning
 
 from .actions import AtomicActionAdapter, _WaypointProgressGate
 from .articulation import _effective_joint_position, _scene_entity
-from .frames import DIRECTIONAL_RELATIONS, robot_frame_axes
-from .grounding import ActionGrounder, LiveArrangementPlan, LivePlacementPlan
+from .frames import DIRECTIONAL_RELATIONS, arm_base_poses, robot_frame_axes
+from .grounding import (
+    ActionGrounder,
+    LiveArrangementPlan,
+    LivePlacementPlan,
+    _table_surface_z,
+)
+from .interaction_physics import _joint_motion_evidence, _restore_gravity_contract
+from .interaction_contacts import _InteractionContacts
+from .interaction_clearance import _InteractionClearance
+from .gripper_geometry import _commanded_gripper_qpos
 from .models import (
     ActionOutcome,
     ExecutionEdge,
@@ -346,6 +355,11 @@ class ProgramExecutor:
         self._orientation_references: dict[str, torch.Tensor] = {}
         self._orientation_errors: dict[str, torch.Tensor] = {}
         self._policies: dict[str, dict[str, Any]] = {}
+        self._interaction_gravity: dict[str, dict[str, Any]] = {}
+        self._core_interactions: dict[tuple[str, str], dict[str, Any]] = {}
+        self._interaction_contacts: _InteractionContacts | None = None
+        self._interaction_clearance: _InteractionClearance | None = None
+        self._detachment_states: dict[tuple[str, str], dict[str, Any]] = {}
         self._entry_satisfied: dict[str, torch.Tensor] = {}
         self._payload_initial: dict[str, dict[str, torch.Tensor]] = {}
         self._support_relations: dict[str, list[_SupportRelation | None]] = {}
@@ -388,6 +402,7 @@ class ProgramExecutor:
         executed_actions: list[torch.Tensor] = []
         error_message = None
         try:
+            self._restore_interaction_gravity()
             while remaining:
                 ready = [
                     self.edges[edge_id]
@@ -737,6 +752,30 @@ class ProgramExecutor:
             ),
         )
 
+    def _restore_interaction_gravity(self) -> None:
+        """Restore explicit USD flags before E6/E7 planning and physical motion."""
+        self._interaction_gravity = {}
+        visited: set[str] = set()
+        for step in self.program.semantic_steps:
+            if (
+                step.operator not in {"slide", "open_door"}
+                or step.object_uid in visited
+            ):
+                continue
+            visited.add(step.object_uid)
+            articulation = self.env.sim.get_articulation(step.object_uid)
+            if articulation is None:
+                continue
+            evidence = _restore_gravity_contract(articulation)
+            if evidence is not None:
+                reset_evidence = getattr(
+                    self.env, "_generated_usd_reset_gravity", {}
+                ).get(step.object_uid)
+                if reset_evidence is not None:
+                    evidence["reset_restore"] = deepcopy(reset_evidence)
+                self._interaction_gravity[step.object_uid] = evidence
+                log_info(f"GenSim gravity contract {step.object_uid}: {evidence}")
+
     def _already_satisfied_articulation_rows(
         self,
         edge: ExecutionEdge,
@@ -848,17 +887,36 @@ class ProgramExecutor:
             planning = failed & ~executed_mask
             execution = failed & executed_mask & ~fallen
             if capability.failure_classifier == "articulation":
-                execution_type = "contact_not_established"
+                execution_type = (
+                    "articulation_core_postcondition_failed"
+                    if any(
+                        "articulation_core_result" in item for item in planner_traces
+                    )
+                    else "contact_not_established"
+                )
             elif capability.failure_classifier == "grasp":
                 execution_type = "grasp_missed"
             elif capability.state_effect in {"preserve_hold", "transfer_hold"}:
                 execution_type = "object_dropped"
+            elif any("articulation_cleanup_guard" in item for item in planner_traces):
+                execution_type = "articulation_cleanup_failed"
+            elif any("articulation_detachment" in item for item in planner_traces):
+                execution_type = "articulation_detachment_failed"
             else:
                 execution_type = "plan_failed"
+            contact_failed = torch.zeros_like(execution)
+            for trace in planner_traces:
+                guard = trace.get("articulation_core_contact_guard")
+                if guard is not None:
+                    contact_failed |= torch.as_tensor(
+                        guard["aborted"], device=execution.device, dtype=torch.bool
+                    ).reshape_as(execution)
+            contact_failed &= execution
             classified = (
                 ("object_fallen", fallen),
                 ("search_exhausted", planning),
-                (execution_type, execution),
+                ("articulation_core_contact_failed", contact_failed),
+                (execution_type, execution & ~contact_failed),
             )
         result: list[dict[str, Any]] = []
         for failure_type, mask in classified:
@@ -957,6 +1015,32 @@ class ProgramExecutor:
                         "postcondition" if postcondition else "execution"
                     ),
                     "env_ids": env_ids,
+                    **(
+                        {
+                            "core_results": [
+                                deepcopy(item["articulation_core_result"])
+                                for item in planner_traces
+                                if "articulation_core_result" in item
+                            ]
+                        }
+                        if failure_type
+                        in {
+                            "articulation_core_postcondition_failed",
+                            "articulation_core_contact_failed",
+                        }
+                        else {}
+                    ),
+                    **(
+                        {
+                            "core_contact_guards": [
+                                deepcopy(item["articulation_core_contact_guard"])
+                                for item in planner_traces
+                                if "articulation_core_contact_guard" in item
+                            ]
+                        }
+                        if failure_type == "articulation_core_contact_failed"
+                        else {}
+                    ),
                 }
             )
         return result
@@ -1081,6 +1165,21 @@ class ProgramExecutor:
         current_failed = result.failed.clone()
         attempted_failure = current_failed & ~failed
         while bool(attempted_failure.any()):
+            for trace in planner_traces:
+                guard = trace.get("articulation_cleanup_guard")
+                if guard is not None:
+                    attempted_failure &= ~guard["aborted"].to(attempted_failure.device)
+                detach = trace.get("articulation_detachment")
+                if detach is not None and "aborted" in detach:
+                    attempted_failure &= ~detach["aborted"].to(attempted_failure.device)
+                core = trace.get("articulation_core_result")
+                if core is not None:
+                    attempted_failure &= ~(
+                        core["executed"].to(attempted_failure.device)
+                        & ~core["success"].to(attempted_failure.device)
+                    )
+            if not bool(attempted_failure.any()):
+                break
             precondition = self._retry_precondition(node_id, attempted_failure)
             decision = self.runtime_graph.record_failure(
                 node_id,
@@ -1771,6 +1870,11 @@ class ProgramExecutor:
         self._orientation_references.clear()
         self._orientation_errors.clear()
         self._policies.clear()
+        self._core_interactions.clear()
+        self._interaction_contacts = None
+        self._interaction_clearance = None
+        self._detachment_states.clear()
+        self.grounder._clear_interaction_cleanup()
         self._entry_satisfied.clear()
         self._payload_initial.clear()
         self._support_relations.clear()
@@ -2379,6 +2483,12 @@ class ProgramExecutor:
                             f"({capability.name}).{target_detail}"
                         )
                         break
+                    if grounded.motion_policy.get(
+                        "articulation_external_cleanup", False
+                    ):
+                        # Door/drawer cleanup depends on the actual moved link and
+                        # verified opening of the hand, not a speculative scene.
+                        break
                 warnings.extend(captured)
         except Exception as exc:
             self._candidate_failures[(step.id, arm)] = f"{type(exc).__name__}: {exc}"
@@ -2952,6 +3062,606 @@ class ProgramExecutor:
             changed[env_id] = True
         return changed
 
+    def _contacts_for_interaction(self) -> _InteractionContacts:
+        if self._interaction_contacts is None:
+            targets = {
+                step.object_uid
+                for step in self.program.semantic_steps
+                if step.operator in {"slide", "open_door"}
+            }
+            self._interaction_contacts = _InteractionContacts(self.env, targets)
+        return self._interaction_contacts
+
+    def _sample_interaction_contacts(
+        self, step: SemanticStep, arm: str
+    ) -> dict[str, Any]:
+        target_link = (
+            getattr(self, "_policies", {})
+            .get(step.id, {})
+            .get("articulation_target_link_name")
+        )
+        return self._contacts_for_interaction().sample(
+            arm,
+            step.object_uid,
+            tick=self.adapter._scene_time,
+            **({"target_link": target_link} if target_link is not None else {}),
+        )
+
+    def _hand_hold_command(self, arm: str, observed: torch.Tensor) -> torch.Tensor:
+        """Preserve the measured master, but command realizable mimic joints."""
+        profile = self.adapter.gripper_profile
+        master = profile.control_joint_names("left" if arm == "left_arm" else "right")[
+            0
+        ]
+        return _commanded_gripper_qpos(
+            self.env,
+            arm,
+            profile,
+            observed[:, self.env.robot.joint_names.index(master)],
+            reference_qpos=observed,
+        )
+
+    def _withdrawal_clearance(
+        self, step: SemanticStep, arm: str, *, active: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Choose a same-arm corridor without conflating distance and IK success."""
+        key = (step.id, arm)
+        interaction = self.grounder._executed_interactions.get(key)
+        if interaction is None or interaction["object_uid"] != step.object_uid:
+            raise ValueError("Withdrawal geometry requires an executed interaction.")
+        eligible = interaction["valid"].clone()
+        if active is not None:
+            eligible &= active
+        articulation = self.env.sim.get_articulation(step.object_uid)
+        pose = articulation.get_link_pose(interaction["link"], to_matrix=True)
+        inverse = -(pose[:, :3, :3] @ interaction["direction"][:, :, None]).squeeze(-1)
+        tcp = self.env.get_current_xpos_agent()[arm != "left_arm"].detach().clone()
+        base = arm_base_poses(self.env)[arm != "left_arm"].to(tcp)
+        up = torch.zeros_like(inverse)
+        up[:, 2] = 1.0
+        directions = (
+            ("inverse_approach", inverse),
+            ("tool_back", -tcp[:, :3, 2]),
+            ("baseward", base[:, :3, 3] - tcp[:, :3, 3]),
+            ("world_up", up),
+        )
+        previous = self.grounder._departure_choices.get(key)
+        choice = (
+            deepcopy(previous)
+            if previous is not None
+            else {
+                "direction": inverse.detach().clone(),
+                "valid": torch.zeros_like(eligible),
+                "clearance": tcp.new_full(eligible.shape, float("nan")),
+                "labels": ["unresolved"] * len(eligible),
+            }
+        )
+        choice["valid"][eligible] = False
+        choice["clearance"][eligible] = float("-inf")
+        choice.setdefault(
+            "terminal_clearance", tcp.new_full(eligible.shape, float("nan"))
+        )
+        choice["terminal_clearance"][eligible] = float("-inf")
+        for row in eligible.nonzero().flatten().tolist():
+            choice["labels"][row] = "unresolved"
+        if self._interaction_clearance is None:
+            self._interaction_clearance = _InteractionClearance(self.env)
+        distance = float(
+            self.runtime_policy.grounding["semantic_defaults"]["safe_retreat_distance"]
+        )
+        current = self.env.robot.get_qpos().detach().clone()
+        hand_target = self._hand_hold_command(arm, current)
+        surface = _table_surface_z(self.env)
+        part = arm_control_part(self.env, arm)
+        joint_ids = self.env.robot.get_joint_ids(name=part)
+        attempts = []
+        for label, direction in directions:
+            if not bool(eligible.any()):
+                break
+            norms = direction.norm(dim=1, keepdim=True)
+            direction_valid = torch.isfinite(direction).all(dim=1) & (
+                norms[:, 0] > 1.0e-6
+            )
+            direction = torch.where(
+                direction_valid[:, None], direction / norms.clamp_min(1.0e-6), up
+            )
+            clearance_components: dict[str, Any] = {}
+            clearance = self._interaction_clearance.withdrawal(
+                arm,
+                step.object_uid,
+                direction=direction,
+                distance=distance,
+                hand_target_qpos=hand_target,
+                support_surface_z=surface,
+                diagnostics=clearance_components,
+            )
+            if clearance.shape != eligible.shape:
+                raise ValueError("Withdrawal clearance must contain one value per row.")
+            terminal = clearance_components["terminal_clearance"].to(clearance)
+            if terminal.shape != eligible.shape or not torch.isfinite(terminal).all():
+                raise ValueError(
+                    "Withdrawal terminal clearance must be finite and row-local."
+                )
+            geometry_valid = (
+                eligible
+                & direction_valid
+                & torch.isfinite(clearance)
+                & (clearance >= 0.003)
+            )
+            ik_valid = torch.zeros_like(eligible)
+            if bool(geometry_valid.any()):
+                endpoint = tcp.clone()
+                endpoint[:, :3, 3] += distance * direction
+                with self.adapter._isolated_random_seed(0):
+                    solved, joints = self.env.robot.compute_batch_ik(
+                        pose=endpoint[:, None],
+                        name=part,
+                        joint_seed=current[:, None, joint_ids],
+                    )
+                if solved.shape != (len(eligible), 1) or solved.dtype != torch.bool:
+                    raise ValueError("Withdrawal IK must return a (B, 1) boolean mask.")
+                ik_valid = solved[:, 0] & torch.isfinite(joints).all(dim=(1, 2))
+            valid = geometry_valid & ik_valid
+            # A numerical tie keeps the larger landing margin, not a new axis sign.
+            tied = (clearance - choice["clearance"]).abs() <= 1.0e-6
+            better = valid & (
+                ~choice["valid"]
+                | (clearance > choice["clearance"] + 1.0e-6)
+                | (tied & (terminal > choice["terminal_clearance"]))
+            )
+            best_clearance = torch.maximum(choice["clearance"], clearance)
+            choice["clearance"] = torch.where(
+                better,
+                clearance,
+                torch.where(
+                    eligible & ~choice["valid"], best_clearance, choice["clearance"]
+                ),
+            )
+            choice["terminal_clearance"][better] = terminal[better].detach()
+            choice["direction"][better] = direction[better].detach()
+            choice["valid"] |= valid
+            for row in better.nonzero().flatten().tolist():
+                choice["labels"][row] = label
+            attempts.append(
+                {
+                    "candidate": label,
+                    "attempted": eligible.clone(),
+                    "direction": direction.detach().clone(),
+                    "clearance": clearance.detach().clone(),
+                    "clearance_components": clearance_components,
+                    "geometry_valid": geometry_valid,
+                    "endpoint_ik_valid": ik_valid,
+                }
+            )
+        for attempt in attempts:
+            attempt["selected"] = (
+                choice["valid"]
+                & eligible
+                & torch.tensor(
+                    [label == attempt["candidate"] for label in choice["labels"]],
+                    device=eligible.device,
+                )
+            )
+        choice["attempts"] = attempts
+        choice["selection_strategy"] = "maximum_path_clearance_then_terminal_clearance"
+        choice["distance"] = distance
+        choice["world_collision_checked"] = False
+        self.grounder._departure_choices[key] = choice
+        return choice["clearance"].clone()
+
+    def _detachment_stop(
+        self,
+        step: SemanticStep,
+        outcomes: Mapping[str, ActionOutcome | None],
+        masks: Mapping[str, torch.Tensor],
+    ) -> Callable[[int], torch.Tensor]:
+        """Stop opening before support contact once three fresh ticks are clear."""
+        states = {}
+        for arm, outcome in outcomes.items():
+            if outcome is None or not outcome.grounded.motion_policy.get(
+                "verify_articulation_detach", False
+            ):
+                continue
+            sample = self._sample_interaction_contacts(step, arm)
+            state = {
+                "attempted": (masks[arm] & outcome.success).clone(),
+                "aborted": torch.zeros_like(masks[arm]),
+                "initial_hand_qpos": self.env.robot.get_qpos()[
+                    :,
+                    self.env.robot.get_joint_ids(
+                        name=self.env.get_agent_eef_control_part(arm == "left_arm")
+                    ),
+                ]
+                .detach()
+                .clone(),
+                "clear_count": torch.zeros_like(masks[arm], dtype=torch.int64),
+                "withdrawal_clearance_valid": torch.zeros_like(masks[arm]),
+                "seen_target_contact": sample["known"] & sample["target_contact"],
+                "sample": sample,
+                "samples": [],
+                "departure_searches": [],
+            }
+            states[arm] = state
+            self._detachment_states[(step.id, arm)] = state
+            outcome.planner_trace["articulation_detachment"] = state
+
+        def stop(waypoint_index: int) -> torch.Tensor:
+            stopped = torch.zeros(
+                int(self.env.num_envs), device=self.env.device, dtype=torch.bool
+            )
+            for arm, state in states.items():
+                sample = self._sample_interaction_contacts(step, arm)
+                hand = self.env.robot.get_qpos()[
+                    :,
+                    self.env.robot.get_joint_ids(
+                        name=self.env.get_agent_eef_control_part(arm == "left_arm")
+                    ),
+                ]
+                opened = torch.as_tensor(self.env.open_state).to(hand)
+                stroke = torch.linalg.vector_norm(
+                    torch.as_tensor(self.env.close_state).to(hand) - opened
+                )
+                initial_error = torch.linalg.vector_norm(
+                    state["initial_hand_qpos"] - opened, dim=1
+                )
+                progress = initial_error - torch.linalg.vector_norm(
+                    hand - opened, dim=1
+                )
+                moved = (progress > 1.0e-4) | (
+                    initial_error
+                    <= stroke
+                    * self.adapter.gripper_profile.release_open_fraction_tolerance
+                )
+                state["opening_progress"] = progress.detach().clone()
+                clear = (
+                    sample["known"]
+                    & ~sample["target_contact"]
+                    & ~sample["robot_world_contact"]
+                    & ~sample["obstacle_contact"]
+                    & state["attempted"]
+                    & moved
+                )
+                state["seen_target_contact"] |= (
+                    sample["known"] & sample["target_contact"]
+                )
+                state["clear_count"] = torch.where(clear, state["clear_count"] + 1, 0)
+                ready = state["clear_count"] >= 3
+                search = (
+                    ready & ~state["withdrawal_clearance_valid"] & ~state["aborted"]
+                )
+                if bool(search.any()):
+                    clearance = self._withdrawal_clearance(step, arm, active=search)
+                    choice = self.grounder._departure_choices[(step.id, arm)]
+                    state["withdrawal_clearance"] = clearance.detach().clone()
+                    state["departure_choice"] = deepcopy(choice)
+                    state["departure_searches"].append(
+                        {
+                            "waypoint_index": waypoint_index,
+                            "observed_hand_qpos": hand.detach().clone(),
+                            **deepcopy(choice),
+                        }
+                    )
+                    state["withdrawal_clearance_valid"] |= (
+                        search
+                        & choice["valid"]
+                        & torch.isfinite(clearance)
+                        & (clearance >= 0.003)
+                    )
+                state["sample"] = sample
+                state["samples"].append(
+                    {"waypoint_index": waypoint_index, **deepcopy(sample)}
+                )
+                state["aborted"] |= state["attempted"] & (
+                    ~sample["known"]
+                    | sample["obstacle_contact"]
+                    | (state["withdrawal_clearance_valid"] & sample["target_contact"])
+                    | sample.get(
+                        "non_target_robot_world_contact", torch.zeros_like(clear)
+                    )
+                )
+                stopped |= masks[arm] & (
+                    state["withdrawal_clearance_valid"] | state["aborted"]
+                )
+            return stopped
+
+        return stop
+
+    def _detachment_hold(
+        self,
+        step: SemanticStep,
+        outcomes: Mapping[str, ActionOutcome | None],
+        masks: Mapping[str, torch.Tensor],
+    ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+        """Keep normal-stop servo references; latch measured holds after hazards."""
+        states = {
+            arm: self._detachment_states[(step.id, arm)]
+            for arm, outcome in outcomes.items()
+            if outcome is not None
+            and outcome.grounded.motion_policy.get("verify_articulation_detach", False)
+        }
+
+        def hold(command: torch.Tensor, stopped: torch.Tensor) -> torch.Tensor:
+            result = command.clone()
+            observed = self.env.robot.get_qpos().detach().clone().to(command)
+            for arm, state in states.items():
+                assigned = stopped & masks[arm] & state["attempted"]
+                saved = state.setdefault(
+                    "stopped_hold_command", command.detach().clone()
+                )
+                saved_valid = state.setdefault(
+                    "stopped_hold_valid", torch.zeros_like(stopped)
+                )
+                saved_abort = state.setdefault(
+                    "stopped_hold_aborted", torch.zeros_like(stopped)
+                )
+                abort = assigned & state["aborted"] & ~saved_abort
+                normal = (
+                    assigned
+                    & state["withdrawal_clearance_valid"]
+                    & ~state["aborted"]
+                    & ~saved_valid
+                )
+                side = "left" if arm == "left_arm" else "right"
+                hand_ids = [
+                    self.env.robot.joint_names.index(name)
+                    for name in self.adapter.gripper_profile.simulated_joint_names(side)
+                ]
+                arm_ids = list(
+                    self.env.robot.get_joint_ids(name=arm_control_part(self.env, arm))
+                )
+                owned_ids = arm_ids + hand_ids
+                if bool(normal.any()):
+                    normal_command = command.clone()
+                    normal_command[:, hand_ids] = self._hand_hold_command(
+                        arm, observed
+                    )[:, hand_ids]
+                    saved[normal] = normal_command[normal]
+                saved[abort] = observed[abort]
+                saved_valid |= normal | abort
+                saved_abort |= abort
+                keep_normal = assigned & saved_valid & ~saved_abort
+                result[:, owned_ids] = torch.where(
+                    keep_normal[:, None], saved[:, owned_ids], result[:, owned_ids]
+                )
+                keep_abort = assigned & saved_abort
+                result[keep_abort] = saved[keep_abort]
+            return result
+
+        return hold
+
+    def _verify_articulation_detachment(
+        self, step: SemanticStep, arm: str, outcome: ActionOutcome
+    ) -> torch.Tensor:
+        state = self._detachment_states.get((step.id, arm))
+        if state is None:
+            return torch.zeros(
+                int(self.env.num_envs), device=self.env.device, dtype=torch.bool
+            )
+        sample = state["sample"]
+        clear = (
+            (state["clear_count"] >= 3)
+            & state["withdrawal_clearance_valid"]
+            & sample["known"]
+            & ~sample["robot_world_contact"]
+            & ~sample["obstacle_contact"]
+            & ~sample["target_contact"]
+            & state["attempted"]
+            & ~state["aborted"]
+        )
+        part = self.env.get_agent_eef_control_part(arm == "left_arm")
+        observed = self.env.robot.get_qpos().detach().clone()
+        hand_ids = self.env.robot.get_joint_ids(name=part)
+        hand = observed[:, hand_ids].clone()
+        command = self._hand_hold_command(arm, observed)[:, hand_ids]
+        state["observed_hand_qpos"] = hand
+        state["commanded_hand_qpos"] = command.clone()
+        state["detached"] = clear & state["seen_target_contact"]
+        state["clear_at_entry_without_observed_contact"] = (
+            clear & ~state["seen_target_contact"]
+        )
+        previous = self.grounder._detached_hands.get((step.id, arm), hand)
+        self.grounder._detached_hands[(step.id, arm)] = torch.where(
+            clear[:, None], command, previous
+        )
+        return clear
+
+    def _core_contact_stop(
+        self,
+        step: SemanticStep,
+        outcomes: Mapping[str, ActionOutcome | None],
+        masks: Mapping[str, torch.Tensor],
+    ) -> tuple[Callable[[int], torch.Tensor], torch.Tensor]:
+        """Allow intended handle contact, but stop on other world contact or unknown data."""
+        aborted = torch.zeros(
+            int(self.env.num_envs), device=self.env.device, dtype=torch.bool
+        )
+        traces = {}
+        for arm, outcome in outcomes.items():
+            if outcome is None:
+                continue
+            trace = {
+                "aborted": torch.zeros_like(aborted),
+                "failure_reason": [None] * int(self.env.num_envs),
+                "first_failure": [None] * int(self.env.num_envs),
+                "sample_count": 0,
+                "scope": "robot_world_except_selected_hand_target_link",
+                "continuous_collision_checked": False,
+            }
+            traces[arm] = trace
+            outcome.planner_trace["articulation_core_contact_guard"] = trace
+
+        def stop(waypoint_index: int) -> torch.Tensor:
+            for arm, trace in traces.items():
+                sample = self._sample_interaction_contacts(step, arm)
+                unsafe = (
+                    (
+                        ~sample["known"]
+                        | sample["obstacle_contact"]
+                        | sample["non_target_robot_world_contact"]
+                    )
+                    & masks[arm]
+                    & outcomes[arm].success
+                )
+                for row in torch.nonzero(unsafe & ~trace["aborted"]).flatten().tolist():
+                    trace["failure_reason"][row] = (
+                        "world_contact"
+                        if bool(sample["known"][row])
+                        else "contact_observation_unknown"
+                    )
+                    trace["first_failure"][row] = {
+                        "waypoint_index": waypoint_index,
+                        "observation_tick": self.adapter._scene_time,
+                        "control_command_index": trace["sample_count"],
+                        "known": bool(sample["known"][row]),
+                        "pairs": deepcopy(sample["pairs"][row]),
+                    }
+                trace["sample_count"] += 1
+                trace["aborted"] |= unsafe
+                aborted.logical_or_(unsafe)
+            return aborted
+
+        return stop, aborted
+
+    def _cleanup_contact_stop(
+        self,
+        step: SemanticStep,
+        outcomes: Mapping[str, ActionOutcome | None],
+        masks: Mapping[str, torch.Tensor],
+    ) -> tuple[Callable[[int], torch.Tensor], torch.Tensor]:
+        """Observe release/withdrawal without turning collision into success."""
+        aborted = torch.zeros(
+            int(self.env.num_envs), device=self.env.device, dtype=torch.bool
+        )
+        traces = {
+            arm: {
+                "samples": [],
+                "aborted": torch.zeros_like(aborted),
+                "failure_reason": [None] * int(self.env.num_envs),
+            }
+            for arm, outcome in outcomes.items()
+            if outcome is not None
+        }
+        for arm, trace in traces.items():
+            outcomes[arm].planner_trace["articulation_cleanup_guard"] = trace
+        planned_tcp = {
+            arm: self.adapter._arm_trajectory_fk(
+                outcomes[arm].trajectory,
+                arm_control_part(self.env, arm),
+            )[0]
+            for arm in traces
+        }
+
+        def stop(waypoint_index: int) -> torch.Tensor:
+            for arm, trace in traces.items():
+                outcome = outcomes[arm]
+                sample = self._sample_interaction_contacts(step, arm)
+                tcp = self.env.get_current_xpos_agent()[0 if arm == "left_arm" else 1]
+                reference_tcp = planned_tcp[arm][
+                    :, min(waypoint_index, planned_tcp[arm].shape[1] - 1)
+                ]
+                position_error = torch.linalg.vector_norm(
+                    tcp[:, :3, 3] - reference_tcp[:, :3, 3], dim=1
+                )
+                relative_rotation = (
+                    tcp[:, :3, :3].transpose(1, 2) @ reference_tcp[:, :3, :3]
+                )
+                rotation_error = torch.acos(
+                    (
+                        (relative_rotation.diagonal(dim1=-2, dim2=-1).sum(1) - 1) / 2
+                    ).clamp(-1, 1)
+                )
+                unsafe = (
+                    ~sample["known"]
+                    | sample["target_contact"]
+                    | sample["obstacle_contact"]
+                    | sample["robot_world_contact"]
+                    | ~torch.isfinite(tcp).all(dim=(1, 2))
+                )
+                hold = outcome.grounded.motion_policy.get("articulation_hand_hold_qpos")
+                tracking_error = None
+                if hold is not None:
+                    part = self.env.get_agent_eef_control_part(arm == "left_arm")
+                    hand = self.env.robot.get_qpos()[
+                        :, self.env.robot.get_joint_ids(name=part)
+                    ]
+                    tracking_error = torch.linalg.vector_norm(
+                        hand - torch.as_tensor(hold).to(hand), dim=1
+                    )
+                    stroke = torch.linalg.vector_norm(
+                        torch.as_tensor(self.env.close_state).to(hand)
+                        - torch.as_tensor(self.env.open_state).to(hand)
+                    )
+                    unsafe |= ~torch.isfinite(tracking_error) | (
+                        tracking_error
+                        > stroke
+                        * self.adapter.gripper_profile.release_open_fraction_tolerance
+                    )
+                core = self._core_interactions.get((step.id, arm))
+                error = None
+                if core is not None:
+                    observation = self._action_execution_observation(
+                        step.object_uid,
+                        grounded=replace(
+                            outcome.grounded, motion_policy=self._policies[step.id]
+                        ),
+                    )
+                    target = torch.as_tensor(
+                        [0.0 if value is None else value for value in core["target"]]
+                    ).to(self.env.device)
+                    error = torch.abs(observation["articulation_qpos"] - target)
+                    unsafe |= core["success"] & (
+                        ~torch.isfinite(error) | (error > core["tolerance"])
+                    )
+                unsafe &= masks[arm] & outcome.success
+                for row in (
+                    torch.nonzero(unsafe & ~trace["aborted"], as_tuple=False)
+                    .flatten()
+                    .tolist()
+                ):
+                    trace["failure_reason"][row] = (
+                        "contact_observation_unknown"
+                        if not bool(sample["known"][row])
+                        else (
+                            "target_contact_reappeared"
+                            if bool(sample["target_contact"][row])
+                            else (
+                                "world_contact"
+                                if bool(
+                                    sample["obstacle_contact"][row]
+                                    | sample["robot_world_contact"][row]
+                                )
+                                else (
+                                    "hand_posture_tracking_failed"
+                                    if tracking_error is not None
+                                    and (
+                                        not bool(torch.isfinite(tracking_error[row]))
+                                        or float(tracking_error[row])
+                                        > float(stroke)
+                                        * self.adapter.gripper_profile.release_open_fraction_tolerance
+                                    )
+                                    else "articulation_target_lost"
+                                )
+                            )
+                        )
+                    )
+                aborted.logical_or_(unsafe)
+                trace["aborted"] |= unsafe
+                trace["samples"].append(
+                    {
+                        "waypoint_index": waypoint_index,
+                        "hand_tracking_error": tracking_error,
+                        "articulation_target_error": error,
+                        "observed_tcp": tcp.detach().clone(),
+                        "planned_tcp": reference_tcp.detach().clone(),
+                        "tcp_position_tracking_error": position_error.detach().clone(),
+                        "tcp_rotation_tracking_error": rotation_error.detach().clone(),
+                        **deepcopy(sample),
+                    }
+                )
+            return aborted
+
+        return stop, aborted
+
     def _execute_edge(
         self,
         edge: ExecutionEdge,
@@ -3195,6 +3905,19 @@ class ProgramExecutor:
                     friction_transitions.append(holding_transition)
 
         execute_kwargs: dict[str, Any] = {"active": active}
+        core_initial = {
+            arm: self._action_execution_observation(
+                step.object_uid, grounded=outcome.grounded
+            )["articulation_qpos"]
+            .detach()
+            .clone()
+            for arm, outcome in outcomes.items()
+            if outcome is not None
+            and interaction_kind in {"slide", "open_door"}
+            and outcome.grounded.motion_policy.get(
+                "articulation_external_cleanup", False
+            )
+        }
         if (
             observation_points
             or motion_waypoint is not None
@@ -3203,10 +3926,55 @@ class ProgramExecutor:
             execute_kwargs["waypoint_observer"] = observe_waypoint
         if progress_gate is not None:
             execute_kwargs["waypoint_progress_gate"] = progress_gate
+        if any(
+            item.motion_policy.get("verify_articulation_detach", False)
+            for item in grounded_items
+        ):
+            execute_kwargs["waypoint_stop"] = self._detachment_stop(
+                step, outcomes, masks
+            )
+            execute_kwargs["waypoint_stop_hold"] = self._detachment_hold(
+                step, outcomes, masks
+            )
+        cleanup_aborted = torch.zeros_like(active)
+        core_aborted = torch.zeros_like(active)
+        if core_initial:
+            execute_kwargs["waypoint_stop"], core_aborted = self._core_contact_stop(
+                step, outcomes, {arm: mask & active for arm, mask in masks.items()}
+            )
+            execute_kwargs["flush_stop_hold"] = True
+        if any(
+            item.motion_policy.get("articulation_hand_hold_qpos") is not None
+            or item.motion_policy.get("articulation_release_mode") == "fully_open"
+            for item in grounded_items
+        ):
+            execute_kwargs["waypoint_stop"], cleanup_aborted = (
+                self._cleanup_contact_stop(step, outcomes, masks)
+            )
         actions = self.adapter.execute_trajectory(
             trajectory,
             **execute_kwargs,
         )
+        if core_initial and actions:
+            for outcome in outcomes.values():
+                if outcome is not None:
+                    guard = outcome.planner_trace.get("articulation_core_contact_guard")
+                    if guard is not None and bool(guard["aborted"].any()):
+                        guard["last_emitted_command"] = actions[-1].detach().clone()
+                        guard["abort_hold_dispatched"] = guard["aborted"].clone()
+        if step.postcondition.get("type") == "articulation_joint_near":
+            observation = self._action_execution_observation(
+                step.object_uid,
+                grounded=replace(
+                    grounded_items[0], motion_policy=self._policies[step.id]
+                ),
+            )
+            for outcome in outcomes.values():
+                if outcome is not None:
+                    outcome.planner_trace["post_action_observation"] = observation
+                    outcome.planner_trace["articulation_gravity_contract"] = deepcopy(
+                        self._interaction_gravity.get(step.object_uid)
+                    )
         if progress_gate is not None:
             for outcome in outcomes.values():
                 if outcome is not None:
@@ -3225,10 +3993,58 @@ class ProgramExecutor:
                     outcome.planner_trace["execution_observations"] = (
                         execution_observations
                     )
-        physical_failed = torch.zeros_like(failed)
+        physical_failed = cleanup_aborted | core_aborted
         for arm, outcome in outcomes.items():
             if outcome is not None:
-                successful = masks[arm] & outcome.success & active
+                attempted = masks[arm] & outcome.success & active
+                successful = attempted & ~cleanup_aborted & ~core_aborted
+                if arm in core_initial:
+                    policy = outcome.grounded.motion_policy
+                    observed = self._action_execution_observation(
+                        step.object_uid, grounded=outcome.grounded
+                    )["articulation_qpos"]
+                    evidence = _joint_motion_evidence(
+                        initial=core_initial[arm],
+                        target=torch.as_tensor(policy["articulation_target_qpos"]).to(
+                            observed
+                        ),
+                        observed=observed,
+                        executed=attempted,
+                        tolerance=float(policy["postcondition_tolerance"]),
+                    )
+                    evidence.update(
+                        {
+                            "joint_motion_success": evidence["success"].clone(),
+                            "safety_aborted": (core_aborted & attempted).clone(),
+                            "joint_name": policy["articulation_joint_name"],
+                            "target_link_name": policy["articulation_target_link_name"],
+                            "object_uid": step.object_uid,
+                            "arm": arm,
+                        }
+                    )
+                    evidence["success"] &= ~core_aborted
+                    outcome.planner_trace["articulation_core_result"] = evidence
+                    key = (step.id, arm)
+                    previous = self._core_interactions.get(key)
+                    frozen = deepcopy(evidence)
+                    if previous is not None:
+                        for name, value in frozen.items():
+                            if isinstance(value, torch.Tensor):
+                                frozen[name] = torch.where(
+                                    attempted, value, previous[name]
+                                )
+                            elif isinstance(value, list):
+                                frozen[name] = [
+                                    (
+                                        item
+                                        if bool(attempted[row])
+                                        else previous[name][row]
+                                    )
+                                    for row, item in enumerate(value)
+                                ]
+                    self._core_interactions[key] = frozen
+                    physical_failed |= attempted & ~evidence["success"]
+                    successful &= evidence["success"]
                 if capability.state_effect == "hold":
                     physical = self._physical_pickup(
                         step.object_uid, arm, outcome.next_state, successful
@@ -3262,6 +4078,21 @@ class ProgramExecutor:
                         )
                     physical_failed |= successful & ~verified
                     successful &= verified
+                    if (
+                        outcome.grounded.motion_policy.get("articulation_release_mode")
+                        == "fully_open"
+                    ):
+                        key = (step.id, arm)
+                        hand = self.grounder._detached_hands.get(key)
+                        if hand is not None:
+                            opened = (
+                                torch.as_tensor(self.env.open_state)
+                                .to(hand)
+                                .expand_as(hand)
+                            )
+                            self.grounder._detached_hands[key] = torch.where(
+                                successful[:, None], opened, hand
+                            )
                 committed_state = outcome.state_after(successful)
                 if capability.state_effect in {"hold", "preserve_hold"}:
                     committed_state = self._rebase_held_state(
@@ -3272,6 +4103,12 @@ class ProgramExecutor:
                         from_planned_qpos=capability.state_effect == "preserve_hold",
                     )
                 self._step_states[(step.id, arm)] = committed_state
+                if outcome.grounded.motion_policy.get(
+                    "articulation_external_cleanup", False
+                ):
+                    self.grounder._record_executed_interaction(
+                        step.id, outcome.grounded, masks[arm] & outcome.success & active
+                    )
                 if bool(outcome.grounded.motion_policy.get("single_release", False)):
                     self._release_ownership(step.object_uid, arm, successful)
                 else:
@@ -3601,7 +4438,8 @@ class ProgramExecutor:
         }
 
         def needs_repeat(waypoint_index: int) -> torch.Tensor:
-            fraction = float(waypoint_index - start + 1) / float(stop - start)
+            # MotionGenerator includes the observed start as its first sample.
+            fraction = float(waypoint_index - start) / float(stop - start - 1)
             expected = initial + (target - initial) * fraction
             observed = _effective_joint_position(
                 articulation,
@@ -5069,6 +5907,16 @@ class ProgramExecutor:
                 item["arrangement"] = arrangement.metadata(step, env_id)
             if articulation_state is not None:
                 item["articulation_state"] = articulation_state
+            core = self._core_interactions.get((step.id, assignment))
+            if core is not None:
+                item["articulation_core_result"] = {
+                    name: (
+                        value[env_id]
+                        if isinstance(value, (list, torch.Tensor))
+                        else value
+                    )
+                    for name, value in core.items()
+                }
             result.append(item)
         return result
 

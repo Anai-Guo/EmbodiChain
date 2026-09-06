@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, replace
 import math
 from typing import Any
@@ -63,6 +64,7 @@ from embodichain.lab.sim.atomic_actions import (
     TwistGoal,
 )
 from embodichain.utils.logger import log_info
+from embodichain.lab.sim.atomic_actions.trajectory_ops import axis_translation_keyframes
 
 from .articulation import (
     _active_joint_candidates,
@@ -717,6 +719,132 @@ class ActionGrounder:
         self._interaction_geometry_cache: dict[
             tuple[str, str, str | None], dict[str, torch.Tensor]
         ] = {}
+        self._executed_interactions: dict[tuple[str, str], dict[str, Any]] = {}
+        self._departure_choices: dict[tuple[str, str], dict[str, Any]] = {}
+        self._departure_anchors: dict[tuple[str, str], dict[str, torch.Tensor]] = {}
+        self._detached_hands: dict[tuple[str, str], torch.Tensor] = {}
+
+    def _clear_interaction_cleanup(self) -> None:
+        self._executed_interactions.clear()
+        self._departure_choices.clear()
+        self._departure_anchors.clear()
+        self._detached_hands.clear()
+
+    def _record_executed_interaction(
+        self,
+        step_id: str,
+        grounded: GroundedAction,
+        active: torch.Tensor,
+    ) -> None:
+        """Retain approach provenance only for rows whose interaction ran."""
+        policy = grounded.motion_policy
+        direction = policy.get("articulation_approach_direction_local")
+        if direction is None or not bool(active.any()):
+            return
+        direction = torch.as_tensor(
+            direction, device=self.env.device, dtype=torch.float32
+        )
+        if (
+            direction.shape != (int(self.env.num_envs), 3)
+            or not torch.isfinite(direction).all()
+        ):
+            raise ValueError(
+                "Interaction approach must contain one finite vector per environment."
+            )
+        norms = torch.linalg.vector_norm(direction, dim=1, keepdim=True)
+        if bool((norms <= 1.0e-6).any()):
+            raise ValueError("Interaction approach must be non-zero.")
+        key = (step_id, grounded.arm)
+        previous = self._executed_interactions.get(key)
+        direction = direction / norms
+        valid = active.clone()
+        if previous is not None:
+            direction = torch.where(active[:, None], direction, previous["direction"])
+            valid |= previous["valid"]
+        self._executed_interactions[key] = {
+            "direction": direction.detach().clone(),
+            "valid": valid,
+            "object_uid": grounded.object_uid,
+            "link": policy["articulation_target_link_name"],
+        }
+        # Re-execution invalidates anchors only for the affected rows.
+        anchor = self._departure_anchors.get(key)
+        if anchor is not None:
+            anchor["valid"][active] = False
+        choice = self._departure_choices.get(key)
+        if choice is not None:
+            choice["valid"][active] = False
+
+    def _articulation_departure_target(
+        self,
+        step: SemanticStep,
+        arm: str,
+        reference: torch.Tensor,
+        policy: dict[str, Any],
+    ) -> torch.Tensor:
+        """Freeze the selected departure endpoint, rather than on each retry."""
+        key = (step.id, arm)
+        interaction = self._executed_interactions.get(key)
+        if interaction is None or interaction["object_uid"] != step.object_uid:
+            raise ValueError(
+                "Articulation departure requires an executed interaction for this arm."
+            )
+        articulation = _scene_entity(self.env.sim, step.object_uid)
+        pose = _batched_pose(
+            articulation.get_link_pose(interaction["link"], to_matrix=True), self.env
+        )
+        direction = -torch.matmul(
+            pose[:, :3, :3], interaction["direction"][:, :, None]
+        ).squeeze(-1)
+        choice = self._departure_choices.get(key)
+        valid = interaction["valid"].clone()
+        if choice is not None:
+            direction = choice["direction"]
+            valid &= choice["valid"]
+            policy["articulation_departure_choice"] = deepcopy(choice)
+        elif key in self._detached_hands:
+            raise ValueError("Staged detachment requires a validated departure choice.")
+        # Legacy full-open cleanup retains its original inverse-approach route.
+        anchor = self._departure_anchors.setdefault(
+            key,
+            {
+                "pose": reference.clone(),
+                "direction": direction.clone(),
+                "valid": torch.zeros_like(interaction["valid"]),
+            },
+        )
+        new_rows = valid & ~anchor["valid"]
+        distance = float(
+            self.runtime_policy.grounding["semantic_defaults"]["safe_retreat_distance"]
+        )
+        proposed = reference.clone()
+        proposed[:, :3, 3] += direction * distance
+        anchor["pose"][new_rows] = proposed[new_rows].detach()
+        anchor["direction"][new_rows] = direction[new_rows].detach()
+        anchor["valid"] |= new_rows
+        target = torch.where(valid[:, None, None], anchor["pose"], reference).clone()
+        direction = anchor["direction"]
+        policy.update(
+            {
+                "articulation_departure_direction_world": direction.detach().clone(),
+                "articulation_departure_approach_local": interaction[
+                    "direction"
+                ].clone(),
+                "articulation_departure_target_pose": target.clone(),
+                "articulation_departure_target_link": interaction["link"],
+                "articulation_departure_valid": valid,
+            }
+        )
+        # Only the latest start position changes on retry; the original endpoint
+        # and wrist orientation remain fixed, preventing cumulative retreat.
+        start = reference.clone()
+        start[:, :3, :3] = target[:, :3, :3]
+        displacement = target[:, :3, 3] - start[:, :3, 3]
+        norm = torch.linalg.vector_norm(displacement, dim=1, keepdim=True)
+        axis = torch.where(
+            norm > 1.0e-6, displacement / norm.clamp_min(1.0e-6), direction
+        )
+        return axis_translation_keyframes(start, target, axis, n_waypoints=5)
 
     def policy(
         self,
@@ -765,9 +893,35 @@ class ActionGrounder:
         kind = str(binding.get("kind", ""))
         orientation = compile_orientation_constraint(step.goal)
         policy = self.policy(action)
+        if (
+            binding.get("articulation_cleanup", False)
+            or binding.get("operation") == "articulation_disengage"
+        ):
+            policy["articulation_keep_hand_open"] = True
+            hand_hold = self._detached_hands.get((step.id, arm))
+            if hand_hold is not None:
+                policy["articulation_hand_hold_qpos"] = hand_hold.clone()
         if kind == "joint_state":
             joint_defaults = self.runtime_policy.grounding["joint_state"]
             source = binding.get("source")
+            if binding.get("operation") == "articulation_release":
+                policy["verify_articulation_release"] = True
+            if binding.get("operation") in {
+                "articulation_detach",
+                "articulation_full_open",
+            }:
+                detach = binding["operation"] == "articulation_detach"
+                policy[
+                    (
+                        "verify_articulation_detach"
+                        if detach
+                        else "verify_articulation_release"
+                    )
+                ] = True
+                policy["articulation_release_mode"] = (
+                    "detach" if detach else "fully_open"
+                )
+                policy["interaction_support_surface_z"] = _table_surface_z(self.env)
             if bool(binding.get("single_release", False)):
                 policy["single_release"] = True
             if source == "gripper_closed":
@@ -917,6 +1071,11 @@ class ActionGrounder:
             policy.setdefault("rotate_angle", math.pi / 2.0)
             target = PourGoal()
         elif kind == "articulation_goal":
+            external_cleanup = binding.get("external_cleanup", False)
+            if type(external_cleanup) is not bool:
+                raise TypeError("external_cleanup must be a boolean.")
+            if external_cleanup:
+                policy["articulation_external_cleanup"] = True
             if capability.target_materializer == "slide":
                 target, policy = self._slide_target(step, arm, policy)
             elif capability.target_materializer == "open_door":
@@ -1018,8 +1177,33 @@ class ActionGrounder:
                 arm,
                 reference_eef_pose,
             )
-            if operation == "safe_retreat":
+            if operation in {"safe_retreat", "articulation_disengage"}:
                 retreat_reference = self._retreat_reference_pose(arm, None)
+                if operation == "articulation_disengage" or binding.get(
+                    "interaction"
+                ) in {"slide", "open_door"}:
+                    policy["articulation_support_audit"] = True
+                    policy["interaction_support_surface_z"] = _table_surface_z(self.env)
+            if operation == "articulation_disengage":
+                keyframes = self._articulation_departure_target(
+                    step, arm, retreat_reference, policy
+                )
+                policy.update(
+                    {
+                        "collision_safety": "required",
+                        "clearance_object_uid": step.object_uid,
+                        "verify_lift_clear": True,
+                    }
+                )
+                return GroundedAction(
+                    action_class=action_class,
+                    arm=arm,
+                    control=control,
+                    target=EndEffectorPoseGoal(xpos=keyframes),
+                    cfg=policy,
+                    motion_policy=policy,
+                    object_uid=step.object_uid,
+                )
             if operation == "interaction_staging":
                 interaction = str(binding.get("interaction", ""))
                 policy["collision_safety"] = "required"

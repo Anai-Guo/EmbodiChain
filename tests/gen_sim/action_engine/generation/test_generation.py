@@ -490,6 +490,82 @@ def test_fast_gym_config_has_runnable_franka_contract(gym_export: Path) -> None:
     ] == [7, 15]
 
 
+@pytest.mark.parametrize("external_cleanup", [False, True])
+def test_open_door_solver_budget_is_scoped_to_resolved_core_action(external_cleanup):
+    from embodichain.gen_sim.action_engine.generation import config_builder
+
+    config = {
+        "robot": {"drive_pros": {"stiffness": {"left_arm": 10000}}},
+        "articulation": [{"uid": "door", "fpath": "/fixture/door.usdc"}],
+    }
+    graph = {
+        "nodes": [
+            {
+                "atomic_action": "OpenDoor",
+                "object_uid": "door",
+                "target_binding": {"external_cleanup": external_cleanup},
+            }
+        ]
+    }
+    config_builder._apply_open_door_solver_budget(
+        config, graph, gripper_model="robotiq"
+    )
+    assert config["robot"]["min_position_iters"] == 32
+    assert config["robot"]["min_velocity_iters"] == 8
+    assert config["robot"]["drive_pros"] == {"stiffness": {"left_arm": 10000}}
+
+
+@pytest.mark.parametrize(
+    "action,source,gripper",
+    [
+        ("Slide", "door.usdc", "robotiq"),
+        ("Grasp", "door.usdc", "robotiq"),
+        ("OpenDoor", "door.urdf", "robotiq"),
+        ("OpenDoor", "door.usdc", "pgi"),
+    ],
+)
+def test_open_door_solver_budget_leaves_other_contracts_unchanged(
+    action, source, gripper
+):
+    from copy import deepcopy
+    from embodichain.gen_sim.action_engine.generation import config_builder
+
+    config = {"robot": {}, "articulation": [{"uid": "door", "fpath": source}]}
+    original = deepcopy(config)
+    graph = {"nodes": [{"atomic_action": action, "object_uid": "door"}]}
+    config_builder._apply_open_door_solver_budget(config, graph, gripper_model=gripper)
+    assert config == original
+
+
+def test_open_door_solver_budget_does_not_lower_existing_precision():
+    from embodichain.gen_sim.action_engine.generation import config_builder
+
+    config = {
+        "robot": {"min_position_iters": 64, "min_velocity_iters": 16},
+        "articulation": [{"uid": "door", "fpath": "door.usdc"}],
+    }
+    graph = {"nodes": [{"atomic_action": "OpenDoor", "object_uid": "door"}]}
+    config_builder._apply_open_door_solver_budget(
+        config, graph, gripper_model="robotiq"
+    )
+    assert config["robot"] == {"min_position_iters": 64, "min_velocity_iters": 16}
+
+
+def test_open_door_solver_budget_requires_the_bound_object_to_be_usd():
+    config = {
+        "robot": {},
+        "articulation": [
+            {"uid": "unused_usd", "fpath": "unused.usdc"},
+            {"uid": "used_urdf", "fpath": "door.urdf"},
+        ],
+    }
+    graph = {"nodes": [{"atomic_action": "OpenDoor", "object_uid": "used_urdf"}]}
+    config_builder_module._apply_open_door_solver_budget(
+        config, graph, gripper_model="robotiq"
+    )
+    assert config["robot"] == {}
+
+
 def test_fast_gym_config_normalizes_usdc_articulation_runtime_fields(
     gym_export: Path,
 ) -> None:
@@ -1564,6 +1640,14 @@ def test_generation_calls_interpreter_recipe_and_renderer_once(
     recipe_calls: list[tuple[object, object]] = []
     rendered: dict[str, object] = {}
     published: dict[str, object] = {}
+    budgets = []
+    resolve_budget = generator._apply_open_door_solver_budget
+
+    def capture_budget(config, program, *, gripper_model):
+        budgets.append((config, program, gripper_model))
+        resolve_budget(config, program, gripper_model=gripper_model)
+
+    monkeypatch.setattr(generator, "_apply_open_door_solver_budget", capture_budget)
 
     def fake_interpret_and_ground(**kwargs):
         planner_call.update(kwargs)
@@ -1603,6 +1687,7 @@ def test_generation_calls_interpreter_recipe_and_renderer_once(
 
     def capture_writer(*args, **kwargs):
         published["program"] = kwargs["seed_task_graph"]
+        published["gym_config"] = kwargs["gym_config"]
         return real_writer(*args, **kwargs)
 
     monkeypatch.setattr(generator, "write_generation_artifacts", capture_writer)
@@ -1632,8 +1717,12 @@ def test_generation_calls_interpreter_recipe_and_renderer_once(
     }
     assert paths.seed_task_graph_png.read_bytes() == b"\x89PNG\r\n\x1a\nseed"
     assert rendered["program"] is published["program"]
+    assert len(budgets) == 1
+    assert budgets[0][0] is published["gym_config"]
+    assert budgets[0][1] is published["program"]
 
     agent_config = json.loads(paths.agent_config.read_text(encoding="utf-8"))
+    assert budgets[0][2] == agent_config["gripper_model"]
     assert agent_config["schema_version"] == "action_engine_config_v3"
     assert agent_config["task_spec"] == "task_spec.json"
     assert agent_config["scene_requirements"] == "scene_requirements.json"

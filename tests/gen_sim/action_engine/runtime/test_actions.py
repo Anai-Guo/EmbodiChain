@@ -465,6 +465,119 @@ def _planner_env(
     )
 
 
+def test_articulation_hand_action_keeps_existing_arm_command() -> None:
+    from .test_staged_articulation_release import _env, _grounded
+
+    env = _env()
+    adapter = AtomicActionAdapter(env)
+    grounded = _grounded("detach")
+    commanded = torch.tensor([[0.1, -0.2], [0.3, -0.4]])
+    grounded.motion_policy["articulation_arm_hold_qpos"] = commanded
+    positions = env.robot.qpos[:, None].repeat(1, 5, 1)
+    before = positions.clone()
+    plan = SimpleNamespace(joint_trajectory=SimpleNamespace(positions=positions))
+
+    result = adapter._positions_with_agent_holds(
+        plan, grounded, SimpleNamespace(state_effect=None)
+    )
+
+    torch.testing.assert_close(
+        result[:, :, [0, 2]], commanded[:, None].expand(-1, 5, -1)
+    )
+    torch.testing.assert_close(positions, before)
+    torch.testing.assert_close(env.robot.qpos, before[:, 0])
+
+
+@pytest.mark.parametrize("action_class", ["Slide", "OpenDoor"])
+def test_external_cleanup_does_not_change_core_grasp_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    action_class: str,
+) -> None:
+    env = _planner_env()
+    env.get_current_xpos_agent = lambda: (torch.eye(4)[None], torch.eye(4)[None])
+    adapter = AtomicActionAdapter(env)
+    calls = []
+    points = _cuboid_vertices(0.03, 0.04, 0.1)
+    monkeypatch.setattr(
+        adapter,
+        "_interaction_release_geometry",
+        lambda arm: calls.append(arm) or points,
+        raising=False,
+    )
+    contexts = []
+
+    class Generator:
+        def interaction_selection_context(self, **kwargs):
+            contexts.append(kwargs)
+            return nullcontext()
+
+    monkeypatch.setattr(actions, "_TracingAntipodalGraspPoseGenerator", Generator)
+    engine = SimpleNamespace(grasp_pose_generators={"physical_left_eef": Generator()})
+    candidate = GroundedAction(
+        action_class,
+        "left_arm",
+        "arm",
+        None,
+        {},
+        motion_policy={
+            "interaction_grasp_candidate_rank": 0,
+            "interaction_support_surface_z": 0.7,
+            "articulation_external_cleanup": True,
+        },
+    )
+    for enabled in (False, True):
+        candidate.motion_policy["articulation_external_cleanup"] = enabled
+        with adapter._interaction_grasp_selection_context(
+            engine, candidate, adapter.capabilities.get(action_class)
+        ):
+            pass
+    assert calls == []
+    assert all(context.get("release_sweep_points") is None for context in contexts)
+    assert all(
+        context["pair_depth_variants"] == (action_class == "OpenDoor")
+        for context in contexts
+    )
+    assert all(
+        context["prefer_unmodified_roll"] == (action_class == "OpenDoor")
+        for context in contexts
+    )
+    assert contexts[0].keys() == contexts[1].keys()
+    for key in contexts[0]:
+        if isinstance(contexts[0][key], torch.Tensor):
+            torch.testing.assert_close(contexts[0][key], contexts[1][key])
+        else:
+            assert contexts[0][key] == contexts[1][key]
+
+
+def test_waypoint_stop_holds_observed_rows_and_does_not_mutate_active_mask() -> None:
+    adapter = object.__new__(AtomicActionAdapter)
+    adapter.num_envs = 2
+    adapter._scene_time = 0.0
+    qpos = torch.zeros(2, 1)
+    commands = []
+
+    def step(command):
+        commands.append(command.clone())
+        qpos.copy_(command + 0.1)
+
+    adapter.env = SimpleNamespace(
+        robot=SimpleNamespace(get_qpos=lambda: qpos), step=step, physics_dt=0.01
+    )
+    trajectory = torch.arange(5.0)[None, :, None].repeat(2, 1, 1)
+    active = torch.ones(2, dtype=torch.bool)
+    result = adapter.execute_trajectory(
+        trajectory,
+        active=active,
+        waypoint_stop=lambda index: torch.tensor([index >= 1, index >= 3]),
+    )
+    assert len(result) == 4
+    assert active.tolist() == [True, True]
+    assert commands[2][0, 0] == pytest.approx(1.1)
+    assert commands[3][0, 0] == pytest.approx(1.1)
+    assert commands[3][1, 0] == pytest.approx(3.0)
+    assert adapter.execute_trajectory(trajectory, active=~active) == []
+
+
 def test_semantics_builds_one_mesh_only_affordance() -> None:
     entity = _MeshEntity()
     env = SimpleNamespace(
@@ -1050,7 +1163,8 @@ def test_articulation_release_restores_the_fully_open_gripper_state() -> None:
 
     torch.testing.assert_close(result[0, 1, 1:], torch.tensor([0.7, -0.7]))
     torch.testing.assert_close(result[0, 2, 1:], torch.tensor([0.0, 0.0]))
-    torch.testing.assert_close(result[0, 3], positions[0, 3])
+    torch.testing.assert_close(result[0, 3, 1:], torch.tensor([0.0, 0.0]))
+    torch.testing.assert_close(result[:, :, 0], positions[:, :, 0])
 
     door_plan = SimpleNamespace(
         segments=(
@@ -1084,6 +1198,85 @@ def test_articulation_release_restores_the_fully_open_gripper_state() -> None:
         capability=SimpleNamespace(target_materializer="open_door"),
     )
     assert door_with_retract.shape == positions.shape
+
+
+@pytest.mark.parametrize(
+    ("kind", "release"), [("slide", "open"), ("open_door", "release")]
+)
+def test_external_cleanup_defers_internal_release_and_retreat(
+    kind: str, release: str
+) -> None:
+    adapter = object.__new__(AtomicActionAdapter)
+    positions = torch.arange(30, dtype=torch.float32).reshape(1, 10, 3)
+    grounded = GroundedAction(
+        action_class="unused",
+        arm="left_arm",
+        control="arm",
+        target=None,
+        cfg={},
+        motion_policy={"articulation_external_cleanup": True},
+    )
+    result = adapter._with_full_articulation_release(
+        positions,
+        grounded=grounded,
+        capability=SimpleNamespace(target_materializer=kind),
+        plan=SimpleNamespace(
+            segments=(SimpleNamespace(name=release, start=5, stop=8),)
+        ),
+    )
+    torch.testing.assert_close(result, positions[:, :5])
+
+
+@pytest.mark.parametrize("arm", ["left_arm", "right_arm"])
+def test_articulation_departure_rejects_only_rows_without_executed_provenance(
+    monkeypatch: pytest.MonkeyPatch, arm: str
+) -> None:
+    adapter = AtomicActionAdapter(_planner_env())
+    entry_qpos = torch.zeros(2, 8)
+    terminal_qpos = torch.ones_like(entry_qpos)
+    trajectory = TimedTrajectory.from_uniform_step(
+        torch.stack((entry_qpos, terminal_qpos), dim=1),
+        env_ids=torch.arange(2),
+        step_dt=0.01,
+    )
+    success = torch.ones(2, dtype=torch.bool)
+    plan = ActionPlan(
+        skill_id="move_end_effector",
+        plan_success=success,
+        commands=_commands_for(trajectory),
+        joint_trajectory=trajectory,
+        recovery_policy=RecoveryPolicy(),
+        tracking_policy=TrackingPolicy.timed(),
+        planned_scene_version=0,
+        planned_collision_world_revision=(0, 0),
+        diagnostics=_planner_diagnostics(success),
+        expected_effects=StateDelta(),
+    )
+    monkeypatch.setattr(adapter, "_engine", lambda: _FakeEngine(lambda *_args: plan))
+    provenance_valid = torch.tensor([True, False])
+    grounded = GroundedAction(
+        action_class="MoveEndEffector",
+        arm=arm,
+        control="arm",
+        target=EndEffectorPoseGoal(xpos=torch.eye(4).repeat(2, 1, 1)),
+        cfg={},
+        motion_policy={
+            "collision_safety": "required",
+            "articulation_departure_valid": provenance_valid,
+        },
+    )
+
+    outcome = adapter.plan(grounded, ExecutionState(last_qpos=entry_qpos))
+
+    assert outcome.planner_trace["primary_success"].tolist() == [True, True]
+    assert outcome.success.tolist() == [True, False]
+    assert outcome.planner_trace["articulation_departure_valid"].tolist() == [
+        True,
+        False,
+    ]
+    torch.testing.assert_close(outcome.next_state.last_qpos[0], terminal_qpos[0])
+    torch.testing.assert_close(outcome.next_state.last_qpos[1], entry_qpos[1])
+    assert provenance_valid.tolist() == [True, False]
 
 
 def test_waypoint_progress_gate_repeats_existing_commands_without_qpos_writes() -> None:
@@ -1156,6 +1349,10 @@ def test_retreat_uses_row_local_motion_planner_reachability_search(
         height_reachable = target[:, 2, 3] <= height_thresholds
         baseward_reachable = target[:, 1, 3] < -0.05
         success = height_reachable | baseward_reachable
+        diagnostics = replace(
+            _planner_diagnostics(success),
+            metadata={"articulation_support_audit": {"success": success.tolist()}},
+        )
         terminal = target[:, 2, 3, None].repeat(1, 8)
         positions = torch.stack((torch.zeros_like(terminal), terminal), dim=1)
         trajectory = TimedTrajectory.from_uniform_step(
@@ -1172,7 +1369,7 @@ def test_retreat_uses_row_local_motion_planner_reachability_search(
             tracking_policy=TrackingPolicy.timed(),
             planned_scene_version=0,
             planned_collision_world_revision=(0, 0),
-            diagnostics=_planner_diagnostics(success),
+            diagnostics=diagnostics,
             expected_effects=StateDelta(),
         )
 
@@ -1211,6 +1408,20 @@ def test_retreat_uses_row_local_motion_planner_reachability_search(
     assert search["strategy"] == "bounded_motion_planner"
     assert search["selected_target_z"].tolist() == pytest.approx([1.20, 1.35])
     assert len(search["attempts"]) == len(attempted_targets)
+    assert (
+        outcome.planner_trace["primary_action_diagnostics_scope"]
+        == "initial_retreat_candidate"
+    )
+    for attempt in search["attempts"]:
+        assert (
+            attempt["articulation_support_audit"]["success"]
+            == attempt["success"].tolist()
+        )
+    for env_id, label in enumerate(search["selected_candidates"]):
+        selected = next(
+            item for item in search["attempts"] if item["candidate"] == label
+        )
+        assert selected["articulation_support_audit"]["success"][env_id]
 
 
 def test_lift_clear_reachability_search_uses_only_vertical_candidates(

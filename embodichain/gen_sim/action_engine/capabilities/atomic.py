@@ -907,6 +907,21 @@ def _resolve_joints_contract(node: Mapping[str, Any]) -> ResolvedActionContract:
     binding = node.get("target_binding", {})
     if not isinstance(binding, Mapping):
         raise ValueError("MoveJoints contract requires a target_binding mapping.")
+    if binding.get("operation") in {
+        "articulation_release",
+        "articulation_detach",
+        "articulation_full_open",
+    }:
+        if node.get("control") != "hand" or binding.get("source") != "gripper_open":
+            raise ValueError(
+                "Articulation release requires a gripper-open hand action."
+            )
+        return ResolvedActionContract(
+            requires=(StateAtom("arm_free", arm=arm),),
+            claims=(ResourceClaim(f"arm:{arm}"),),
+            completion="cleanup",
+            failure_policy="safety_required",
+        )
     single_release = binding.get("single_release", False)
     if not isinstance(single_release, bool):
         raise TypeError("joint_state single_release must be a boolean.")
@@ -1077,13 +1092,18 @@ def _verify_arm_clearance(
                 executor.runtime_policy.predicate_fallbacks["position_tolerance"],
             )
         )
-        clear &= (
-            torch.linalg.vector_norm(
-                eef[:, :3, 3] - target[:, :3, 3],
-                dim=1,
-            )
-            <= tolerance
+        target_error = torch.linalg.vector_norm(
+            eef[:, :3, 3] - target[:, :3, 3],
+            dim=1,
         )
+        clear &= target_error <= tolerance
+        outcome.planner_trace["clearance_verification"] = {
+            "observed_tcp": eef.detach().cpu().tolist(),
+            "target_tcp": target.detach().cpu().tolist(),
+            "target_error": target_error.detach().cpu().tolist(),
+            "root_distance": distance.detach().cpu().tolist(),
+            "clear": clear.detach().cpu().tolist(),
+        }
     return attempted & clear
 
 
@@ -1097,6 +1117,31 @@ def _verify_move_joints(
 ) -> torch.Tensor:
     """Route joint effects to their dedicated physical verifier."""
     policy = outcome.grounded.motion_policy
+    if policy.get("verify_articulation_detach", False):
+        return attempted & executor._verify_articulation_detachment(step, arm, outcome)
+    if policy.get("verify_articulation_release", False):
+        env = executor.env
+        part = env.get_agent_eef_control_part(arm == "left_arm")
+        if part is None:
+            return torch.zeros_like(attempted)
+        joint_ids = env.robot.get_joint_ids(name=part)
+        current = env.robot.get_qpos()[:, joint_ids]
+        target = outcome.grounded.target.target.to(current)
+        closed = torch.as_tensor(
+            env.close_state, device=current.device, dtype=current.dtype
+        )
+        stroke = torch.linalg.vector_norm(closed - target, dim=-1)
+        profile = get_gripper_profile(getattr(env, "agent_gripper_model", "pgi"))
+        error = torch.linalg.vector_norm(current - target, dim=1)
+        reached = (stroke > 1.0e-6) & (
+            error <= stroke * profile.release_open_fraction_tolerance
+        )
+        outcome.planner_trace["articulation_release"] = {
+            "observed_hand_qpos": current.detach().cpu().tolist(),
+            "target_hand_qpos": target.detach().cpu().tolist(),
+            "opened": reached.detach().cpu().tolist(),
+        }
+        return attempted & reached
     if bool(policy.get("single_release", False)):
         return _verify_single_release(
             executor=executor,

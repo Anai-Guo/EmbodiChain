@@ -60,6 +60,149 @@ class _TestAction:
     end_effector_roles: tuple[str, ...] = ()
 
 
+@pytest.mark.parametrize("opened", [True, False])
+def test_articulation_release_checks_live_hand_before_cleanup(opened: bool) -> None:
+    from embodichain.gen_sim.action_engine.capabilities.atomic import (
+        _verify_move_joints,
+    )
+
+    env = SimpleNamespace(
+        close_state=torch.tensor([0.0, 0.0]),
+        agent_gripper_model="pgi",
+        get_agent_eef_control_part=lambda is_left: "hand",
+        robot=SimpleNamespace(
+            get_joint_ids=lambda **kwargs: [0, 1],
+            get_qpos=lambda: torch.tensor([[0.04, 0.04] if opened else [0.0, 0.0]]),
+        ),
+    )
+    outcome = SimpleNamespace(
+        grounded=SimpleNamespace(
+            motion_policy={"verify_articulation_release": True},
+            target=SimpleNamespace(target=torch.tensor([0.04, 0.04])),
+        ),
+        planner_trace={},
+    )
+    verified = _verify_move_joints(
+        executor=SimpleNamespace(env=env),
+        step=None,
+        arm="left_arm",
+        outcome=outcome,
+        attempted=torch.tensor([True]),
+    )
+    assert verified.tolist() == [opened]
+    assert outcome.planner_trace["articulation_release"]["opened"] == [opened]
+
+
+@pytest.mark.parametrize("arm", ["left_arm", "right_arm"])
+@pytest.mark.parametrize("batched_target", [False, True])
+def test_articulation_release_robotiq_boundary_and_active_rows(
+    arm: str, batched_target: bool
+) -> None:
+    from embodichain.gen_sim.action_engine.capabilities.atomic import (
+        _verify_move_joints,
+    )
+    from embodichain.gen_sim.action_engine.gripper_profiles import get_gripper_profile
+
+    profile = get_gripper_profile("robotiq")
+    opened = torch.tensor(profile.open_positions, dtype=torch.float64)
+    closed = torch.tensor(profile.close_positions, dtype=torch.float64)
+    tolerance = profile.release_open_fraction_tolerance
+    # Straddle the full-stroke threshold without relying on floating-point equality.
+    boundary_margin = 1.0e-4
+    residual_fractions = torch.tensor(
+        [
+            tolerance * (1.0 - boundary_margin),
+            tolerance * (1.0 + boundary_margin),
+            0.0,
+            1.0,
+            0.0,
+        ],
+        dtype=torch.float64,
+    )
+    current_hand = opened + residual_fractions[:, None] * (closed - opened)
+    num_envs = len(residual_fractions)
+    arm_dof, hand_dof = 7, len(profile.open_positions)
+    side_dof = arm_dof + hand_dof
+    joint_ids = {
+        "left_hand": list(range(arm_dof, side_dof)),
+        "right_hand": list(range(side_dof + arm_dof, 2 * side_dof)),
+    }
+    current_robot = torch.zeros(num_envs, 2 * side_dof, dtype=torch.float64)
+    for ids in joint_ids.values():
+        current_robot[:, ids] = closed
+    selected_hand = "left_hand" if arm == "left_arm" else "right_hand"
+    current_robot[:, joint_ids[selected_hand]] = current_hand
+    original_qpos = current_robot.clone()
+    target = opened.repeat(num_envs, 1) if batched_target else opened
+    env = SimpleNamespace(
+        close_state=closed,
+        agent_gripper_model="robotiq",
+        get_agent_eef_control_part=lambda is_left: (
+            "left_hand" if is_left else "right_hand"
+        ),
+        robot=SimpleNamespace(
+            get_joint_ids=lambda name: joint_ids[name],
+            get_qpos=lambda: current_robot,
+        ),
+    )
+    outcome = SimpleNamespace(
+        grounded=SimpleNamespace(
+            motion_policy={"verify_articulation_release": True},
+            target=SimpleNamespace(target=target),
+        ),
+        planner_trace={},
+    )
+    attempted = torch.tensor([True, True, False, True, True])
+
+    verified = _verify_move_joints(
+        executor=SimpleNamespace(env=env),
+        step=None,
+        arm=arm,
+        outcome=outcome,
+        attempted=attempted,
+    )
+
+    assert verified.tolist() == [True, False, False, False, True]
+    trace = outcome.planner_trace["articulation_release"]
+    assert trace["opened"] == [True, False, True, False, True]
+    assert trace["observed_hand_qpos"] == current_hand.tolist()
+    assert trace["target_hand_qpos"] == target.tolist()
+    assert attempted.tolist() == [True, True, False, True, True]
+    assert torch.equal(current_robot, original_qpos)
+
+
+@pytest.mark.parametrize("arm", ["left_arm", "right_arm"])
+def test_articulation_release_missing_hand_fails_closed(arm: str) -> None:
+    from embodichain.gen_sim.action_engine.capabilities.atomic import (
+        _verify_move_joints,
+    )
+
+    requested_sides: list[bool] = []
+
+    def missing_hand(is_left: bool) -> None:
+        requested_sides.append(is_left)
+        return None
+
+    outcome = SimpleNamespace(
+        grounded=SimpleNamespace(
+            motion_policy={"verify_articulation_release": True},
+        ),
+        planner_trace={},
+    )
+    verified = _verify_move_joints(
+        executor=SimpleNamespace(
+            env=SimpleNamespace(get_agent_eef_control_part=missing_hand)
+        ),
+        step=None,
+        arm=arm,
+        outcome=outcome,
+        attempted=torch.tensor([True, False, True]),
+    )
+
+    assert requested_sides == [arm == "left_arm"]
+    assert verified.tolist() == [False, False, False]
+
+
 class _TestEngine:
     binding_owner_id = "test-engine"
 
@@ -329,6 +472,56 @@ def test_explicit_required_home_is_safety_required_for_any_task_type() -> None:
 
     assert generic.failure_policy == "best_effort"
     assert required_home.failure_policy == "safety_required"
+
+
+@pytest.mark.parametrize("operation", ["articulation_detach", "articulation_full_open"])
+def test_articulation_hand_cleanup_contract_does_not_require_core_success(
+    operation: str,
+) -> None:
+    capability = build_atomic_capability_registry().get("MoveJoints")
+    contract = capability.resolve_contract(
+        {
+            "atomic_action": "MoveJoints",
+            "object_uid": "articulation_fixture",
+            "actor": {"mode": "required", "arm": "left_arm"},
+            "control": "hand",
+            "role": "cleanup",
+            "target_binding": {
+                "kind": "joint_state",
+                "source": "gripper_open",
+                "operation": operation,
+            },
+        }
+    )
+    assert contract.requires == (StateAtom("arm_free", arm="left_arm"),)
+    assert contract.completion == "cleanup"
+    assert contract.failure_policy == "safety_required"
+    assert contract.effects == ()
+
+
+@pytest.mark.parametrize("operation", ["articulation_detach", "articulation_full_open"])
+@pytest.mark.parametrize(
+    "control,source", [("arm", "gripper_open"), ("hand", "initial")]
+)
+def test_articulation_hand_cleanup_rejects_non_hand_or_non_open_binding(
+    operation, control, source
+) -> None:
+    capability = build_atomic_capability_registry().get("MoveJoints")
+    with pytest.raises(ValueError, match="hand action"):
+        capability.resolve_contract(
+            {
+                "atomic_action": "MoveJoints",
+                "object_uid": "articulation_fixture",
+                "actor": {"mode": "required", "arm": "left_arm"},
+                "control": control,
+                "role": "cleanup",
+                "target_binding": {
+                    "kind": "joint_state",
+                    "source": source,
+                    "operation": operation,
+                },
+            }
+        )
 
 
 def test_coordinated_release_contract_uses_binding_not_task_number() -> None:

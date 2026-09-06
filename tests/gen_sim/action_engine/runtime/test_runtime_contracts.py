@@ -543,6 +543,32 @@ def _pose(x: float, y: float, z: float) -> torch.Tensor:
     return result
 
 
+def test_executor_restores_gravity_only_for_unique_slide_door_targets(monkeypatch):
+    from embodichain.gen_sim.action_engine.runtime import executor as module
+
+    instance = object.__new__(ProgramExecutor)
+    instance.program = SimpleNamespace(
+        semantic_steps=[
+            SimpleNamespace(operator="slide", object_uid="drawer"),
+            SimpleNamespace(operator="slide", object_uid="drawer"),
+            SimpleNamespace(operator="open_door", object_uid="door"),
+            SimpleNamespace(operator="pick_up", object_uid="box"),
+        ]
+    )
+    instance.env = SimpleNamespace(
+        sim=SimpleNamespace(get_articulation=lambda uid: uid)
+    )
+    calls = []
+    monkeypatch.setattr(
+        module,
+        "_restore_gravity_contract",
+        lambda item: calls.append(item) or {"changed": False, "configured": False},
+    )
+    instance._restore_interaction_gravity()
+    assert calls == ["drawer", "door"]
+    assert set(instance._interaction_gravity) == {"drawer", "door"}
+
+
 def _interaction_edge(program):
     return next(
         edge
@@ -550,6 +576,412 @@ def _interaction_edge(program):
         if edge.actions[0]["atomic_action_class"]
         in {"Slide", "OpenDoor", "Twist", "Press"}
     )
+
+
+def _core_result_executor(
+    monkeypatch: pytest.MonkeyPatch,
+    task_type: str,
+    observed_qpos: list[float],
+) -> tuple[ProgramExecutor, _FakeArticulation, ExecutionEdge, list[str]]:
+    task, _ = make_task_spec(task_type)
+    program = load_execution_program(
+        instantiate_seed_graph(task, {"object_01": "interaction_fixture"})
+    )
+    articulation = _FakeArticulation("interaction_fixture", 0.0)
+    batch_size = len(observed_qpos)
+    articulation._qpos = torch.zeros(batch_size, 1)
+    articulation._pose = articulation._pose.repeat(batch_size, 1, 1)
+    target_qpos = -0.08 if task_type == "E6" else 1.38
+    articulation._limits = torch.tensor(
+        [[[min(0.0, target_qpos), max(0.0, target_qpos)]]]
+    ).repeat(batch_size, 1, 1)
+    if task_type == "E7":
+        articulation._joint_info.joint_type.name = "REVOLUTE"
+    env = _FakeEnv(articulations={articulation.uid: articulation})
+    env.num_envs = batch_size
+    env.robot = _FakeRobot(batch_size)
+    executor = ProgramExecutor(program, env, settle_steps=0, record_runtime=False)
+    step = program.semantic_steps[0]
+    edge = _interaction_edge(program)
+    executor._assignments[step.id] = ["left_arm"] * batch_size
+    execution_calls: list[str] = []
+
+    def plan(
+        action: dict[str, Any],
+        _step: SemanticStep,
+        *,
+        arm: str,
+        state: ExecutionState,
+        **_kwargs: Any,
+    ) -> tuple[GroundedAction, ActionOutcome]:
+        policy = {
+            "articulation_external_cleanup": True,
+            "articulation_joint_name": "slide_joint",
+            "articulation_target_link_name": "drawer_link",
+            "articulation_initial_qpos": articulation.get_qpos()[:, 0].clone(),
+            "articulation_target_qpos": torch.full((batch_size,), target_qpos),
+            "articulation_approach_direction_local": torch.tensor(
+                [[1.0, 0.0, 0.0]]
+            ).repeat(batch_size, 1),
+            "postcondition_tolerance": 0.005,
+        }
+        grounded = GroundedAction(
+            action_class=action["atomic_action_class"],
+            arm=arm,
+            control="arm",
+            target=None,
+            cfg=policy,
+            motion_policy=policy,
+            object_uid=articulation.uid,
+        )
+        return grounded, ActionOutcome(
+            trajectory=state.last_qpos[:, None].clone(),
+            success=torch.ones(batch_size, dtype=torch.bool),
+            next_state=state,
+            grounded=grounded,
+            planner_trace={"primary_success": torch.ones(batch_size, dtype=torch.bool)},
+        )
+
+    def execute(
+        trajectory: torch.Tensor, *, active: torch.Tensor, **_kwargs: Any
+    ) -> list[torch.Tensor]:
+        execution_calls.append(edge.id)
+        articulation._qpos[:, 0] = torch.where(
+            active, torch.tensor(observed_qpos), articulation._qpos[:, 0]
+        )
+        return [trajectory[:, 0].clone()]
+
+    monkeypatch.setattr(executor, "_ground_and_plan_candidates", plan)
+    monkeypatch.setattr(executor.adapter, "execute_trajectory", execute)
+    monkeypatch.setattr(
+        executor,
+        "_ensure_assignment",
+        lambda step, _failed: executor._assignments.setdefault(
+            step.id, ["left_arm"] * batch_size
+        ),
+    )
+    return executor, articulation, edge, execution_calls
+
+
+def test_open_door_progress_gate_keeps_zero_motion_start_and_exact_terminal_goal(
+    monkeypatch,
+):
+    from embodichain.gen_sim.action_engine.runtime import executor as module
+
+    initial = torch.tensor([0.2, -0.1, 0.0])
+    target = torch.tensor([1.38, -1.9, 1.0])
+    observed = initial.clone()
+    articulation = SimpleNamespace(
+        joint_names=["hinge"],
+        _entities=[SimpleNamespace(get_joint_info=lambda name: None)],
+    )
+    env = SimpleNamespace(
+        num_envs=3,
+        device=torch.device("cpu"),
+        sim=SimpleNamespace(get_articulation=lambda uid: articulation),
+    )
+    policy = {
+        "articulation_progress_sync_enabled": True,
+        "articulation_joint_name": "hinge",
+        "articulation_initial_qpos": initial,
+        "articulation_target_qpos": target,
+        "articulation_progress_sync_tolerance": 0.01,
+    }
+    outcome = SimpleNamespace(
+        grounded=SimpleNamespace(object_uid="door", motion_policy=policy),
+        planner_trace={"action_segments": {"open": {"start": 230, "stop": 290}}},
+    )
+    monkeypatch.setattr(
+        module, "_effective_joint_position", lambda *args: observed.clone()
+    )
+    gate = ProgramExecutor._open_door_progress_gate(
+        SimpleNamespace(env=env),
+        {"left_arm": outcome},
+        interaction_kind="open_door",
+        active=torch.tensor([True, True, False]),
+    )
+    assert gate.needs_repeat(230).tolist() == [False, False, False]
+    assert gate.trace["last_expected_qpos"] == pytest.approx(initial.tolist())
+    assert gate.needs_repeat(231).tolist() == [True, True, False]
+    assert gate.needs_repeat(289).tolist() == [True, True, False]
+    assert gate.trace["last_expected_qpos"] == pytest.approx(target.tolist())
+    observed[:] = target
+    assert gate.needs_repeat(289).tolist() == [False, False, False]
+
+
+def test_core_contact_stop_allows_handle_contact_and_latches_first_hazard():
+    sample = {
+        "known": torch.tensor([True, True, False]),
+        "target_contact": torch.tensor([True, True, True]),
+        "robot_world_contact": torch.tensor([True, True, True]),
+        "obstacle_contact": torch.tensor([False, False, False]),
+        "non_target_robot_world_contact": torch.tensor([False, True, False]),
+        "pairs": [[], [{"bodies": ["wrist", "table"]}], []],
+    }
+    outcome = SimpleNamespace(success=torch.ones(3, dtype=torch.bool), planner_trace={})
+    executor = SimpleNamespace(
+        env=SimpleNamespace(num_envs=3, device=torch.device("cpu")),
+        adapter=SimpleNamespace(_scene_time=1.0),
+        _sample_interaction_contacts=lambda *args: sample,
+    )
+    stop, aborted = ProgramExecutor._core_contact_stop(
+        executor,
+        None,
+        {"left_arm": outcome},
+        {"left_arm": torch.ones(3, dtype=torch.bool)},
+    )
+    assert stop(10).tolist() == [False, True, True]
+    trace = outcome.planner_trace["articulation_core_contact_guard"]
+    assert trace["failure_reason"] == [
+        None,
+        "world_contact",
+        "contact_observation_unknown",
+    ]
+    sample["known"][:] = True
+    sample["non_target_robot_world_contact"][:] = False
+    sample["pairs"][1].clear()
+    executor.adapter._scene_time = 2.0
+    assert stop(11).tolist() == [False, True, True]
+    assert aborted.tolist() == [False, True, True]
+    assert trace["first_failure"][1]["waypoint_index"] == 10
+    assert trace["first_failure"][1]["pairs"] == [{"bodies": ["wrist", "table"]}]
+
+
+@pytest.mark.parametrize(
+    ("task_type", "observed"),
+    [("E6", [-0.079, -0.04]), ("E7", [1.379, 0.2])],
+)
+def test_core_joint_result_is_immediate_row_local_and_keeps_cleanup_provenance(
+    monkeypatch: pytest.MonkeyPatch, task_type: str, observed: list[float]
+) -> None:
+    executor, _, edge, _ = _core_result_executor(monkeypatch, task_type, observed)
+    step = executor.program.semantic_steps[0]
+
+    result = executor._execute_edge(edge, step, failed=torch.zeros(2, dtype=torch.bool))
+
+    assert result.executed.tolist() == [True, True]
+    assert result.failed.tolist() == [False, True]
+    evidence = result.planner_traces[0]["articulation_core_result"]
+    assert evidence["phase"] == "core_terminal_before_release"
+    assert evidence["observed"] == pytest.approx(observed)
+    assert evidence["success"].tolist() == [True, False]
+    assert executor.grounder._executed_interactions[(step.id, "left_arm")][
+        "valid"
+    ].tolist() == [True, True]
+    stored = executor._core_interactions[(step.id, "left_arm")]
+    assert stored["success"].tolist() == [True, False]
+    executor._reset_runtime_state()
+    assert executor._core_interactions == {}
+    assert executor.grounder._executed_interactions == {}
+
+
+def test_core_failure_is_not_retried_or_erased_when_cleanup_reaches_joint_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor, articulation, core, calls = _core_result_executor(
+        monkeypatch, "E6", [-0.04]
+    )
+    original_execute = executor._execute_edge
+    cleanup_masks: list[torch.Tensor] = []
+
+    def execute(
+        edge: ExecutionEdge, step: SemanticStep, *, failed: torch.Tensor
+    ) -> _EdgeResult:
+        if edge.id == core.id:
+            return original_execute(edge, step, failed=failed)
+        cleanup_masks.append((~failed).clone())
+        articulation._qpos[~failed, 0] = -0.08
+        return _EdgeResult([], failed.clone(), [], executed=~failed)
+
+    monkeypatch.setattr(executor, "_execute_edge", execute)
+    result = executor.run()
+
+    assert calls == [core.id]
+    assert len(cleanup_masks) == len(executor.program.edges) - 1
+    assert all(mask.tolist() == [True] for mask in cleanup_masks)
+    assert articulation.get_qpos()[0, 0].item() == pytest.approx(-0.08)
+    assert result.success.tolist() == [False]
+    assert (
+        result.failure_events[0]["failure_type"]
+        == "articulation_core_postcondition_failed"
+    )
+    assert result.failure_events[0]["edge_id"] == core.id
+    step = executor.program.semantic_steps[0]
+    evidence = executor._core_interactions[(step.id, "left_arm")]
+    assert evidence["observed"] == pytest.approx([-0.04])
+    assert evidence["success"].tolist() == [False]
+
+
+@pytest.mark.parametrize("task_type,observed", [("E6", -0.079), ("E7", 1.379)])
+def test_core_collision_cannot_pass_even_when_joint_reaches_goal(
+    monkeypatch, task_type, observed
+):
+    executor, _, edge, _ = _core_result_executor(monkeypatch, task_type, [observed])
+    step = executor.program.semantic_steps[0]
+    original = executor.adapter.execute_trajectory
+    monkeypatch.setattr(
+        executor,
+        "_sample_interaction_contacts",
+        lambda *args: {
+            "known": torch.tensor([True]),
+            "target_contact": torch.tensor([True]),
+            "robot_world_contact": torch.tensor([True]),
+            "obstacle_contact": torch.tensor([False]),
+            "non_target_robot_world_contact": torch.tensor([True]),
+            "pairs": [[{"bodies": ["wrist", "table"]}]],
+        },
+    )
+
+    def execute(trajectory, *, active, **kwargs):
+        commands = original(trajectory, active=active)
+        assert kwargs["flush_stop_hold"] is True
+        assert kwargs["waypoint_stop"](0).tolist() == [True]
+        return commands
+
+    monkeypatch.setattr(executor.adapter, "execute_trajectory", execute)
+    result = executor._execute_edge(edge, step, failed=torch.tensor([False]))
+    assert result.failed.tolist() == [True]
+    core = result.planner_traces[0]["articulation_core_result"]
+    assert core["executed"].tolist() == [True]
+    assert core["joint_motion_success"].tolist() == [True]
+    assert core["safety_aborted"].tolist() == [True]
+    assert core["success"].tolist() == [False]
+    assert executor.grounder._executed_interactions[(step.id, "left_arm")][
+        "valid"
+    ].tolist() == [True]
+    failures = executor._failure_events(
+        edge,
+        step,
+        result.failed,
+        postcondition=False,
+        executed=result.executed,
+        fallen_transition=None,
+        planner_traces=result.planner_traces,
+    )
+    assert failures[0]["failure_type"] == "articulation_core_contact_failed"
+    assert (
+        failures[0]["core_contact_guards"][0]["first_failure"][0]["waypoint_index"] == 0
+    )
+
+
+def test_core_failure_classification_separates_contact_and_joint_failure_rows(
+    monkeypatch,
+):
+    executor, _, edge, _ = _core_result_executor(monkeypatch, "E7", [0.5, 0.5])
+    step = executor.program.semantic_steps[0]
+    traces = [
+        {
+            "articulation_core_result": {"success": torch.tensor([False, False])},
+            "articulation_core_contact_guard": {"aborted": torch.tensor([True, False])},
+        }
+    ]
+    failures = executor._failure_events(
+        edge,
+        step,
+        torch.tensor([True, True]),
+        postcondition=False,
+        executed=torch.tensor([True, True]),
+        fallen_transition=None,
+        planner_traces=traces,
+    )
+    assert [(f["failure_type"], f["env_ids"]) for f in failures] == [
+        ("articulation_core_contact_failed", [0]),
+        ("articulation_core_postcondition_failed", [1]),
+    ]
+
+
+def test_cleanup_failure_keeps_successful_core_joint_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor, articulation, core, calls = _core_result_executor(
+        monkeypatch, "E7", [1.379]
+    )
+    original_execute = executor._execute_edge
+    blocked_after_departure: list[torch.Tensor] = []
+    departure = next(
+        edge
+        for edge in executor.program.edges
+        if edge.actions[0]["target_binding"].get("operation")
+        == "articulation_disengage"
+    )
+
+    def execute(
+        edge: ExecutionEdge, step: SemanticStep, *, failed: torch.Tensor
+    ) -> _EdgeResult:
+        if edge.id == core.id:
+            return original_execute(edge, step, failed=failed)
+        if edge.id == departure.id:
+            articulation._qpos[:, 0] = 0.0
+            return _EdgeResult([], torch.ones_like(failed), [], executed=~failed)
+        if departure.id in edge.depends_on:
+            blocked_after_departure.append(failed.clone())
+        return _EdgeResult([], failed.clone(), [], executed=~failed)
+
+    monkeypatch.setattr(executor, "_execute_edge", execute)
+    result = executor.run()
+
+    assert calls == [core.id]
+    assert result.success.tolist() == [False]
+    assert blocked_after_departure and all(
+        mask.tolist() == [True] for mask in blocked_after_departure
+    )
+    assert all(
+        event["failure_type"] != "articulation_core_postcondition_failed"
+        for event in result.failure_events
+    )
+    step = executor.program.semantic_steps[0]
+    evidence = executor._core_interactions[(step.id, "left_arm")]
+    assert evidence["observed"] == pytest.approx([1.379])
+    assert evidence["success"].tolist() == [True]
+
+
+@pytest.mark.parametrize(
+    "cleanup_failure", [[False, False], [False, True], [True, False]]
+)
+def test_core_and_cleanup_failures_remain_independent_across_environment_rows(
+    monkeypatch: pytest.MonkeyPatch, cleanup_failure: list[bool]
+) -> None:
+    executor, articulation, core, calls = _core_result_executor(
+        monkeypatch, "E6", [-0.079, -0.04]
+    )
+    original_execute = executor._execute_edge
+    departure = next(
+        edge
+        for edge in executor.program.edges
+        if edge.actions[0]["target_binding"].get("operation")
+        == "articulation_disengage"
+    )
+
+    def execute(
+        edge: ExecutionEdge, step: SemanticStep, *, failed: torch.Tensor
+    ) -> _EdgeResult:
+        if edge.id == core.id:
+            return original_execute(edge, step, failed=failed)
+        articulation._qpos[~failed, 0] = -0.08
+        edge_failed = failed.clone()
+        if edge.id == departure.id:
+            edge_failed |= torch.tensor(cleanup_failure)
+        return _EdgeResult([], edge_failed, [], executed=~failed)
+
+    monkeypatch.setattr(executor, "_execute_edge", execute)
+    result = executor.run()
+
+    assert calls == [core.id]
+    assert result.success.tolist() == [not cleanup_failure[0], False]
+    assert (
+        result.failure_events[0]["failure_type"]
+        == "articulation_core_postcondition_failed"
+    )
+    assert result.failure_events[0]["env_ids"] == [1]
+    if any(cleanup_failure):
+        assert any(
+            event["edge_id"] == departure.id for event in result.failure_events[1:]
+        )
+    evidence = executor._core_interactions[
+        (executor.program.semantic_steps[0].id, "left_arm")
+    ]
+    assert evidence["observed"] == pytest.approx([-0.079, -0.04])
+    assert evidence["success"].tolist() == [True, False]
 
 
 def test_press_grounding_adapts_top_surface_and_depth_to_mainline_contract() -> None:
@@ -5128,6 +5560,132 @@ def test_articulation_grounding_dispatches_revolute_door_to_open_door() -> None:
     assert not bool(evaluate_predicate(env, predicate)[0])
     articulation._qpos[0, 0] = -1.0
     assert bool(evaluate_predicate(env, predicate)[0])
+
+
+def test_articulation_disengage_uses_inverse_link_approach_and_fixed_retry_target() -> (
+    None
+):
+    task, _ = make_task_spec("E6")
+    program = load_execution_program(
+        instantiate_seed_graph(task, {"object_01": "drawer"})
+    )
+    env = _FakeEnv(articulations={"drawer": _FakeArticulation("drawer", 0.0)})
+    live = _pose(0.1, 0.2, 0.9)
+    live[:, :3, :3] = torch.tensor([[0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]])
+    env.get_current_xpos_agent = lambda: (live, live)
+    step = program.semantic_steps[0]
+    edge = next(
+        e
+        for e in program.edges
+        if e.actions[0]["target_binding"].get("operation") == "articulation_disengage"
+    )
+    grounder = ActionGrounder(program, env, lambda _uid: None)
+    interaction = GroundedAction(
+        action_class="Slide",
+        arm="left_arm",
+        control="arm",
+        target=None,
+        cfg={},
+        object_uid="drawer",
+        motion_policy={
+            "articulation_target_link_name": "drawer_link",
+            "articulation_approach_direction_local": torch.tensor([[1.0, 0.0, 0.0]]),
+        },
+    )
+    grounder._record_executed_interaction(step.id, interaction, torch.tensor([True]))
+    env.sim.get_articulation("drawer")._pose[:, :3, :3] = torch.tensor(
+        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+    )
+    result = grounder.ground(
+        edge.actions[0],
+        step,
+        arm="left_arm",
+        state=ExecutionState(last_qpos=env.robot.get_qpos()),
+        reference_eef_pose=_pose(10.0, 20.0, 30.0),
+    )
+    expected = live.clone()
+    expected[:, 1, 3] -= grounder.runtime_policy.grounding["semantic_defaults"][
+        "safe_retreat_distance"
+    ]
+    assert result.target.xpos.shape == (1, 5, 4, 4)
+    torch.testing.assert_close(result.target.xpos[:, -1], expected)
+    torch.testing.assert_close(
+        result.target.xpos[:, :, :3, :3], live[:, None, :3, :3].expand(-1, 5, -1, -1)
+    )
+    live[:, 1, 3] -= 0.03
+    env.sim.get_articulation("drawer")._pose[:, :3, :3] = torch.eye(3)
+    retried = grounder.ground(
+        edge.actions[0],
+        step,
+        arm="left_arm",
+        state=ExecutionState(last_qpos=env.robot.get_qpos()),
+    )
+    torch.testing.assert_close(retried.target.xpos[:, -1], expected)
+    torch.testing.assert_close(
+        retried.motion_policy["articulation_departure_direction_world"],
+        result.motion_policy["articulation_departure_direction_world"],
+    )
+    with pytest.raises(ValueError, match="executed interaction"):
+        grounder.ground(
+            edge.actions[0],
+            step,
+            arm="right_arm",
+            state=ExecutionState(last_qpos=env.robot.get_qpos()),
+        )
+    grounder._clear_interaction_cleanup()
+    with pytest.raises(ValueError, match="executed interaction"):
+        grounder.ground(
+            edge.actions[0],
+            step,
+            arm="left_arm",
+            state=ExecutionState(last_qpos=env.robot.get_qpos()),
+        )
+
+
+def test_articulation_departure_anchors_are_row_local() -> None:
+    task, _ = make_task_spec("E6")
+    program = load_execution_program(
+        instantiate_seed_graph(task, {"object_01": "drawer"})
+    )
+    env = _FakeEnv(articulations={"drawer": _FakeArticulation("drawer", 0.0)})
+    env.num_envs = 2
+    articulation = env.sim.get_articulation("drawer")
+    articulation._pose = articulation._pose.repeat(2, 1, 1)
+    grounder = ActionGrounder(program, env, lambda _uid: None)
+    interaction = GroundedAction(
+        action_class="Slide",
+        arm="left_arm",
+        control="arm",
+        target=None,
+        cfg={},
+        object_uid="drawer",
+        motion_policy={
+            "articulation_target_link_name": "drawer_link",
+            "articulation_approach_direction_local": torch.tensor(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+            ),
+        },
+    )
+    step = program.semantic_steps[0]
+    reference = _pose(0.1, 0.2, 0.9).repeat(2, 1, 1)
+    grounder._record_executed_interaction(
+        step.id, interaction, torch.tensor([True, False])
+    )
+    first = grounder._articulation_departure_target(step, "left_arm", reference, {})[
+        :, -1
+    ]
+    moved = reference.clone()
+    moved[:, 0, 3] += 0.3
+    grounder._record_executed_interaction(
+        step.id, interaction, torch.tensor([False, True])
+    )
+    second = grounder._articulation_departure_target(step, "left_arm", moved, {})[:, -1]
+    torch.testing.assert_close(second[0], first[0])
+    expected = moved[1].clone()
+    expected[1, 3] -= grounder.runtime_policy.grounding["semantic_defaults"][
+        "safe_retreat_distance"
+    ]
+    torch.testing.assert_close(second[1], expected)
 
 
 def test_open_door_defers_thin_handle_feasibility_to_grasp_sampler() -> None:
