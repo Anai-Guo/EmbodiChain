@@ -22,6 +22,10 @@ explicitly writes zero target velocity at every command. Results are descriptive
 for this robot, drive configuration, and cadence; velocity feed-forward is not
 expected to improve every controller or trajectory.
 
+Joint-space tracking errors and forward-kinematics end-effector errors are
+reported for both trials. Translation error is a distance in meters; rotation
+error is the geodesic angle between reference and measured orientations.
+
 Run from the repository root::
 
     python examples/sim/motion/trajectory_velocity_tracking.py --headless
@@ -42,7 +46,12 @@ from embodichain.lab.sim.cfg import RenderCfg
 from embodichain.lab.sim.objects import Robot
 from embodichain.lab.sim.robots import FrankaPandaCfg
 
-__all__ = ["compute_tracking_metrics", "generate_reference", "main"]
+__all__ = [
+    "compute_pose_errors",
+    "compute_tracking_metrics",
+    "generate_reference",
+    "main",
+]
 
 
 def generate_reference(
@@ -116,12 +125,64 @@ def compute_tracking_metrics(
     """
     if reference.shape != measured.shape or reference.numel() == 0:
         raise ValueError("reference and measured must have the same non-empty shape.")
-    error = (measured - reference).abs().reshape(-1).float()
+    return _compute_error_metrics((measured - reference).abs())
+
+
+def compute_pose_errors(
+    reference: torch.Tensor, measured: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute end-effector translation and rotation errors.
+
+    Args:
+        reference: Reference homogeneous transforms shaped ``(..., 4, 4)``.
+        measured: Measured homogeneous transforms with the same shape.
+
+    Returns:
+        Translation error in meters and geodesic rotation error in radians,
+        each shaped ``reference.shape[:-2]``.
+    """
+    if (
+        reference.shape != measured.shape
+        or reference.numel() == 0
+        or reference.shape[-2:] != (4, 4)
+    ):
+        raise ValueError(
+            "reference and measured must have the same non-empty (..., 4, 4) shape."
+        )
+    translation_error = torch.linalg.vector_norm(
+        measured[..., :3, 3] - reference[..., :3, 3], dim=-1
+    )
+    relative_rotation = torch.matmul(
+        reference[..., :3, :3].transpose(-1, -2), measured[..., :3, :3]
+    )
+    trace = relative_rotation.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+    rotation_error = torch.acos(torch.clamp((trace - 1.0) * 0.5, -1.0, 1.0))
+    return translation_error, rotation_error
+
+
+def _compute_error_metrics(error: torch.Tensor) -> dict[str, float]:
+    """Summarize a non-empty scalar error tensor."""
+    error = error.reshape(-1).float()
     return {
         "rmse": float(torch.sqrt(torch.mean(error.square())).item()),
         "p95": float(torch.quantile(error, 0.95).item()),
         "max": float(error.max().item()),
     }
+
+
+def _compute_fk_trajectory(
+    robot: Robot, qpos: torch.Tensor, *, control_part: str
+) -> torch.Tensor:
+    """Compute one end-effector pose for every joint trajectory sample."""
+    if qpos.dim() != 3 or qpos.shape[1] == 0:
+        raise ValueError("qpos must have shape (B, N, DOF) with N > 0.")
+    poses = [
+        robot.compute_fk(
+            qpos=qpos[:, sample], name=control_part, to_matrix=True
+        ).clone()
+        for sample in range(qpos.shape[1])
+    ]
+    return torch.stack(poses, dim=1)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -194,9 +255,13 @@ def _run_trial(
         control_dt=args.control_dt,
         amplitude=args.amplitude,
     )
+    reference_pose = _compute_fk_trajectory(robot, reference, control_part="arm")
     robot.set_qpos(reference[:, 0], joint_ids=joint_ids)
     robot.set_qvel(velocity[:, 0] if use_velocity else zeros, joint_ids=joint_ids)
     measured = [robot.get_qpos()[:, joint_ids].clone()]
+    measured_pose = [
+        robot.compute_fk(qpos=measured[0], name="arm", to_matrix=True).clone()
+    ]
     timestamps = [0.0]
     for index in range(reference.shape[1] - 1):
         if index > 0:
@@ -206,6 +271,9 @@ def _run_trial(
         sim.update(step=physics_steps)
         timestamps.append(timestamps[-1] + float(dt[0, index + 1]))
         measured.append(robot.get_qpos()[:, joint_ids].clone())
+        measured_pose.append(
+            robot.compute_fk(qpos=measured[-1], name="arm", to_matrix=True).clone()
+        )
 
     robot.set_qpos(reference[:, -1], joint_ids=joint_ids)
     robot.set_qvel(zeros, joint_ids=joint_ids)
@@ -216,6 +284,8 @@ def _run_trial(
         "time": torch.tensor(timestamps),
         "reference": reference.cpu(),
         "measured": torch.stack(measured, dim=1).cpu(),
+        "reference_pose": reference_pose.cpu(),
+        "measured_pose": torch.stack(measured_pose, dim=1).cpu(),
         "velocity": velocity.cpu(),
     }
 
@@ -249,24 +319,43 @@ def _write_artifacts(
                         ]
                     )
 
+    pose_csv_path = output_dir / "pose_tracking.csv"
+    with pose_csv_path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["mode", "time_s", "translation_error_m", "rotation_error_rad"])
+        for mode, trial in trials.items():
+            translation_error, rotation_error = compute_pose_errors(
+                trial["reference_pose"], trial["measured_pose"]
+            )
+            for timestamp, translation, rotation in zip(
+                trial["time"].tolist(),
+                translation_error[0].tolist(),
+                rotation_error[0].tolist(),
+            ):
+                writer.writerow([mode, timestamp, translation, rotation])
+
     try:
         import matplotlib.pyplot as plt
     except ImportError:
         print("[WARN]: matplotlib is unavailable; wrote CSV only.")
         return
-    figure, axis = plt.subplots(figsize=(8, 4.5))
+    figure, axes = plt.subplots(3, 1, figsize=(8, 9), sharex=True)
     for mode, trial in trials.items():
-        error = torch.sqrt(
+        joint_error = torch.sqrt(
             torch.mean((trial["measured"] - trial["reference"]) ** 2, dim=(0, 2))
         )
-        axis.plot(trial["time"], error, label=mode)
-    axis.set(
-        xlabel="measurement time (s)",
-        ylabel="joint RMSE (rad)",
-        title="DexSim trajectory tracking",
-    )
-    axis.grid(True, alpha=0.3)
-    axis.legend()
+        translation_error, rotation_error = compute_pose_errors(
+            trial["reference_pose"], trial["measured_pose"]
+        )
+        axes[0].plot(trial["time"], joint_error, label=mode)
+        axes[1].plot(trial["time"], translation_error[0], label=mode)
+        axes[2].plot(trial["time"], rotation_error[0], label=mode)
+    axes[0].set(ylabel="joint RMSE (rad)", title="DexSim trajectory tracking")
+    axes[1].set(ylabel="FK translation error (m)")
+    axes[2].set(xlabel="measurement time (s)", ylabel="FK rotation error (rad)")
+    for axis in axes:
+        axis.grid(True, alpha=0.3)
+        axis.legend()
     figure.tight_layout()
     figure.savefig(output_dir / "tracking.png", dpi=160)
     plt.close(figure)
@@ -311,10 +400,25 @@ def main() -> None:
         )
         _write_artifacts(args.output_dir, trials)
         for mode, trial in trials.items():
-            metrics = compute_tracking_metrics(trial["reference"], trial["measured"])
+            joint_metrics = compute_tracking_metrics(
+                trial["reference"], trial["measured"]
+            )
+            translation_error, rotation_error = compute_pose_errors(
+                trial["reference_pose"], trial["measured_pose"]
+            )
+            translation_metrics = _compute_error_metrics(translation_error)
+            rotation_metrics = _compute_error_metrics(rotation_error)
             print(
-                f"{mode}: RMSE={metrics['rmse']:.6f} rad, "
-                f"P95={metrics['p95']:.6f} rad, max={metrics['max']:.6f} rad",
+                f"{mode}:\n"
+                f"  joint: RMSE={joint_metrics['rmse']:.6f} rad, "
+                f"P95={joint_metrics['p95']:.6f} rad, "
+                f"max={joint_metrics['max']:.6f} rad\n"
+                f"  FK translation: RMSE={translation_metrics['rmse']:.6f} m, "
+                f"P95={translation_metrics['p95']:.6f} m, "
+                f"max={translation_metrics['max']:.6f} m\n"
+                f"  FK rotation: RMSE={rotation_metrics['rmse']:.6f} rad, "
+                f"P95={rotation_metrics['p95']:.6f} rad, "
+                f"max={rotation_metrics['max']:.6f} rad",
                 flush=True,
             )
         print(f"Artifacts: {args.output_dir.resolve()}", flush=True)

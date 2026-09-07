@@ -86,6 +86,46 @@ def test_tracking_metrics_use_joint_samples() -> None:
     assert metrics["max"] == pytest.approx(1.0)
 
 
+def test_pose_errors_report_translation_norm_and_rotation_angle() -> None:
+    example = _load_example()
+    reference = torch.eye(4).reshape(1, 1, 4, 4).repeat(1, 2, 1, 1)
+    measured = reference.clone()
+    measured[0, 0, :3, 3] = torch.tensor([3.0, 4.0, 0.0])
+    measured[0, 1, :3, :3] = torch.tensor(
+        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+    )
+
+    translation_error, rotation_error = example.compute_pose_errors(reference, measured)
+
+    torch.testing.assert_close(translation_error, torch.tensor([[5.0, 0.0]]))
+    torch.testing.assert_close(
+        rotation_error, torch.tensor([[0.0, torch.pi / 2]]), atol=1.0e-6, rtol=0.0
+    )
+
+
+def test_fk_trajectory_calls_robot_compute_fk_for_each_sample() -> None:
+    example = _load_example()
+
+    class FakeRobot:
+        def __init__(self) -> None:
+            self.calls: list[tuple[torch.Tensor, str, bool]] = []
+
+        def compute_fk(self, qpos, name, to_matrix):
+            self.calls.append((qpos.clone(), name, to_matrix))
+            pose = torch.eye(4).repeat(qpos.shape[0], 1, 1)
+            pose[:, 0, 3] = qpos.sum(dim=1)
+            return pose
+
+    robot = FakeRobot()
+    qpos = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+
+    poses = example._compute_fk_trajectory(robot, qpos, control_part="arm")
+
+    assert len(robot.calls) == 2
+    assert all(name == "arm" and to_matrix for _, name, to_matrix in robot.calls)
+    torch.testing.assert_close(poses[0, :, 0, 3], torch.tensor([3.0, 7.0]))
+
+
 def test_tutorial_resamples_fractional_intervals_and_holds_terminal_velocity() -> None:
     tutorial = _load_tutorial()
 
@@ -196,6 +236,13 @@ def test_trial_explicitly_clears_current_and_target_velocity_after_reset() -> No
 
         def get_joint_ids(self, _name):
             return [0]
+
+        def compute_fk(self, qpos, name, to_matrix):
+            assert name == "arm"
+            assert to_matrix
+            pose = torch.eye(4).repeat(qpos.shape[0], 1, 1)
+            pose[:, 0, 3] = qpos[:, 0]
+            return pose
 
         def set_qvel(self, value, *, target=True, **_kwargs):
             self.qvel_targets.append(target)
