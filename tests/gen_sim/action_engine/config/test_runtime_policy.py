@@ -33,6 +33,37 @@ from embodichain.gen_sim.action_engine.config import (
 from embodichain.lab.sim.atomic_actions.primitives.place import PlaceOptions
 
 
+def test_articulation_contact_defaults_are_snapshotted_per_skill() -> None:
+    policy = default_runtime_policy("dual_franka")
+    assert (
+        policy.motion_defaults["Slide"]["articulation_core_contact_policy"] == "observe"
+    )
+    assert (
+        policy.motion_defaults["OpenDoor"]["articulation_core_contact_policy"] == "stop"
+    )
+    restored = RuntimePolicyCfg.from_mapping(policy.as_mapping())
+    assert restored.motion_defaults == policy.motion_defaults
+
+
+@pytest.mark.parametrize("action", ["Slide", "OpenDoor"])
+@pytest.mark.parametrize("invalid", [None, True, "ignore"])
+def test_invalid_articulation_contact_policy_is_rejected(action, invalid) -> None:
+    snapshot = default_runtime_policy("dual_franka").as_mapping()
+    snapshot["motion_defaults"][action]["articulation_core_contact_policy"] = invalid
+    with pytest.raises(ValueError, match="articulation_core_contact_policy"):
+        RuntimePolicyCfg.from_mapping(snapshot)
+
+
+def test_legacy_contact_policy_snapshot_is_not_silently_rewritten() -> None:
+    snapshot = default_runtime_policy("dual_franka").as_mapping()
+    for action in ("Slide", "OpenDoor"):
+        snapshot["motion_defaults"][action].pop(
+            "articulation_core_contact_policy", None
+        )
+    restored = RuntimePolicyCfg.from_mapping(snapshot)
+    assert restored.motion_defaults == snapshot["motion_defaults"]
+
+
 def test_default_runtime_policy_preserves_current_arm_selection_behavior() -> None:
     policy = default_runtime_policy("dual_ur10")
 
@@ -181,6 +212,7 @@ def test_e6_e7_defaults_match_atomic_action_tutorial_contracts() -> None:
     motion = default_runtime_policy("dual_franka").motion_defaults
 
     assert motion["Slide"] == {
+        "articulation_core_contact_policy": "observe",
         "sample_interval": 140,
         "hand_interp_steps": 12,
         "approach_distance": pytest.approx(0.10),
@@ -203,6 +235,7 @@ def test_e6_e7_defaults_match_atomic_action_tutorial_contracts() -> None:
         "postcondition_tolerance": pytest.approx(0.005),
     }
     assert motion["OpenDoor"] == {
+        "articulation_core_contact_policy": "stop",
         "sample_interval": 300,
         "hand_interp_steps": 30,
         "door_waypoint_count": 50,

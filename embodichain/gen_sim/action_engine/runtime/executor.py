@@ -3471,7 +3471,7 @@ class ProgramExecutor:
         outcomes: Mapping[str, ActionOutcome | None],
         masks: Mapping[str, torch.Tensor],
     ) -> tuple[Callable[[int], torch.Tensor], torch.Tensor]:
-        """Allow intended handle contact, but stop on other world contact or unknown data."""
+        """Apply the snapshotted core contact policy without weakening cleanup."""
         aborted = torch.zeros(
             int(self.env.num_envs), device=self.env.device, dtype=torch.bool
         )
@@ -3479,10 +3479,22 @@ class ProgramExecutor:
         for arm, outcome in outcomes.items():
             if outcome is None:
                 continue
+            policy = outcome.grounded.motion_policy.get(
+                "articulation_core_contact_policy", "stop"
+            )
+            if policy not in ("stop", "observe"):
+                raise ValueError(
+                    "articulation_core_contact_policy must be 'stop' or 'observe'."
+                )
             trace = {
+                "policy": policy,
                 "aborted": torch.zeros_like(aborted),
                 "failure_reason": [None] * int(self.env.num_envs),
                 "first_failure": [None] * int(self.env.num_envs),
+                "contact_observed": torch.zeros_like(aborted),
+                "contact_sample_count": torch.zeros_like(aborted, dtype=torch.long),
+                "first_contact": [None] * int(self.env.num_envs),
+                "last_contact": [None] * int(self.env.num_envs),
                 "sample_count": 0,
                 "scope": "robot_world_except_selected_hand_target_link",
                 "continuous_collision_checked": False,
@@ -3491,28 +3503,57 @@ class ProgramExecutor:
             outcome.planner_trace["articulation_core_contact_guard"] = trace
 
         def stop(waypoint_index: int) -> torch.Tensor:
+            active_rows = ~aborted
             for arm, trace in traces.items():
                 sample = self._sample_interaction_contacts(step, arm)
-                unsafe = (
-                    (
-                        ~sample["known"]
-                        | sample["obstacle_contact"]
-                        | sample["non_target_robot_world_contact"]
-                    )
-                    & masks[arm]
-                    & outcomes[arm].success
+                eligible = masks[arm] & outcomes[arm].success & active_rows
+                world_contact = (
+                    sample["obstacle_contact"]
+                    | sample["non_target_robot_world_contact"]
                 )
+                state_finite = torch.ones_like(aborted)
+                if trace["policy"] == "observe":
+                    state_finite = torch.isfinite(self.env.robot.get_qpos()).all(dim=1)
+                observed = sample["known"] & state_finite & world_contact & eligible
+                for row in torch.nonzero(observed).flatten().tolist():
+                    evidence = {
+                        "waypoint_index": waypoint_index,
+                        "observation_tick": self.adapter._scene_time,
+                        "control_command_index": trace["sample_count"],
+                        "pairs": deepcopy(sample["pairs"][row]),
+                    }
+                    if trace["first_contact"][row] is None:
+                        trace["first_contact"][row] = evidence
+                        if trace["policy"] == "observe":
+                            log_warning(
+                                f"Articulation core contact {step.id}/{arm}/env={row}: "
+                                "policy=observe; continuing with recorded non-target "
+                                "contact, not certifying collision-free motion."
+                            )
+                    trace["last_contact"][row] = evidence
+                trace["contact_observed"] |= observed
+                trace["contact_sample_count"] += observed.to(torch.long)
+                unsafe = (
+                    ~sample["known"]
+                    | ~state_finite
+                    | (world_contact if trace["policy"] == "stop" else False)
+                ) & eligible
                 for row in torch.nonzero(unsafe & ~trace["aborted"]).flatten().tolist():
                     trace["failure_reason"][row] = (
-                        "world_contact"
-                        if bool(sample["known"][row])
-                        else "contact_observation_unknown"
+                        "contact_observation_unknown"
+                        if not bool(sample["known"][row])
+                        else (
+                            "world_contact"
+                            if bool(state_finite[row])
+                            else "robot_state_nonfinite"
+                        )
                     )
                     trace["first_failure"][row] = {
                         "waypoint_index": waypoint_index,
                         "observation_tick": self.adapter._scene_time,
                         "control_command_index": trace["sample_count"],
                         "known": bool(sample["known"][row]),
+                        "robot_state_finite": bool(state_finite[row]),
                         "pairs": deepcopy(sample["pairs"][row]),
                     }
                 trace["sample_count"] += 1

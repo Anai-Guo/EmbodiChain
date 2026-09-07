@@ -366,6 +366,15 @@ class RuntimePolicyCfg:
             for policy in self.motion_defaults.values()
         ):
             raise ValueError("Every motion default must be a non-empty mapping.")
+        for action in ("Slide", "OpenDoor"):
+            contact_policy = self.motion_defaults[action].get(
+                "articulation_core_contact_policy", "stop"
+            )
+            if contact_policy not in ("stop", "observe"):
+                raise ValueError(
+                    f"motion_defaults.{action}.articulation_core_contact_policy "
+                    "must be 'stop' or 'observe'."
+                )
         _validate_motion_modifiers(self.motion_modifiers)
         _require_keys(
             self.predicate_fallbacks,

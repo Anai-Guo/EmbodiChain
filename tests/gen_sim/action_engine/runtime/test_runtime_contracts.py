@@ -718,7 +718,11 @@ def test_core_contact_stop_allows_handle_contact_and_latches_first_hazard():
         "non_target_robot_world_contact": torch.tensor([False, True, False]),
         "pairs": [[], [{"bodies": ["wrist", "table"]}], []],
     }
-    outcome = SimpleNamespace(success=torch.ones(3, dtype=torch.bool), planner_trace={})
+    outcome = SimpleNamespace(
+        success=torch.ones(3, dtype=torch.bool),
+        planner_trace={},
+        grounded=SimpleNamespace(motion_policy={}),
+    )
     executor = SimpleNamespace(
         env=SimpleNamespace(num_envs=3, device=torch.device("cpu")),
         adapter=SimpleNamespace(_scene_time=1.0),
@@ -745,6 +749,136 @@ def test_core_contact_stop_allows_handle_contact_and_latches_first_hazard():
     assert aborted.tolist() == [False, True, True]
     assert trace["first_failure"][1]["waypoint_index"] == 10
     assert trace["first_failure"][1]["pairs"] == [{"bodies": ["wrist", "table"]}]
+
+
+def test_observe_core_contacts_continue_but_unknown_rows_stop():
+    sample = {
+        "known": torch.tensor([True, False, True]),
+        "target_contact": torch.tensor([False, False, False]),
+        "robot_world_contact": torch.tensor([True, True, True]),
+        "obstacle_contact": torch.tensor([True, True, True]),
+        "non_target_robot_world_contact": torch.tensor([True, True, True]),
+        "pairs": [[{"bodies": ["finger", "table"]}], [], []],
+    }
+    outcome = SimpleNamespace(
+        success=torch.ones(3, dtype=torch.bool),
+        planner_trace={},
+        grounded=SimpleNamespace(
+            motion_policy={"articulation_core_contact_policy": "observe"}
+        ),
+    )
+    executor = SimpleNamespace(
+        env=SimpleNamespace(
+            num_envs=3,
+            device=torch.device("cpu"),
+            robot=SimpleNamespace(get_qpos=lambda: torch.zeros(3, 2)),
+        ),
+        adapter=SimpleNamespace(_scene_time=1.0),
+        _sample_interaction_contacts=lambda *args: sample,
+    )
+    stop, aborted = ProgramExecutor._core_contact_stop(
+        executor,
+        SimpleNamespace(id="slide_step"),
+        {"left_arm": outcome},
+        {"left_arm": torch.tensor([True, True, False])},
+    )
+    assert stop(44).tolist() == [False, True, False]
+    trace = outcome.planner_trace["articulation_core_contact_guard"]
+    assert trace["policy"] == "observe"
+    assert trace["contact_observed"].tolist() == [True, False, False]
+    assert trace["contact_sample_count"].tolist() == [1, 0, 0]
+    sample["pairs"][0].clear()
+    sample["known"][:] = True
+    assert stop(45).tolist() == [False, True, False]
+    assert trace["contact_sample_count"].tolist() == [2, 0, 0]
+    assert trace["first_contact"][0]["pairs"] == [{"bodies": ["finger", "table"]}]
+    assert trace["last_contact"][0]["waypoint_index"] == 45
+    assert aborted.tolist() == [False, True, False]
+
+
+def test_observe_core_contact_policy_rejects_nonfinite_robot_state():
+    sample = {
+        "known": torch.tensor([True]),
+        "obstacle_contact": torch.tensor([False]),
+        "non_target_robot_world_contact": torch.tensor([False]),
+        "pairs": [[]],
+    }
+    outcome = SimpleNamespace(
+        success=torch.tensor([True]),
+        planner_trace={},
+        grounded=SimpleNamespace(
+            motion_policy={"articulation_core_contact_policy": "observe"}
+        ),
+    )
+    executor = SimpleNamespace(
+        env=SimpleNamespace(
+            num_envs=1,
+            device=torch.device("cpu"),
+            robot=SimpleNamespace(get_qpos=lambda: torch.tensor([[float("nan")]])),
+        ),
+        adapter=SimpleNamespace(_scene_time=1.0),
+        _sample_interaction_contacts=lambda *args: sample,
+    )
+    stop, _ = ProgramExecutor._core_contact_stop(
+        executor, None, {"left_arm": outcome}, {"left_arm": torch.tensor([True])}
+    )
+    assert stop(0).tolist() == [True]
+    assert outcome.planner_trace["articulation_core_contact_guard"][
+        "failure_reason"
+    ] == ["robot_state_nonfinite"]
+
+
+def test_inline_invalid_core_contact_policy_cannot_disable_guard():
+    outcome = SimpleNamespace(
+        grounded=SimpleNamespace(
+            motion_policy={"articulation_core_contact_policy": "typo"}
+        ),
+        planner_trace={},
+    )
+    executor = SimpleNamespace(env=SimpleNamespace(num_envs=1, device="cpu"))
+    with pytest.raises(ValueError, match="articulation_core_contact_policy"):
+        ProgramExecutor._core_contact_stop(executor, None, {"left_arm": outcome}, {})
+
+
+@pytest.mark.parametrize("observed,failed", [(-0.079, False), (-0.04, True)])
+def test_observe_core_contact_policy_preserves_joint_verification(
+    monkeypatch, observed, failed
+):
+    executor, _, edge, _ = _core_result_executor(monkeypatch, "E6", [observed])
+    step = executor.program.semantic_steps[0]
+    original_plan = executor._ground_and_plan_candidates
+    original_execute = executor.adapter.execute_trajectory
+
+    def plan(*args, **kwargs):
+        grounded, outcome = original_plan(*args, **kwargs)
+        grounded.motion_policy["articulation_core_contact_policy"] = "observe"
+        return grounded, outcome
+
+    def execute(trajectory, *, active, **kwargs):
+        commands = original_execute(trajectory, active=active)
+        assert kwargs["waypoint_stop"](0).tolist() == [False]
+        return commands
+
+    monkeypatch.setattr(executor, "_ground_and_plan_candidates", plan)
+    monkeypatch.setattr(executor.adapter, "execute_trajectory", execute)
+    monkeypatch.setattr(
+        executor,
+        "_sample_interaction_contacts",
+        lambda *args: {
+            "known": torch.tensor([True]),
+            "obstacle_contact": torch.tensor([True]),
+            "non_target_robot_world_contact": torch.tensor([True]),
+            "pairs": [[{"bodies": ["finger", "table"]}]],
+        },
+    )
+    result = executor._execute_edge(edge, step, failed=torch.tensor([False]))
+    assert result.failed.tolist() == [failed]
+    trace = result.planner_traces[0]
+    assert trace["articulation_core_result"]["success"].tolist() == [not failed]
+    assert trace["articulation_core_result"]["safety_aborted"].tolist() == [False]
+    assert trace["articulation_core_contact_guard"]["contact_observed"].tolist() == [
+        True
+    ]
 
 
 @pytest.mark.parametrize(

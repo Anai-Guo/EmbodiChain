@@ -2147,6 +2147,18 @@ def test_agent_config_uses_relative_program_paths(gym_export: Path) -> None:
         "lift_height"
     ] == pytest.approx(0.16)
     assert "max_open_length" not in config["runtime_policy"]["grasp"]
+    assert (
+        config["runtime_policy"]["motion_defaults"]["Slide"][
+            "articulation_core_contact_policy"
+        ]
+        == "observe"
+    )
+    assert (
+        config["runtime_policy"]["motion_defaults"]["OpenDoor"][
+            "articulation_core_contact_policy"
+        ]
+        == "stop"
+    )
     assert len(config["runtime_policy_hash"]) == 64
 
 

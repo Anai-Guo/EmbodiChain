@@ -227,6 +227,7 @@ runtime:
         press_depth: 0.004
         postcondition_tolerance: 0.03
       Slide:
+        articulation_core_contact_policy: observe
         sample_interval: 140
         hand_interp_steps: 12
         approach_distance: 0.10
@@ -239,6 +240,7 @@ runtime:
         articulation_contact_overtravel: 0.01
         postcondition_tolerance: 0.005
       OpenDoor:
+        articulation_core_contact_policy: stop
         sample_interval: 300
         hand_interp_steps: 30
         door_waypoint_count: 50

@@ -273,9 +273,18 @@ repeatedly issuing the unchanged starting command. This preserves the original
 progress tolerance and maximum repeat budget.
 E6/E7 cores with external cleanup also observe robot/world contacts after every
 control command, including commands repeated by the progress gate. Selected-hand
-contact with the named moving link is allowed; other world contact or unknown
-contact data latches a row-local failure. The first contact evidence is retained
-even if later observations clear. Core stops flush one final robot command with
+contact with the named moving link is allowed. The snapshotted motion default
+`articulation_core_contact_policy` selects `observe` or `stop`: newly generated
+Slide tasks default to `observe`, while OpenDoor remains `stop`. Missing keys in
+existing runtime-policy snapshots retain `stop`; those snapshots are not rewritten.
+Configurations without a snapshot continue to inherit package defaults.
+Observe mode records known, finite non-target contacts and warns once per active
+row instead of aborting. Unknown contact data or nonfinite observed robot qpos
+still abort. Stop mode retains its existing contact-abort behavior. Traces record
+the effective policy, contact presence/count, and owned first/last contact
+snapshots separately from abort evidence. Contact observation is not a claim of
+collision-free execution, and joint-effect verification remains mandatory.
+Core stops flush one final robot command with
 measured holds on aborted rows, including when peers finish normally, so the last
 unsafe drive target is not left active. Invalid measured
 holds are rejected instead of dispatched. Non-gated cleanup keeps its existing

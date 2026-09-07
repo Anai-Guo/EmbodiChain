@@ -224,7 +224,10 @@ def test_departure_rotates_actual_linkage_points_before_clearance_query() -> Non
     ).tolist() == pytest.approx([-0.05], abs=1.0e-6)
 
 
-def test_departure_audits_interior_fk_waypoints_not_only_safe_endpoints() -> None:
+@pytest.mark.parametrize("core_contact_policy", ["stop", "observe"])
+def test_departure_audits_interior_fk_waypoints_not_only_safe_endpoints(
+    core_contact_policy: str,
+) -> None:
     plan = _plan()
     adapter = _adapter(
         _poses([[1.2, 1.2, 1.05, 1.2, 1.2]]),
@@ -232,6 +235,7 @@ def test_departure_audits_interior_fk_waypoints_not_only_safe_endpoints() -> Non
     )
     grounded = _grounded(
         {
+            "articulation_core_contact_policy": core_contact_policy,
             "articulation_support_audit": True,
             "interaction_support_surface_z": 1.0,
         },
