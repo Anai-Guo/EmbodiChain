@@ -639,7 +639,7 @@ def get_changed_qpos(
                 qpos_to_change,
                 offset_value=qpos_change_value,
                 joint_list_offset=joint_list_change,
-                degrees=change_partition[2],
+                degrees=change_partition[2] if len(change_partition) > 2 else None,
             )
         else:
             log_error(f"The {change_mode} change mode haven't realized yet!")
