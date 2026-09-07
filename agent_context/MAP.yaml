@@ -198,6 +198,7 @@ topics:
       - pinocchio solver
       - pytorch solver
       - differential solver
+      - fep solver
       - 逆运动学
       - IK求解器
     keywords:
@@ -210,6 +211,7 @@ topics:
       - pinocchio
       - pytorch
       - differential
+      - FEP
       - kinematics
       - joint
       - tcp
@@ -224,6 +226,8 @@ topics:
       - embodichain/lab/sim/solvers/pinocchio_solver.py
       - embodichain/lab/sim/solvers/pytorch_solver.py
       - embodichain/lab/sim/solvers/differential_solver.py
+      - embodichain/lab/sim/solvers/fep_solver.py
+      - embodichain/utils/warp/kinematics/fep_solver.py
     related_topics:
       - simulation-system
       - robot-system

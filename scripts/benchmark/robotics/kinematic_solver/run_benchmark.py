@@ -14,11 +14,11 @@
 # limitations under the License.
 # ----------------------------------------------------------------------------
 
-"""Unified benchmark for OPW, UR, and Pytorch kinematic solvers.
+"""Unified benchmark for OPW, UR, Pytorch, and FEP kinematic solvers.
 
 Measures IK wall-clock latency, pose accuracy, success rate, and memory usage
 across OPW (Warp CUDA vs CPU), UR analytic (Warp CPU vs CUDA), and the
-Pytorch solver (CPU vs optional CUDA).
+Pytorch solver (CPU vs optional CUDA), and numerical FEP (Python vs Warp).
 Run: embodichain benchmark robotics-kinematic-solver
 """
 
@@ -28,6 +28,7 @@ import argparse
 import os
 import time
 from datetime import datetime
+from itertools import product
 from pathlib import Path
 
 import numpy as np
@@ -38,6 +39,7 @@ from embodichain.data import get_data_path
 from embodichain.lab.sim.solvers.opw_solver import OPWSolverCfg
 from embodichain.lab.sim.solvers.pytorch_solver import PytorchSolver, PytorchSolverCfg
 from embodichain.lab.sim.solvers.ur_solver import URSolver, URSolverCfg
+from embodichain.lab.sim.solvers.fep_solver import FEPSolver, FEPSolverCfg
 
 OPW_LOWER_LIMITS = [-2.618, 0.0, -2.967, -1.745, -1.22, -2.0944]
 OPW_UPPER_LIMITS = [2.618, 3.14159, 0.0, 1.745, 1.22, 2.0944]
@@ -61,7 +63,12 @@ UR_TCP = [
 ]
 
 SAMPLE_SIZES = [100, 1000, 10000]
-SUPPORTED_SOLVERS = ("opw", "pytorch", "ur")
+SUPPORTED_SOLVERS = ("opw", "pytorch", "ur", "fep")
+
+FEP_JOINT_NAMES = [f"fr3_joint{i}" for i in range(1, 8)]
+FEP_TCP = np.eye(4)
+FEP_SEED_OFFSET = [0.03, -0.02, 0.01, 0.02, -0.01, 0.02, 0.04]
+FEP_METHODS = ("seeded_numerical", "nearest_redundancy")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -76,7 +83,7 @@ def _parse_args() -> argparse.Namespace:
         choices=(*SUPPORTED_SOLVERS, "all"),
         default=["all"],
         help=(
-            "Solvers to benchmark. Use one or more of: opw, pytorch, ur, all. "
+            "Solvers to benchmark. Use one or more of: opw, pytorch, ur, fep, all. "
             "Default: all"
         ),
     )
@@ -872,8 +879,131 @@ def benchmark_ur_solver() -> tuple[list[dict[str, object]], list[dict[str, objec
     return perf_rows, metric_rows
 
 
+def _init_fep_solver(device: torch.device, backend: str) -> FEPSolver:
+    """Initialize FEP on the packaged Franka seven-axis URDF."""
+    return FEPSolverCfg(
+        urdf_path=get_data_path("Franka/Panda/PandaWithHand.urdf"),
+        root_link_name="base",
+        end_link_name="fr3_hand_tcp",
+        joint_names=FEP_JOINT_NAMES,
+        tcp=FEP_TCP,
+        backend=backend,
+    ).init_solver(device=device)
+
+
+def _timed_fep_ik_call(
+    solver: FEPSolver,
+    fk_xpos: torch.Tensor,
+    qpos_seed: torch.Tensor,
+    solve_method: str = "seeded_numerical",
+) -> tuple[float, dict[str, float], float, torch.Tensor, torch.Tensor]:
+    """Time two IK calls after a synchronized warmup, including memory deltas."""
+    solver.get_ik(fk_xpos, qpos_seed, solve_method=solve_method)
+    _sync_cuda()
+    _reset_peak_gpu_memory()
+    before = _memory_snapshot()
+    start = time.perf_counter()
+    for _ in range(2):
+        success, joints = solver.get_ik(fk_xpos, qpos_seed, solve_method=solve_method)
+    _sync_cuda()
+    elapsed = (time.perf_counter() - start) / 2
+    after = _memory_snapshot()
+    deltas = {key: after[key] - before[key] for key in before}
+    return elapsed, deltas, _peak_gpu_memory_mb(), success, joints
+
+
+def benchmark_fep_solver() -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Compare nearby-seed and mixed-unreachable batches on Python and Warp.
+
+    Returns:
+        Timing/memory rows and success/accuracy rows for the shared report.
+    """
+    from pytorch_kinematics.transforms import matrix_to_axis_angle
+
+    solvers = [
+        _init_fep_solver(torch.device("cpu"), "python"),
+        _init_fep_solver(torch.device("cpu"), "warp"),
+    ]
+    if torch.cuda.is_available():
+        solvers.append(_init_fep_solver(torch.device("cuda"), "warp"))
+    else:
+        print("  CUDA unavailable; FEP CUDA benchmark is skipped.")
+    limits = solvers[0].get_qpos_limits()
+    lower = torch.tensor(limits["lower_qpos_limits"])
+    upper = torch.tensor(limits["upper_qpos_limits"])
+    generator = torch.Generator().manual_seed(27)
+    perf_rows, metric_rows = [], []
+    print("\n=== FEP Numerical Solver Benchmark (perturbed seeds) ===")
+    for n in SAMPLE_SIZES:
+        qpos = (
+            lower
+            + 0.1
+            + (upper - lower - 0.2) * torch.rand((n, 7), generator=generator)
+        )
+        targets = solvers[0].get_fk(qpos)
+        seeds = (qpos + torch.tensor(FEP_SEED_OFFSET)).clamp(lower, upper)
+        for solver, method, mixed in product(solvers, FEP_METHODS, (False, True)):
+            target = targets.to(solver.device).clone()
+            reachable = torch.ones(n, dtype=torch.bool, device=solver.device)
+            if mixed:
+                # Ten percent are plainly beyond reach. All remaining inputs
+                # are identical to the ordinary nearby-seed benchmark.
+                reachable[::10] = False
+                target[~reachable, 0, 3] += 20
+            elapsed, memory, peak, success, joints = _timed_fep_ik_call(
+                solver, target, seeds.to(solver.device), solve_method=method
+            )
+            expected_result = success == reachable
+            if mixed:
+                torch.testing.assert_close(
+                    joints[~reachable], seeds.to(solver.device)[~reachable]
+                )
+            actual = solver.get_fk(joints[reachable])
+            checked_target = target[reachable]
+            translation, _ = get_pose_err(checked_target, actual)
+            # Quaternion-based angle avoids the acos/float32 trace noise floor.
+            rotation = torch.linalg.vector_norm(
+                matrix_to_axis_angle(
+                    checked_target[:, :3, :3].double()
+                    @ actual[:, :3, :3].double().transpose(-1, -2)
+                ),
+                dim=-1,
+            )
+            identity = {
+                "sample_size": n,
+                "impl": f"fep_{solver.backend}_{solver.device.type}",
+                "component": (
+                    "fep_ik"
+                    if method == "seeded_numerical"
+                    else "fep_nearest_redundancy"
+                )
+                + ("_mixed_unreachable" if mixed else ""),
+            }
+            perf_rows.append(
+                {
+                    **identity,
+                    "cost_time_ms": f"{elapsed * 1000:.6f}",
+                    "cpu_delta_mb": f"{memory['cpu_mb']:.6f}",
+                    "gpu_delta_mb": f"{memory['gpu_mb']:.6f}",
+                    "peak_gpu_mb": f"{peak:.6f}",
+                }
+            )
+            metric_rows.append(
+                {
+                    **identity,
+                    "success_rate": f"{expected_result.float().mean().item():.6f}",
+                    "translation_err_mm": f"{translation.mean().item() * 1000:.6f}",
+                    "rotation_err_deg": f"{rotation.mean().item() * 180 / np.pi:.6f}",
+                }
+            )
+            print(
+                f"  {identity['impl']} ({method}, mixed={mixed}): n={n}, {elapsed * 1000:.3f} ms, expected result={expected_result.float().mean().item():.2%}"
+            )
+    return perf_rows, metric_rows
+
+
 def run_all_benchmarks(selected_solvers: list[str] | None = None) -> None:
-    """Run unified OPW + UR + Pytorch kinematic solver benchmarks."""
+    """Run unified OPW, UR, Pytorch and FEP kinematic solver benchmarks."""
     solvers_to_run = _normalize_selected_solvers(selected_solvers)
 
     print("=" * 60)
@@ -889,6 +1019,7 @@ def run_all_benchmarks(selected_solvers: list[str] | None = None) -> None:
     )
     print("- Pytorch solver: UR10 URDF-based PytorchSolver with " "UR10 joint limits.")
     print("- UR solver: analytic UR10 IK via URSolverCfg with UR10 DH parameters.")
+    print("- FEP solver: numerical 7R IK on the Franka URDF with perturbed seeds.")
 
     perf_rows: list[dict[str, object]] = []
     metric_rows: list[dict[str, object]] = []
@@ -908,6 +1039,11 @@ def run_all_benchmarks(selected_solvers: list[str] | None = None) -> None:
         perf_rows.extend(ur_perf_rows)
         metric_rows.extend(ur_metric_rows)
 
+    if "fep" in solvers_to_run:
+        fep_perf_rows, fep_metric_rows = benchmark_fep_solver()
+        perf_rows.extend(fep_perf_rows)
+        metric_rows.extend(fep_metric_rows)
+
     leaderboard_rows = _build_leaderboard_rows(metric_rows)
 
     benchmark_name = "kinematic_solver"
@@ -925,6 +1061,13 @@ def run_all_benchmarks(selected_solvers: list[str] | None = None) -> None:
             "CPU/GPU memory fields are deltas measured around timed calls.",
             "This report contains exactly three tables: Time & Memory, Success & Other Metrics, and Leaderboard.",
         ]
+        + (
+            [
+                "FEP uses RNG seed 27 and identical Franka targets/perturbed seeds across backends and seeded/radial methods. Mixed-unreachable components shift every tenth target by 20 m; their success_rate measures expected validity agreement (solve reachable targets, reject unreachable targets). Pose-error means include all reachable rows, including failed solves. GPU memory counts PyTorch allocations, excluding Warp runtime/JIT allocations."
+            ]
+            if "fep" in solvers_to_run
+            else []
+        )
         + (
             [
                 "OPW and Pytorch solvers use different initialization paths and different lower/upper joint limits."

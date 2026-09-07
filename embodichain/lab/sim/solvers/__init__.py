@@ -16,8 +16,10 @@
 
 """Inverse-kinematics solvers sharing the ``BaseSolver`` interface.
 
-Provides analytic (SRS, OPW, UR), numerical (Pinocchio, Pink, Differential), and learning-based (PyTorch, NeuralIK) solvers, one per robot control part.
+Provides analytic (SRS, OPW, UR), numerical (FEP, Pinocchio, Pink, Differential), and learning-based (PyTorch, NeuralIK) solvers, one per robot control part.
 """
+
+from __future__ import annotations
 
 from .base_solver import SolverCfg, BaseSolver
 from .pytorch_solver import PytorchSolverCfg, PytorchSolver
@@ -28,3 +30,27 @@ from .opw_solver import OPWSolverCfg, OPWSolver
 from .srs_solver import SRSSolverCfg, SRSSolver
 from .neural_ik_solver import NeuralIKSolverCfg, NeuralIKSolver
 from .ur_solver import URSolverCfg, URSolver
+from .fep_solver import FEPSolverCfg, FEPSolver
+
+__all__ = [
+    "SolverCfg",
+    "BaseSolver",
+    "PytorchSolverCfg",
+    "PytorchSolver",
+    "PinocchioSolverCfg",
+    "PinocchioSolver",
+    "DifferentialSolverCfg",
+    "DifferentialSolver",
+    "PinkSolverCfg",
+    "PinkSolver",
+    "OPWSolverCfg",
+    "OPWSolver",
+    "SRSSolverCfg",
+    "SRSSolver",
+    "NeuralIKSolverCfg",
+    "NeuralIKSolver",
+    "URSolverCfg",
+    "URSolver",
+    "FEPSolverCfg",
+    "FEPSolver",
+]

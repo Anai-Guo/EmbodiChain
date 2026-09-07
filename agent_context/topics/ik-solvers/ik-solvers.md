@@ -41,6 +41,7 @@ SolverCfg  (@configclass, abstract)
   ├── PytorchSolverCfg
   ├── PinocchioSolverCfg
   ├── PinkSolverCfg
+  ├── FEPSolverCfg
   └── DifferentialSolverCfg
 
 BaseSolver  (ABCMeta)
@@ -49,6 +50,7 @@ BaseSolver  (ABCMeta)
   ├── PytorchSolver
   ├── PinocchioSolver
   ├── PinkSolver
+  ├── FEPSolver
   └── DifferentialSolver
 ```
 
@@ -67,6 +69,7 @@ overrides it to construct the matching `BaseSolver` subclass.
 | **PinocchioSolver** | Iterative IK via Pinocchio + optional CasADi | High-accuracy IK with full rigid-body dynamics model | `pinocchio`, `casadi` (optional) |
 | **PinkSolver** | Task-based IK via Pink (QP optimisation) | Multi-task IK (e.g., dual-arm, posture + EE control, null-space tasks) | `pinocchio`, `pink` |
 | **DifferentialSolver** | Differential IK (Jacobian pseudo-inverse / SVD / DLS) | Real-time velocity-level IK; supports relative-mode commands | (none beyond core) |
+| **FEPSolver** | Branch-seeded numerical FEP (7R), following HolisticMotion's numerical facade | Offset seven-revolute-joint URDF chains; Python and Warp CPU/CUDA correction | `pytorch_kinematics`, `warp` for Warp backend |
 
 ---
 
@@ -205,6 +208,48 @@ and available CUDA backends in seeded and full redundancy-search modes.
 
 - `a1, a2, b, c1–c4, offsets, flip_axes, has_parallelogram`: OPW kinematic parameters.
 - `safe_margin`: joint-limit safety margin in radians.
+
+### FEPSolver-specific
+
+- Entry points: `embodichain/lab/sim/solvers/fep_solver.py` and
+  `embodichain/utils/warp/kinematics/fep_solver.py`; public exports are
+  `FEPSolverCfg` and `FEPSolver` in the solvers package.
+- Implements HolisticMotion's numerical FEP facade, not analytical FEP.
+  Requires seven revolute/continuous joints in serial-chain order. Joint names
+  are inferred when omitted, and all intervening fixed transforms are retained.
+- `backend`: `auto` chooses Warp on CPU and CUDA. Explicit `python` uses
+  PyTorch operations; `warp` runs the correction loop per candidate in a
+  CPU/CUDA kernel. Public FK stays on BaseSolver's URDF path.
+- `solve_method`: `seeded_numerical`, `configuration`, `all_configurations`, or
+  `nearest_redundancy`. Configuration signs are joints 2/4/6 (zero is positive).
+  Joint 7 is a redundancy seed, not a locked degree of freedom. Branch searches
+  are numerical and neither exhaustive nor globally convergent.
+- Defaults: 200 updates, 1e-5 m/rad tolerances, damping 0.01, step size 1.0 and
+  maximum absolute joint update 0.35 rad. Radial search has 37 levels at pi/36,
+  clipped to radii at most pi. Only unresolved targets advance to the next
+  radius, with at most two seeds per target per batch; no full grid is allocated.
+- `adaptive_damping=True` uses `damp² * clip(10 * ||pose_error||, 1e-4, 1)` as
+  diagonal regularization. Far from the goal this retains the configured
+  damping; near convergence it reduces lambda down to 1% of `damp`.
+  Disable it to use fixed damping.
+- Both backends read runtime TCP, limits and weights at each call. URDF limits
+  remain hard bounds. Updates use float64, but iteration FK evaluates representable
+  float32 joints to avoid rejecting converged candidates after rounding. The
+  iteration paths compose only seven moving frames; public FK and final
+  acceptance remain on shared URDF FK.
+- A conservative first-to-last joint distance bound rejects geometrically
+  impossible targets before candidate generation on both backends. It accounts
+  for the current TCP, position/rotation tolerances and roundoff padding;
+  passing the bound does not establish reachability. Mixed batches retain row
+  order and original seeds on rejected rows, including all-solutions output.
+- Python CPU batches below 60 degrees rotation residual evaluate only the
+  reference conversion's positive-real quaternion candidate, preserving its
+  arithmetic. Larger angles and CUDA use the full reference conversion.
+- Standard outputs are `(N,)`, `(N, 7)`; all-solutions mode forces eight branch
+  seeds and returns `(N, 8)`, `(N, 8, 7)`, sorted by weighted periodic distance.
+  Periodic duplicates are invalidated; every invalid slot preserves its seed.
+- Focused tests: `tests/sim/solvers/test_fep_solver.py`. Benchmark:
+  `python -m scripts.benchmark.robotics.kinematic_solver.run_benchmark -s fep`.
 
 ---
 

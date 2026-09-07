@@ -34,4 +34,23 @@ Trajectory Warping Utilities
    :members:
    :undoc-members:
    :show-inheritance:
-   
+
+FEP numerical correction kernel
+-------------------------------
+
+These low-level Warp objects implement per-candidate double-precision
+FK, geometric Jacobian evaluation and bounded damped least-squares correction.
+Use ``FEPSolver`` for input validation, branch enumeration and solution selection.
+
+.. currentmodule:: embodichain.utils.warp.kinematics.fep_solver
+
+.. autosummary::
+
+   FEPParam
+   fep_ik
+
+.. autodata:: FEPParam
+   :annotation:
+
+.. autodata:: fep_ik
+   :annotation:

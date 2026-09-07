@@ -98,3 +98,4 @@ See also
     srs_solver.md
     ur_solver.md
     neural_ik_solver.md
+    fep_solver.md

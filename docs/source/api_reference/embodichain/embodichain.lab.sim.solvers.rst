@@ -149,3 +149,36 @@ Neural IK Solver
     :members:
     :inherited-members:
     :show-inheritance:
+
+FEP numerical solver
+--------------------
+
+The FEP solver supports seven-axis URDF chains with Python and Warp correction.
+``FEPSolverCfg`` and ``FEPSolver`` are also exported from
+``embodichain.lab.sim.solvers``. Configuration labels follow HolisticMotion's
+joint-sign convention; numerical enumeration is not exhaustive.
+
+.. currentmodule:: embodichain.lab.sim.solvers.fep_solver
+
+.. autosummary::
+
+   FEPSolverCfg
+   FEPSolver
+
+.. autoclass:: FEPSolverCfg
+   :members:
+   :show-inheritance:
+
+.. autoclass:: FEPSolver
+   :members:
+   :show-inheritance:
+
+Public FEP imports
+~~~~~~~~~~~~~~~~~~
+
+.. currentmodule:: embodichain.lab.sim.solvers
+
+.. autosummary::
+
+   FEPSolverCfg
+   FEPSolver
