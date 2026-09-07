@@ -63,7 +63,12 @@ from embodichain.lab.sim.planners.utils import PlanResult
 from embodichain.toolkits.graspkit import GraspPoseGenerator
 from embodichain.utils.math import axis_angle_to_rotation_matrix, pose_inv
 
-from ..config import SuiteCfg, TrackCfg
+from ..config import (
+    SuiteCfg,
+    TrackCfg,
+    resolve_atomic_batch_sizes,
+    resolve_atomic_pose_randomization,
+)
 from ..metrics.trajectory import compute_case_outcomes
 from ..models import BenchmarkCase, CaseOutcome
 from ..registry import register_scenario_provider
@@ -289,13 +294,35 @@ def _seeded_jitter(
     stream: int,
     dtype: torch.dtype,
     device: torch.device,
+    batch_size: int = 1,
+    seed_stride: int = 1,
 ) -> torch.Tensor:
-    """Sample deterministic independent uniform jitter in ``[-amplitude, +amplitude]``."""
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed((int(seed) * 1_000_003 + int(stream) * 97_409) % (2**63 - 1))
-    unit = torch.rand(len(amplitude), generator=generator, dtype=torch.float32)
+    """Sample deterministic uniform jitter, optionally one row per environment.
+
+    The legacy ``batch_size=1`` result remains a one-dimensional vector.  For
+    a pose-batch benchmark the returned tensor has shape ``(B, D)``; each row
+    gets its own deterministic CPU generator so values are stable across
+    devices and independent of planner execution order.
+    """
+    if type(batch_size) is not int or batch_size < 1:
+        raise ValueError("batch_size must be a positive integer.")
+    if type(seed_stride) is not int or seed_stride < 1:
+        raise ValueError("seed_stride must be a positive integer.")
+    base_seed = (int(seed) * 1_000_003 + int(stream) * 97_409) % (2**63 - 1)
+    # Keep the historical B=1 sequence byte-for-byte stable.  For a pose
+    # batch, derive a separate deterministic CPU stream per row; this makes
+    # adding/removing a neighboring skill unable to change an existing row.
+    rows: list[torch.Tensor] = []
+    for row in range(batch_size):
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed((base_seed + row * seed_stride) % (2**63 - 1))
+        rows.append(
+            torch.rand(len(amplitude), generator=generator, dtype=torch.float32)
+        )
+    unit = torch.stack(rows, dim=0)
     values = (2.0 * unit - 1.0) * torch.tensor(amplitude, dtype=torch.float32)
-    return values.to(dtype=dtype, device=device)
+    values = values.to(dtype=dtype, device=device)
+    return values[0] if batch_size == 1 else values
 
 
 def _case_generation_seed(seed: int, *, skill_index: int, case_index: int) -> int:
@@ -339,6 +366,60 @@ def _randomized_vector(
     )
 
 
+def _randomized_vector_batch(
+    base: Sequence[float],
+    config: Mapping[str, object],
+    *,
+    jitter_name: str,
+    seed: int,
+    stream: int,
+    batch_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return one independently jittered vector for every environment row.
+
+    Skill-local jitter keys take precedence.  A track-level pose-batch
+    translation range (injected as ``_pose_batch_translation_jitter_m`` during
+    case generation) is used as a fallback, which keeps suite YAML concise.
+    """
+    base_values = [float(value) for value in base]
+    configured = config.get(jitter_name)
+    if configured is None and len(base_values) == 3:
+        # Track-level ranges describe *pose* perturbations only.  Do not leak
+        # an object-position range into grasp/held offsets, whose semantics
+        # are local robot/object geometry and should remain deterministic
+        # unless explicitly configured by the skill.
+        if jitter_name in {"target_offset_jitter_m", "target_object_offset_jitter_m"}:
+            configured = config.get("_pose_batch_translation_jitter_m")
+        elif jitter_name == "object_position_jitter_m":
+            configured = config.get("_pose_batch_object_translation_jitter_m")
+    amplitude = _float_vector(
+        configured,
+        name=jitter_name,
+        length=len(base_values),
+        default=(0.0,) * len(base_values),
+    )
+    if any(value < 0.0 for value in amplitude):
+        raise ValueError(f"{jitter_name} values must be non-negative.")
+    stride = int(config.get("_pose_batch_seed_stride", 1))
+    jitter = _seeded_jitter(
+        amplitude,
+        seed=seed,
+        stream=stream,
+        dtype=dtype,
+        device=device,
+        batch_size=batch_size,
+        seed_stride=stride,
+    )
+    if jitter.dim() == 1:
+        jitter = jitter.unsqueeze(0)
+    base_tensor = torch.tensor(base_values, dtype=dtype, device=device).expand(
+        batch_size, -1
+    )
+    return base_tensor + jitter
+
+
 def _randomization_parameters(
     config: Mapping[str, object], *, seed: int
 ) -> dict[str, object]:
@@ -346,14 +427,36 @@ def _randomization_parameters(
     ranges = {
         str(key): value
         for key, value in config.items()
-        if str(key).endswith("_jitter_m") or str(key).endswith("_jitter_rad")
+        if (
+            not str(key).startswith("_pose_batch_")
+            and (str(key).endswith("_jitter_m") or str(key).endswith("_jitter_rad"))
+        )
     }
-    return {
-        "enabled": bool(ranges),
+    pose_batch_enabled = bool(config.get("_pose_batch_enabled", False))
+    parameters: dict[str, object] = {
+        "enabled": bool(ranges) or pose_batch_enabled,
         "seed": int(seed),
         "distribution": "independent_uniform",
         "ranges": ranges,
     }
+    if pose_batch_enabled:
+        parameters.update(
+            {
+                "pose_batch": True,
+                "pose_batch_seed_stride": int(config.get("_pose_batch_seed_stride", 1)),
+                "pose_batch_translation_jitter_m": list(
+                    config.get("_pose_batch_translation_jitter_m", (0.0, 0.0, 0.0))
+                ),
+                "pose_batch_object_translation_jitter_m": list(
+                    config.get(
+                        "_pose_batch_object_translation_jitter_m",
+                        (0.0, 0.0, 0.0),
+                    )
+                ),
+                "batch_semantics": "one_pose_per_environment_row",
+            }
+        )
+    return parameters
 
 
 def _motion_valid_mask(
@@ -773,23 +876,52 @@ class _MoveEndEffectorCases(AtomicSkillCaseProvider):
         start_pose = scenario.robot.compute_fk(
             start_qpos, name=scenario.control_part, to_matrix=True
         )
-        offsets_tensor = torch.stack(
-            [
-                _randomized_vector(
-                    offset,
-                    config,
-                    jitter_name="target_offset_jitter_m",
-                    seed=seed,
-                    stream=101 + index,
-                    dtype=start_pose.dtype,
-                    device=start_pose.device,
-                )
-                for index, offset in enumerate(base_offsets)
-            ]
-        )
+        if bool(config.get("_pose_batch_enabled", False)):
+            # One batch row represents one perturbed target pose.  Reuse the
+            # same translation at every waypoint so the requested path shape
+            # is preserved while each environment explores a different pose.
+            shared_jitter = _randomized_vector_batch(
+                (0.0, 0.0, 0.0),
+                config,
+                jitter_name="target_offset_jitter_m",
+                seed=seed,
+                stream=101,
+                batch_size=batch_size,
+                dtype=start_pose.dtype,
+                device=start_pose.device,
+            )
+            base_tensor = torch.tensor(
+                base_offsets,
+                dtype=start_pose.dtype,
+                device=start_pose.device,
+            )
+            offsets_tensor = base_tensor.unsqueeze(0).expand(batch_size, -1, -1)
+            offsets_tensor = offsets_tensor + shared_jitter[:, None, :]
+        else:
+            offsets_tensor = torch.stack(
+                [
+                    _randomized_vector_batch(
+                        offset,
+                        config,
+                        jitter_name="target_offset_jitter_m",
+                        seed=seed,
+                        stream=101 + index,
+                        batch_size=batch_size,
+                        dtype=start_pose.dtype,
+                        device=start_pose.device,
+                    )
+                    for index, offset in enumerate(base_offsets)
+                ],
+                dim=1,
+            )
         offsets = offsets_tensor.detach().cpu().tolist()
-        targets = start_pose[:, None].repeat(1, len(offsets), 1, 1)
-        targets[:, :, :3, 3] += offsets_tensor[None]
+        # Preserve the historical manifest shape for the ordinary B=1
+        # benchmark (`[waypoint][xyz]`), while retaining one row per pose
+        # sample for the batched variant (`[batch][waypoint][xyz]`).
+        if batch_size == 1:
+            offsets = offsets[0]
+        targets = start_pose[:, None].repeat(1, len(base_offsets), 1, 1)
+        targets[:, :, :3, 3] += offsets_tensor
         references = scenario.solve_reference_qpos(start_qpos, targets)
         name = _case_name(config)
         return BenchmarkCase(
@@ -799,7 +931,7 @@ class _MoveEndEffectorCases(AtomicSkillCaseProvider):
             case_id=f"{track.id}:{self.skill_id}:{name}:s{seed}",
             seed=seed,
             batch_size=batch_size,
-            num_waypoints=len(offsets),
+            num_waypoints=len(base_offsets),
             path_shape="robot_relative_waypoints",
             start_state_bin="pre_action",
             start_qpos=start_qpos,
@@ -876,8 +1008,20 @@ class _PickUpCases(AtomicSkillCaseProvider):
         handle = scenario.activate_object(object_id)
         scenario.restore_base_robot()
 
+        raw_settle_steps = config.get(
+            "pre_action_settle_steps", handle.config.get("settle_steps", 2)
+        )
+        if type(raw_settle_steps) is not int or raw_settle_steps < 0:
+            raise ValueError("pre_action_settle_steps must be a non-negative integer.")
+        # Freeze the pose after gravity has settled the object.  Planning from
+        # the configured spawn pose while the dynamic cube is still falling
+        # makes the grasp target stale before the first controller command.
         object_pose = scenario.randomize_object_pose(
-            handle, config, seed=seed, stream=201
+            handle,
+            config,
+            seed=seed,
+            stream=201,
+            settle_steps=raw_settle_steps,
         )
         arm_start = scenario.robot.get_qpos(name=scenario.control_part)
         pre_pick_pose = scenario.robot.compute_fk(
@@ -943,7 +1087,7 @@ class _PickUpCases(AtomicSkillCaseProvider):
             grasp_pose[:, :3, :3] = rotation
         else:
             raise ValueError("grasp_source must be 'fixed' or 'antipodal'.")
-        grasp_offset = _randomized_vector(
+        grasp_offset = _randomized_vector_batch(
             _float_vector(
                 config.get("grasp_offset_m"),
                 name="grasp_offset_m",
@@ -954,6 +1098,7 @@ class _PickUpCases(AtomicSkillCaseProvider):
             jitter_name="grasp_offset_jitter_m",
             seed=seed,
             stream=202,
+            batch_size=batch_size,
             dtype=grasp_pose.dtype,
             device=grasp_pose.device,
         )
@@ -995,6 +1140,7 @@ class _PickUpCases(AtomicSkillCaseProvider):
                 "minimum_object_lift_m": float(
                     config.get("minimum_object_lift_m", 0.04)
                 ),
+                "pre_action_settle_steps": raw_settle_steps,
                 "grasp_pose": grasp_pose.detach().cpu().tolist(),
                 "object_initial_pose": object_pose.detach().cpu().tolist(),
                 "object_config": dict(handle.config),
@@ -1026,6 +1172,15 @@ class _PickUpCases(AtomicSkillCaseProvider):
             GraspGoal(
                 semantics=semantics,
                 grasp_xpos=case.target_waypoints[:, 1],
+                object_pose=(
+                    None
+                    if "object_initial_pose" not in case.case_parameters
+                    else _case_pose(
+                        case,
+                        "object_initial_pose",
+                        device=scenario.robot.device,
+                    )
+                ),
             ),
             control_parts={
                 "primary": {
@@ -1099,20 +1254,26 @@ class _MoveJointsCases(AtomicSkillCaseProvider):
         start_qpos = scenario.robot.get_qpos(name=scenario.control_part).clone()
         offset_tensor = torch.stack(
             [
-                _randomized_vector(
+                _randomized_vector_batch(
                     offset,
                     config,
                     jitter_name="target_offset_jitter_rad",
                     seed=seed,
                     stream=211 + index,
+                    batch_size=batch_size,
                     dtype=start_qpos.dtype,
                     device=start_qpos.device,
                 )
                 for index, offset in enumerate(base_offsets)
-            ]
+            ],
+            dim=1,
         )
         offsets = offset_tensor.detach().cpu().tolist()
-        targets = start_qpos[:, None] + torch.cumsum(offset_tensor, dim=0)[None]
+        # Keep B=1 case manifests backward-compatible; B>1 exposes the
+        # per-environment perturbations explicitly.
+        if batch_size == 1:
+            offsets = offsets[0]
+        targets = start_qpos[:, None] + torch.cumsum(offset_tensor, dim=1)
         limits = scenario.robot.get_qpos_limits(name=scenario.control_part)[0]
         margin = float(config.get("joint_limit_margin_rad", 0.05))
         if bool(
@@ -1143,7 +1304,7 @@ class _MoveJointsCases(AtomicSkillCaseProvider):
             case_id=f"{track.id}:{self.skill_id}:{name}:s{seed}",
             seed=seed,
             batch_size=batch_size,
-            num_waypoints=len(offsets),
+            num_waypoints=len(base_offsets),
             path_shape="relative_joint_waypoints",
             start_state_bin="pre_action",
             start_qpos=start_qpos,
@@ -1217,6 +1378,18 @@ class _HeldObjectCases(AtomicSkillCaseProvider):
 
     requires_gripper = True
 
+    def lift_segment_start(self, compiled: CompiledTrajectory) -> int | None:
+        """Return the prepended PickUp lift boundary for composite cases.
+
+        ``move_held_object`` and ``place`` are compiled as
+        ``PickUp -> transport/place`` sequences.  Once the first PickUp lift
+        segment begins, the benchmark replay should clear residual rigid-body
+        dynamics just as it does for an isolated PickUp; otherwise gravity and
+        contact impulses can make the cube drift out of the gripper before the
+        second action starts.
+        """
+        return compiled.segment(0, "lift").start
+
     def _prepare_start(
         self,
         scenario: "AtomicTaskScenario",
@@ -1277,29 +1450,18 @@ class _HeldObjectCases(AtomicSkillCaseProvider):
                 ),
             )
         elif grasp_source == "fixed":
+            # These cases now prepend a real PickUp action at replay time.
+            # Keep the object at its settled table pose; ``held_object_offset``
+            # belonged to the old pre-held initialization and must not lift
+            # either the physical object or the pickup TCP above the table.
             object_pose = table_object_pose.clone()
-            held_offset = _randomized_vector(
-                _float_vector(
-                    config.get("held_object_offset_m"),
-                    name="held_object_offset_m",
-                    length=3,
-                    default=(0.0, 0.0, 0.18),
-                ),
-                config,
-                jitter_name="held_object_offset_jitter_m",
-                seed=seed,
-                stream=302,
-                dtype=object_pose.dtype,
-                device=object_pose.device,
-            )
-            object_pose[:, :3, 3] += held_offset
             grasp_pose = object_pose.clone()
             grasp_pose[:, :3, :3] = torch.tensor(
                 config.get("grasp_rotation", _TOP_DOWN_ROTATION),
                 dtype=grasp_pose.dtype,
                 device=grasp_pose.device,
             )
-            grasp_pose[:, :3, 3] += _randomized_vector(
+            grasp_pose[:, :3, 3] += _randomized_vector_batch(
                 _float_vector(
                     config.get("grasp_offset_m"),
                     name="grasp_offset_m",
@@ -1310,6 +1472,7 @@ class _HeldObjectCases(AtomicSkillCaseProvider):
                 jitter_name="grasp_offset_jitter_m",
                 seed=seed,
                 stream=303,
+                batch_size=table_object_pose.shape[0],
                 dtype=grasp_pose.dtype,
                 device=grasp_pose.device,
             )
@@ -1388,8 +1551,11 @@ class _MoveHeldObjectCases(_HeldObjectCases):
             table_object_pose,
         ) = self._prepare_start(scenario, config, seed=seed)
         lift_height = float(config.get("lift_height_m", 0.16))
-        target_object = object_pose.clone()
-        target_object[:, :3, 3] += _randomized_vector(
+        # The preceding PickUp lifts the object from the settled table pose;
+        # derive the transport target from that same pose rather than from the
+        # legacy pre-held offset.
+        target_object = table_object_pose.clone()
+        target_object[:, :3, 3] += _randomized_vector_batch(
             _float_vector(
                 config.get("target_object_offset_m"),
                 name="target_object_offset_m",
@@ -1400,6 +1566,7 @@ class _MoveHeldObjectCases(_HeldObjectCases):
             jitter_name="target_object_offset_jitter_m",
             seed=seed,
             stream=311,
+            batch_size=object_pose.shape[0],
             dtype=object_pose.dtype,
             device=object_pose.device,
         )
@@ -1536,7 +1703,7 @@ class _PlaceCases(_HeldObjectCases):
             table_object_pose,
         ) = self._prepare_start(scenario, config, seed=seed)
         target_object = table_object_pose.clone()
-        target_object[:, :3, 3] += _randomized_vector(
+        target_object[:, :3, 3] += _randomized_vector_batch(
             _float_vector(
                 config.get("target_object_offset_m"),
                 name="target_object_offset_m",
@@ -1547,6 +1714,7 @@ class _PlaceCases(_HeldObjectCases):
             jitter_name="target_object_offset_jitter_m",
             seed=seed,
             stream=321,
+            batch_size=object_pose.shape[0],
             dtype=object_pose.dtype,
             device=object_pose.device,
         )
@@ -2355,12 +2523,7 @@ class AtomicTaskScenario(ScenarioProvider):
     def batch_sizes(self, suite: SuiteCfg, track: TrackCfg) -> list[int]:
         """Return the explicitly configured physical-execution batch sizes."""
         del suite
-        values = [int(value) for value in track.config.get("batch_sizes", [1])]
-        if values != [1]:
-            raise ValueError(
-                "The initial Atomic Task implementation supports batch_sizes: [1] only."
-            )
-        return values
+        return resolve_atomic_batch_sizes(track)
 
     def create_runtime_entities(
         self,
@@ -2518,6 +2681,11 @@ class AtomicTaskScenario(ScenarioProvider):
                 if not isinstance(raw_case, Mapping):
                     raise TypeError("Every atomic skill case must be a mapping.")
                 config = {**defaults, **dict(raw_case)}
+                config = self._prepare_pose_batch_config(
+                    config,
+                    track,
+                    batch_size=batch_size,
+                )
                 for seed in seeds:
                     provider = create_atomic_skill_provider(skill_id)
                     rng_devices = (
@@ -2554,6 +2722,38 @@ class AtomicTaskScenario(ScenarioProvider):
         for index, handle in enumerate(self._articulations.values()):
             handle.park(len(self._objects) + index)
         return cases
+
+    @staticmethod
+    def _prepare_pose_batch_config(
+        config: dict[str, object],
+        track: TrackCfg,
+        *,
+        batch_size: int,
+    ) -> dict[str, object]:
+        """Inject shared pose-batch controls into one skill configuration.
+
+        Skill-specific jitter keys remain authoritative.  The track-level
+        translation range is only a fallback, allowing a compact YAML block
+        to drive all object and target pose variants.  No randomization is
+        applied when the track does not opt in.
+        """
+        randomization = resolve_atomic_pose_randomization(track)
+        if randomization.enabled:
+            if batch_size != randomization.pose_batch_size:
+                raise ValueError(
+                    "Atomic pose-batch size must match the simulator batch: "
+                    f"{randomization.pose_batch_size} != {batch_size}."
+                )
+            if randomization.mode == "translation":
+                config["_pose_batch_translation_jitter_m"] = list(
+                    randomization.target_translation_jitter_m
+                )
+                config["_pose_batch_object_translation_jitter_m"] = list(
+                    randomization.object_translation_jitter_m
+                )
+            config["_pose_batch_seed_stride"] = randomization.seed_stride
+            config["_pose_batch_enabled"] = True
+        return config
 
     def prepare_planner(
         self, adapter: PlannerAdapter, first_case: BenchmarkCase
@@ -2645,6 +2845,7 @@ class AtomicTaskScenario(ScenarioProvider):
         robot.clear_dynamics()
         active_id = case.object_id
         reset_steps = 2
+        active_object_pose: torch.Tensor | None = None
         for index, handle in enumerate(self._objects.values()):
             if handle.object_id == active_id:
                 reset_steps = int(
@@ -2654,13 +2855,12 @@ class AtomicTaskScenario(ScenarioProvider):
                 if initial_pose is None:
                     handle.reset()
                 else:
-                    handle.entity.set_local_pose(
-                        torch.tensor(
-                            initial_pose,
-                            dtype=torch.float32,
-                            device=robot.device,
-                        )
+                    active_object_pose = torch.tensor(
+                        initial_pose,
+                        dtype=torch.float32,
+                        device=robot.device,
                     )
+                    handle.entity.set_local_pose(active_object_pose)
                     handle.entity.clear_dynamics()
             else:
                 handle.park(index)
@@ -2691,6 +2891,15 @@ class AtomicTaskScenario(ScenarioProvider):
             else:
                 handle.park(len(self._objects) + index)
         simulation.update(step=reset_steps)
+        if active_object_pose is not None:
+            # The case manifest freezes the pose used to derive its grasp and
+            # target transforms.  Re-apply it after the optional settle window
+            # so every planner/replay attempt starts from exactly that pose,
+            # rather than a slightly different gravity-integrated state.
+            active_handle = self._objects.get(active_id or "")
+            if active_handle is not None:
+                active_handle.entity.set_local_pose(active_object_pose)
+                active_handle.entity.clear_dynamics()
 
     def plan_case(self, adapter: PlannerAdapter, case: BenchmarkCase) -> object:
         """Compile one Atomic Action with an explicitly pinned motion backend."""
@@ -2726,6 +2935,11 @@ class AtomicTaskScenario(ScenarioProvider):
                 GraspGoal(
                     semantics=semantics,
                     grasp_xpos=_case_pose(case, "grasp_pose", device=self.robot.device),
+                    object_pose=_case_pose(
+                        case,
+                        "object_initial_pose",
+                        device=self.robot.device,
+                    ),
                 ),
                 control_parts={
                     "primary": {
@@ -2975,7 +3189,7 @@ class AtomicTaskScenario(ScenarioProvider):
         case: BenchmarkCase,
         provider: AtomicSkillCaseProvider,
     ) -> _ExecutionObservation | None:
-        """Replay a successful full-robot trajectory under common physics."""
+        """Replay a finite full-robot trajectory under common physics."""
         if self.simulation is None or self.robot is None or self.track is None:
             raise RuntimeError("Atomic Task runtime is not configured.")
         if not self._is_replayable(compiled):
@@ -3020,8 +3234,15 @@ class AtomicTaskScenario(ScenarioProvider):
             final_object_position = final_object_pose[:, :3, 3]
             object_lift = final_object_position[:, 2] - initial_object_position[:, 2]
         return _ExecutionObservation(
-            execution_success=torch.isfinite(observed).all(dim=1)
-            & (tracking <= settings.joint_tracking_tolerance_rad),
+            # A compiled trajectory carries one planning result per batch row.
+            # Physical replay is allowed when at least one row succeeded, but
+            # failed rows must never be promoted to execution success merely
+            # because their held command happened to track the controller.
+            execution_success=(
+                compiled.plan_success.to(device=observed.device)
+                & torch.isfinite(observed).all(dim=1)
+                & (tracking <= settings.joint_tracking_tolerance_rad)
+            ),
             final_tcp_pose=final_tcp,
             joint_tracking_rmse_rad=tracking,
             execution_time_ms=elapsed_ms,
@@ -3063,7 +3284,7 @@ class AtomicTaskScenario(ScenarioProvider):
         trajectory = compiled.trajectory.positions
         return (
             trajectory.shape[1] > 0
-            and bool(compiled.plan_success.all().item())
+            and bool(compiled.plan_success.any().item())
             and bool(torch.isfinite(trajectory).all().item())
         )
 
@@ -3459,6 +3680,8 @@ class AtomicTaskScenario(ScenarioProvider):
             stream=stream,
             dtype=start.dtype,
             device=start.device,
+            batch_size=start.shape[0],
+            seed_stride=int(config.get("_pose_batch_seed_stride", 1)),
         )
         limits = self.robot.get_qpos_limits(name=self.control_part)[0]
         margin = float(config.get("start_joint_limit_margin_rad", 0.05))
@@ -3484,11 +3707,27 @@ class AtomicTaskScenario(ScenarioProvider):
         *,
         seed: int,
         stream: int,
+        settle_steps: int | None = None,
     ) -> torch.Tensor:
-        """Install one deterministic position/yaw perturbation for an object."""
+        """Install one deterministic position/yaw perturbation for an object.
+
+        When ``settle_steps`` is supplied, physics is advanced for exactly
+        that many frames and the live post-settle pose is returned.  This is
+        used by PickUp case generation so its frozen grasp target matches a
+        cube that has actually fallen onto the table.  Omitting the argument
+        preserves the legacy two-frame write/restore behavior used by the
+        other case providers.
+        """
+        if settle_steps is not None and (
+            type(settle_steps) is not int or settle_steps < 0
+        ):
+            raise ValueError("settle_steps must be a non-negative integer or None.")
         pose = handle.initial_pose.clone()
+        position_jitter = config.get("object_position_jitter_m")
+        if position_jitter is None:
+            position_jitter = config.get("_pose_batch_object_translation_jitter_m")
         position_amplitude = _float_vector(
-            config.get("object_position_jitter_m"),
+            position_jitter,
             name="object_position_jitter_m",
             length=3,
             default=(0.0, 0.0, 0.0),
@@ -3501,6 +3740,8 @@ class AtomicTaskScenario(ScenarioProvider):
             stream=stream,
             dtype=pose.dtype,
             device=pose.device,
+            batch_size=pose.shape[0],
+            seed_stride=int(config.get("_pose_batch_seed_stride", 1)),
         )
 
         yaw_amplitude = float(config.get("object_yaw_jitter_rad", 0.0))
@@ -3512,22 +3753,35 @@ class AtomicTaskScenario(ScenarioProvider):
             stream=stream + 1,
             dtype=pose.dtype,
             device=pose.device,
-        )[0]
+            batch_size=pose.shape[0],
+            seed_stride=int(config.get("_pose_batch_seed_stride", 1)),
+        )
+        if yaw.dim() == 1:
+            yaw = yaw[:1]
+        else:
+            yaw = yaw[:, 0]
         cosine = torch.cos(yaw)
         sine = torch.sin(yaw)
-        yaw_rotation = torch.eye(3, dtype=pose.dtype, device=pose.device)
-        yaw_rotation[0, 0] = cosine
-        yaw_rotation[0, 1] = -sine
-        yaw_rotation[1, 0] = sine
-        yaw_rotation[1, 1] = cosine
-        pose[:, :3, :3] = yaw_rotation.unsqueeze(0) @ pose[:, :3, :3]
+        yaw_rotation = torch.eye(3, dtype=pose.dtype, device=pose.device).repeat(
+            pose.shape[0], 1, 1
+        )
+        yaw_rotation[:, 0, 0] = cosine
+        yaw_rotation[:, 0, 1] = -sine
+        yaw_rotation[:, 1, 0] = sine
+        yaw_rotation[:, 1, 1] = cosine
+        pose[:, :3, :3] = yaw_rotation @ pose[:, :3, :3]
 
         handle.entity.set_local_pose(pose)
         handle.entity.clear_dynamics()
         if self.simulation is not None:
-            self.simulation.update(step=2)
-            handle.entity.set_local_pose(pose)
-            handle.entity.clear_dynamics()
+            if settle_steps is None:
+                self.simulation.update(step=2)
+                handle.entity.set_local_pose(pose)
+                handle.entity.clear_dynamics()
+            elif settle_steps:
+                self.simulation.update(step=settle_steps)
+                pose = handle.entity.get_local_pose(to_matrix=True).clone()
+                handle.entity.clear_dynamics()
         return pose
 
     def set_robot_start(

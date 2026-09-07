@@ -50,8 +50,9 @@ def add_parser_arguments(parser: argparse.ArgumentParser) -> None:
         "--suite",
         default="smoke",
         help=(
-            "Suite short name (smoke/coverage/atomic_franka_pgi_curobo/"
-            "atomic_franka_pgi_curobo_randomized) "
+            "Suite short name (smoke/coverage/atomic_franka_pgi_curobo, "
+            "atomic_franka_pgi_curobo_randomized, "
+            "atomic_franka_pgi_curobo_pose_batch) "
             "or an explicit YAML path."
         ),
     )

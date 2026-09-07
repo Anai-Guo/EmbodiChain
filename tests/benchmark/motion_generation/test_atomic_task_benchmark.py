@@ -28,6 +28,7 @@ import pytest
 import torch
 
 from embodichain.lab.sim.atomic_actions import ArticulationAffordanceGeometry
+from embodichain.lab.sim.atomic_actions.plans import CompiledTrajectory, TimedTrajectory
 from scripts.benchmark.motion_generation.aggregation import aggregate_results
 from scripts.benchmark.motion_generation.artifacts import write_case_manifest
 from scripts.benchmark.motion_generation.config import load_suite
@@ -537,6 +538,145 @@ def test_new_atomic_skill_cases_freeze_reference_waypoints(
         target_joint=config["target_joint"],
         joint_type=joint_type,
     )
+
+
+def test_fixed_held_object_case_keeps_pickup_and_transport_at_table_pose() -> None:
+    """Pre-pick composite cases must not reuse the legacy held-height offset."""
+    batch_size = 2
+    table_pose = torch.eye(4).repeat(batch_size, 1, 1)
+    table_pose[:, :3, 3] = torch.tensor(
+        [[-0.42, -0.08, 0.05], [-0.38, -0.04, 0.05]], dtype=torch.float32
+    )
+
+    robot = Mock(device=torch.device("cpu"))
+    robot.get_qpos.side_effect = lambda name=None: torch.zeros(batch_size, 7)
+    robot.compute_ik.side_effect = lambda pose, joint_seed, name: (
+        torch.ones(batch_size, dtype=torch.bool),
+        joint_seed.clone(),
+    )
+    handle = Mock(
+        object_id="cube",
+        entity=Mock(),
+        initial_pose=table_pose.clone(),
+        config={"id": "cube"},
+    )
+    scenario = Mock(
+        robot=robot,
+        control_part="arm",
+        simulation=None,
+    )
+    scenario.activate_object.return_value = handle
+    scenario.randomize_object_pose.return_value = table_pose.clone()
+    scenario.solve_reference_qpos.side_effect = lambda start, targets: torch.zeros(
+        targets.shape[0], targets.shape[1], start.shape[-1]
+    )
+    suite = Mock(suite_version="test_v1", robot=Mock(id="franka_pgi"))
+    track = Mock(id="atomic-task")
+    config = {
+        "name": "fixed_table_pick",
+        "object": "cube",
+        "grasp_source": "fixed",
+        # This legacy value used to move the object and TCP up by 18 cm.
+        "held_object_offset_m": [0.0, 0.0, 0.18],
+        "target_object_offset_m": [0.10, 0.10, 0.0],
+        "lift_height_m": 0.16,
+        "pre_action_settle_steps": 0,
+    }
+
+    case = create_atomic_skill_provider("move_held_object").generate_case(
+        scenario,
+        suite,
+        track,
+        config,
+        seed=11,
+        batch_size=batch_size,
+    )
+
+    object_initial = torch.tensor(case.case_parameters["object_initial_pose"])
+    grasp_pose = torch.tensor(case.case_parameters["grasp_pose"])
+    target_object = torch.tensor(case.case_parameters["target_object_pose"])
+    torch.testing.assert_close(object_initial, table_pose)
+    torch.testing.assert_close(grasp_pose[:, 2, 3], table_pose[:, 2, 3])
+    torch.testing.assert_close(target_object[:, 2, 3], table_pose[:, 2, 3] + 0.16)
+    assert case.target_waypoints.shape == (batch_size, 1, 4, 4)
+
+
+def test_held_object_composites_clear_dynamics_at_pickup_lift() -> None:
+    """Composite transport/place reuses the PickUp lift boundary."""
+    compiled = Mock()
+    compiled.segment.return_value = Mock(start=17)
+
+    for skill_id in ("move_held_object", "place"):
+        provider = create_atomic_skill_provider(skill_id)
+        assert provider.lift_segment_start(compiled) == 17
+
+    compiled.segment.assert_called_with(0, "lift")
+
+
+def _compiled_replay_batch(plan_success: list[bool]) -> CompiledTrajectory:
+    """Build a small finite compiled batch for replay-mask tests."""
+    batch_size = len(plan_success)
+    positions = torch.zeros(batch_size, 2, 7)
+    trajectory = TimedTrajectory.from_uniform_step(
+        positions,
+        env_ids=torch.arange(batch_size, dtype=torch.long),
+        step_dt=0.01,
+    )
+    return CompiledTrajectory(
+        plan_success=torch.tensor(plan_success, dtype=torch.bool),
+        trajectory=trajectory,
+        action_plans=(),
+        projected_context=Mock(),
+    )
+
+
+def test_partial_compiled_batch_is_replayable() -> None:
+    """One successful row should not be blocked by another failed row."""
+    assert AtomicTaskScenario._is_replayable(_compiled_replay_batch([True, False]))
+    assert not AtomicTaskScenario._is_replayable(_compiled_replay_batch([False, False]))
+
+
+def test_execute_masks_failed_plan_rows_from_execution_success() -> None:
+    """Controller tracking cannot turn a planner-failed row into success."""
+    batch_size = 2
+    scenario = AtomicTaskScenario()
+    scenario.simulation = Mock(sim_config=Mock(physics_dt=0.01))
+    scenario.robot = Mock(device=torch.device("cpu"))
+    scenario.robot.get_qpos.side_effect = lambda name=None: torch.zeros(batch_size, 7)
+    scenario.robot.compute_fk.return_value = torch.eye(4).repeat(batch_size, 1, 1)
+    scenario.track = Mock(
+        config={
+            "physics": {
+                "steps_per_waypoint": 1,
+                "hold_steps": 0,
+                "hold_sim_steps": 1,
+                "joint_tracking_tolerance_rad": 0.05,
+            }
+        }
+    )
+    scenario.control_part = "arm"
+    scenario._replay_physics = Mock(
+        return_value=Mock(
+            squared_tracking_error=torch.zeros(batch_size),
+            tracking_value_count=7,
+            articulation_joint_initial=None,
+            articulation_joint_final=None,
+            articulation_joint_peak_signed_delta=None,
+        )
+    )
+    case = replace(
+        _atomic_case(),
+        batch_size=batch_size,
+        start_qpos=torch.zeros(batch_size, 7),
+        target_waypoints=torch.eye(4).repeat(batch_size, 1, 1, 1),
+        reference_qpos=torch.zeros(batch_size, 1, 7),
+        full_start_qpos=torch.zeros(batch_size, 9),
+    )
+
+    observation = scenario._execute(_compiled_replay_batch([True, False]), case, Mock())
+
+    assert observation is not None
+    assert observation.execution_success.tolist() == [True, False]
 
 
 def test_articulation_effect_uses_peak_displacement_when_joint_rebounds():

@@ -21,6 +21,8 @@ python -m scripts.benchmark.motion_generation.run_benchmark \
 python -m scripts.benchmark.motion_generation.run_benchmark \
   --suite atomic_franka_pgi_curobo_randomized --device cuda
 python -m scripts.benchmark.motion_generation.run_benchmark \
+  --suite atomic_franka_pgi_curobo_pose_batch --device cuda
+python -m scripts.benchmark.motion_generation.run_benchmark \
   --extra-baselines ik_interpolate toppra
 ```
 
@@ -45,6 +47,15 @@ in that run's `videos/` directory.
   accepts a spring-loaded button that rebounds before the final hold state
 - Deterministic 16-seed generalization sweep for the original six-skill subset,
   with bounded robot-start, target, held-object, and object-pose randomization
+- Translation-only pose-batch coverage suite (`atomic_franka_pgi_curobo_pose_batch`):
+  one simulator environment row per independently perturbed object/target pose
+  sample. Each action in a case is planned over all eight rows in one batched
+  Atomic Action goal and planner call (one benchmark case). Configure
+  `randomization.pose_batch_size` together with a matching single-value
+  `batch_sizes: [K]` and the
+  `*_translation_jitter_m` bounds in the suite YAML.  The shipped track uses
+  fixed grasps; geometry-sampled antipodal and articulated-grasp providers
+  remain batch-size-one until their candidate selection is vectorized.
 - Default matrix: cuRobo (`primary_baseline`); IK / TOPPRA optional diagnostics
 - Direct, batched NMG ONNX adapter (`candidate`, enabled when a model path is supplied)
 - Lifecycle timing: construct / prepare / cold / warm
@@ -76,8 +87,10 @@ scenes. Use `--no-headless` instead to open the live simulator viewer.
 ## Current limits
 
 - `collision-deployment` and obstacle-aware common-input tracks
-- Atomic Task execution is currently `B=1`; the supplied suite covers only
-  Franka + PGI and cuRobo
+- Atomic Task pose-batch execution uses one configured simulator batch per
+  track (the supplied pose-batch suite uses `B=8`); geometry-sampled
+  antipodal and articulated-grasp candidate selection remains `B=1`
+- The supplied pose-batch suite covers only Franka + PGI and cuRobo
 - The v3 suite's Microwave and Drawer are physical simulation articulations,
   but cuRobo still receives an empty external collision world. Contact replay
   validates target-joint actuation; it does not guarantee collision safety
