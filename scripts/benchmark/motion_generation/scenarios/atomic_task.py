@@ -59,7 +59,7 @@ from embodichain.lab.sim.atomic_actions import (
     sample_initial_articulation_geometry,
 )
 from embodichain.lab.sim.atomic_actions.plans import CompiledTrajectory
-from embodichain.lab.sim.planners.utils import PlanResult
+from embodichain.lab.sim.motion.planners.utils import PlanResult
 from embodichain.toolkits.graspkit import GraspPoseGenerator
 from embodichain.utils.math import axis_angle_to_rotation_matrix, pose_inv
 

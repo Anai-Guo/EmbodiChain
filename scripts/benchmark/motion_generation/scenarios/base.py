@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from embodichain.lab.sim.planners.utils import PlanResult
+from embodichain.lab.sim.motion.planners.utils import PlanResult
 
 from ..metrics.trajectory import compute_case_outcomes, make_failure_outcomes
 from ..models import CaseOutcome

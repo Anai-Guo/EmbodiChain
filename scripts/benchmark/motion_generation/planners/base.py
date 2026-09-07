@@ -24,14 +24,14 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from embodichain.lab.sim.planners.utils import PlanResult
+from embodichain.lab.sim.motion.planners.utils import PlanResult
 
 from ..config import PlannerSpecCfg, stable_hash
 from ..models import AlgorithmRole, BenchmarkCase, PlannerMetadata
 
 if TYPE_CHECKING:
     from embodichain.lab.sim.objects import Robot
-    from embodichain.lab.sim.planners import MotionGenerator
+    from embodichain.lab.sim.motion.motion_generator import MotionGenerator
 
 __all__ = ["PlannerAdapter", "PlannerContext"]
 
